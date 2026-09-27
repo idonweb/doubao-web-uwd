@@ -68,7 +68,8 @@ import {
   watchSystemTheme,
 } from '../shared/dom';
 import { icon, type IconName } from '../shared/icons';
-import type { ConvScope, DownloadProgress, MediaItem, PageKind, StateResponse } from '../../core/types';
+import { isDoubaoHostUrl } from '../../core/site-contract';
+import type { ConvScope, DownloadProgress, MediaItem, PageInfo, PageKind, StateResponse } from '../../core/types';
 
 const rootEl = document.getElementById('app');
 if (!rootEl) throw new Error('#app 不存在');
@@ -134,8 +135,22 @@ const PAGE_BADGE: Record<PageKind, BadgeSpec> = {
   none: { cls: 'b-none', text: '非豆包页面', icon: 'image' },
 };
 
+/**
+ * 「豆包站内 · 非对话页」（2026-09-27 用户要求）：豆包首页（新建对话未输入）这类
+ * 在豆包域内、但插件能抓取的对话页 / 分享页都还没出现的情形 —— 不能说成「非豆包页面」。
+ * 域名判定用 `isDoubaoHostUrl`（站点契约，与 bg 的 `isDoubaoUrl` 同源）。
+ */
+const BADGE_DOUBAO_NONCONV: BadgeSpec = { cls: 'b-none', text: '豆包非对话页', icon: 'image' };
+
 /** 「豆包页待刷新」：页面确实是豆包页，只是内容脚本还没注入 —— 不能说成「非豆包页面」 */
 const STALE_BADGE: BadgeSpec = { cls: 'b-warn', text: '豆包页面', icon: 'clock' };
+
+/** 徽标选择：kind=none 时按「是否在豆包域内」细分（`docs/03` §15.6） */
+function pageBadge(page: PageInfo | undefined): BadgeSpec {
+  const kind = page?.kind;
+  if (kind === 'chat' || kind === 'thread') return PAGE_BADGE[kind];
+  return isDoubaoHostUrl(page?.url) ? BADGE_DOUBAO_NONCONV : PAGE_BADGE.none;
+}
 
 const KIND_LABEL: Record<string, string> = { video: '视频', image: '图片' };
 
@@ -151,7 +166,7 @@ function statusLine(): { dot: string; text: string; ready: boolean } {
   if (errorText) return { dot: 'off', text: '无法连接扩展后台', ready: false };
   if (!state) return { dot: 'off', text: '正在读取页面状态…', ready: false };
   if (state.stale) return { dot: 'warn', text: '页面需刷新后生效', ready: false };
-  if (state.page.kind === 'none') return { dot: 'off', text: '未检测到豆包页面', ready: false };
+  if (state.page.kind === 'none') return { dot: 'off', text: '未检测到豆包对话或分享页面', ready: false };
   return { dot: 'ok', text: '已就绪 · 自动解析中', ready: true };
 }
 
@@ -170,6 +185,15 @@ interface ViewData {
 }
 
 function viewData(): ViewData {
+  /*
+   * 非会话页闸门（2026-09-27 第八轮，防御层）：没有激活会话就没有条目。
+   * 即使库里残留上个会话的条目（清库消息丢失等极端情况），也绝不在这里显示 ——
+   * 「状态行说未检测到豆包对话或分享页面、列表却有视频」的自相矛盾不允许出现（`docs/03` §15）。
+   * 副作用修正：chips 计数来自 `statsOf(全库)`，此前在 none 页会显示上个会话的数字。
+   */
+  if (!state || state.page.kind === 'none') {
+    return { items: [], deduped: 0, counts: { total: 0, video: 0, image: 0 } };
+  }
   // 单会话视图：groupBy 固定 'conv'（只有一个分组），这里直接把它摊平。
   const result = queryLibrary(library, { filter: prefs.filter, query: '', sort: prefs.sort, groupBy: 'conv' });
   const group = result.groups[0];
@@ -233,7 +257,7 @@ function headHtml(): string {
 function sessHtml(items: MediaItem[], deduped: number): string {
   const { dot, text, ready } = statusLine();
   const page = state?.page;
-  const badge = state?.stale ? STALE_BADGE : PAGE_BADGE[page?.kind ?? 'none'];
+  const badge = state?.stale ? STALE_BADGE : pageBadge(page);
   const latest = items.length ? Math.max(...items.map((item) => item.lastSeen)) : 0;
 
   return `<section class="sess">
@@ -311,7 +335,7 @@ function emptyHtml(): string {
   if (!state || state.page.kind === 'none') {
     return `<div class="empty">
       <div class="empty-ic">${icon('image')}</div>
-      <h3>未检测到豆包页面</h3>
+      <h3>未检测到豆包对话或分享页面</h3>
       <p>资源库只显示<b>当前激活对话</b>解析到的资源。打开豆包对话页或分享链接页后会自动开始解析。</p>
     </div>`;
   }

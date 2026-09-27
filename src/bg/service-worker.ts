@@ -22,8 +22,10 @@ import { DownloadQueue, FilenameAllocator } from '../core/download';
 import {
   type Library,
   filterDraftsByConv,
+  isLeaveScope,
   markFailed,
   patchItem,
+  rekeyConv,
   retainConv,
   retitleConv,
   statsOf,
@@ -31,7 +33,12 @@ import {
 } from '../core/library-store';
 import { broadcast, onRuntimeMessage, trySendToTab } from '../core/messaging';
 import { migrate, onStateChanged, patchConfig, readConfig, readLibrary, readState, writeLibrary } from '../core/storage';
-import { CHAT_PATH_PATTERN, THREAD_PATH_PATTERN } from '../core/site-contract';
+import {
+  CHAT_PATH_PATTERN,
+  THREAD_PATH_PATTERN,
+  isDoubaoHostUrl,
+  isLocalConvId,
+} from '../core/site-contract';
 import type {
   Config,
   ConvScope,
@@ -175,17 +182,58 @@ function scopeKey(scope: ConvScope | null | undefined): string | null {
   return convId ? convId : null;
 }
 
+/** 结束会话作用域：内存与 session 存储一并置空（`isLeaveScope` 分支专用） */
+async function clearScope(): Promise<void> {
+  activeScope = null;
+  try {
+    await chrome.storage.session.remove(SESSION_SCOPE);
+  } catch {
+    /* session 存储不可用时内存已置空 */
+  }
+}
+
 async function applyScope(scope: ConvScope): Promise<void> {
   try {
     const previous = await recallScope();
     const convId = scope.convId.trim();
+
+    /*
+     * 离开会话（2026-09-27 第八轮）：豆包域内的非会话页（首页 `/chat` 等）。
+     * L1 语义补角：资源库 == 当前激活会话 —— 没有激活会话 → 库整体清空 + 作用域置空。
+     * 回到任何会话时 chain 历史重拉会照常恢复该会话的条目（与「切走即清空」同一语义）。
+     * 幂等：已处于无会话状态时直接返回。
+     * ⚠️ 只由**页面侧的 conv:scope** 触发 —— `buildStateResponse` / `syncScopeFromTab`
+     *   对 kind=none 仍然不调用本函数的清库分支（活动标签页不是豆包页 ≠ 离开会话，
+     *   不能因为用户切去别的网站就清掉后台豆包页的库）。
+     */
+    if (isLeaveScope(scope)) {
+      if (!scopeKey(previous)) return;
+      const library = await getLibrary();
+      const left = Object.keys(library).length;
+      await clearScope();
+      await persistLibrary({});
+      diag('bg.scope', `离开会话（kind=${scope.kind}）→ 资源库清空（原 ${left} 条）`);
+      return;
+    }
+
     const convChanged = scopeKey(previous) !== scopeKey(scope);
     const titleChanged = Boolean(convId && scope.title && previous?.title !== scope.title);
     if (!convChanged && !titleChanged) return;
 
     const library = await getLibrary();
     let next = library;
-    if (convChanged && convId) next = retainConv(next, convId);
+    if (convChanged && convId) {
+      const previousId = scopeKey(previous);
+      /*
+       * 新建会话的占位 ID（`local_*`）→ 真实 ID（2026-09-27 第七轮）：
+       * 占位窗口期入库的条目 convId 是占位值，直接 retainConv 会把它们当「异会话」清掉。
+       * 先重键到真实会话、再裁剪其它会话 —— 新会话生成阶段捕获的素材因此不会丢。
+       */
+      if (previousId && isLocalConvId(previousId) && !isLocalConvId(convId)) {
+        next = rekeyConv(next, previousId, convId);
+      }
+      next = retainConv(next, convId);
+    }
     if (convId && scope.title) next = retitleConv(next, convId, scope.title);
 
     // 标题留空时沿用同一会话上一次已知的真实标题（页面可能先报空、随后再报标题）
@@ -253,7 +301,13 @@ async function flushDrafts(): Promise<void> {
   // chain / SSE 的响应可能晚于「用户切走」才到，那时页面盖的是新会话的 ID，
   // 收进来就会变成另一条会话下的重复资源。
   const scope = await recallScope();
-  const drafts = filterDraftsByConv(buffered, scope?.convId ?? '');
+  // 没有激活会话（已离开会话页，第八轮）→ 草稿一律不入库。
+  // 否则首页期间兜到的「unknown 会话」草稿会写进刚清空的库，残留重新出现。
+  if (!scope?.convId) {
+    diag('bg.upsert', `无激活会话，丢弃草稿 ${buffered.length} 条`, { level: 'warn' });
+    return;
+  }
+  const drafts = filterDraftsByConv(buffered, scope.convId);
   const dropped = buffered.length - drafts.length;
   if (dropped > 0) {
     diag('bg.upsert', `丢弃异会话草稿 ${dropped} 条（当前会话=${scope?.convId || '-'}）`, { level: 'warn' });
@@ -550,10 +604,10 @@ async function handleDownloadRequest(
 /* --------------------------------------------------------------------------- */
 
 function isDoubaoUrl(url: string | undefined): boolean {
-  if (!url) return false;
+  // 域名判定集中在 site-contract（`isDoubaoHostUrl`），这里只补「是会话页路径」一层
+  if (!isDoubaoHostUrl(url)) return false;
   try {
-    const { hostname, pathname } = new URL(url);
-    if (!/(^|\.)(doubao|dola)\.com$/.test(hostname)) return false;
+    const { pathname } = new URL(url ?? '');
     return CHAT_PATH_PATTERN.test(pathname) || THREAD_PATH_PATTERN.test(pathname);
   } catch {
     return false;

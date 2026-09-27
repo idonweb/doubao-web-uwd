@@ -17,7 +17,7 @@ import { DEFAULT_CONFIG, LIMITS, MSG } from '../core/constants';
 import { makeRecord, sample } from '../core/diagnostics';
 import { envelope, onWindowMessage, postToWindow } from '../core/messaging';
 import { normalizeConfig } from '../core/storage';
-import { RANK, toDrafts, type DraftContext } from '../core/extract';
+import { RANK, toDrafts, classifyResponseConv, collectConversationIds, type DraftContext } from '../core/extract';
 import { extractChainRaw } from '../core/extract/chain';
 import { extractSseRaw } from '../core/extract/sse';
 import { extractThreadRaw, describeTitleFields, findShareInfo, parseFnArgs, shareTitle, FN_ARGS_SELECTOR } from '../core/extract/thread';
@@ -29,6 +29,7 @@ import {
   CHAT_PATH_PATTERN,
   CONV_ID_PATTERN,
   DOM_CONTRACT,
+  isLocalConvId,
   SSE_ENDPOINT,
   THREAD_PATH_PATTERN,
 } from '../core/site-contract';
@@ -218,9 +219,16 @@ declare global {
     };
   }
 
-  /** 把「当前激活会话」告知 background —— 它是资源库会话作用域的唯一依据 */
+  /**
+   * 把「当前激活会话」告知 background —— 它是资源库会话作用域的唯一依据。
+   *
+   * ⚠️ 2026-09-27 第八轮：`kind=none`（豆包域内的非会话页，如首页 `/chat`）**也要上报** ——
+   * 旧的 early-return 让 bg 永远不知道「已离开会话」，`retainConv` 不执行，
+   * 上个会话的条目残留进库，被弹窗在「未检测到豆包对话或分享页面」状态下画出来
+   * （实测：首页弹窗显示上一会话的视频，`docs/03` §15）。
+   * bg 侧对 none 的处置（清库 + 作用域置空）见 `bg::applyScope` 的 `isLeaveScope` 分支。
+   */
   function emitScope(): void {
-    if (pageKind === 'none') return;
     postToWindow(envelope('page', MSG.ConvScope, { convId, title: convTitle, kind: pageKind }));
   }
 
@@ -300,21 +308,46 @@ declare global {
   }
 
   /**
-   * 响应是否属于「当前激活会话」。
+   * 响应是否属于「当前激活会话」（**仅在没有响应自报会话可用时**作为兜底判定）。
    *
    * 判定依据是**请求发出那一刻**的 convId（而不是响应到达时），
    * 因为 SSE / chain 的响应可能晚于「用户切走」才到；那时 `draftContext()` 会盖上
    * 新会话的 convId，同一条素材于是在两个会话下各存一份 —— 实机的「重复记录」。
+   *
+   * ⚠️ 2026-09-27 第七轮补充：新建会话的请求发出时 convId 还是 `local_*` **占位 ID**，
+   * 响应到达时页面已被站点 replaceState 成真实 ID —— 两者永不相等。
+   * 占位值一律视为「属于当前会话」放行，否则新会话的生成响应会被误杀（实测 Bug A）。
    */
   function isCurrentConvResponse(requestConvId: string): boolean {
-    return !requestConvId || requestConvId === (convId || 'unknown');
+    if (!requestConvId || isLocalConvId(requestConvId)) return true;
+    return requestConvId === (convId || 'unknown');
+  }
+
+  /** 拼一条「丢弃异会话响应」的诊断（把判定依据写清楚，便于以后翻记录） */
+  function dropForeignResponse(
+    event: 'parse.sse' | 'parse.chain',
+    requestConvId: string,
+    verdict: 'foreign' | 'unknown',
+    text: string,
+  ): void {
+    const selfReported = verdict === 'foreign' ? collectConversationIds(text).join('|') : '未自报';
+    diag(
+      event,
+      `丢弃异会话响应（请求 convId=${requestConvId} 当前=${convId || '-'} 响应自报=${selfReported}）len=${text.length}`,
+      { level: 'warn' },
+    );
   }
 
   function handleSse(text: string, requestConvId: string): void {
-    if (!isCurrentConvResponse(requestConvId)) {
-      diag('parse.sse', `丢弃异会话响应（请求 convId=${requestConvId} 当前=${convId || '-'}）len=${text.length}`, {
-        level: 'warn',
-      });
+    /*
+     * 响应归属两级判定（2026-09-27 第七轮，修 Bug A / Bug B）：
+     * ① 响应自报会话优先：SSE 报文自带 conversation_id（SSE_ACK / FULL_MSG_NOTIFY）。
+     *    自报会话不含当前会话 → 这是推给别的会话的消息，整体丢弃；
+     * ② 自报不了（结构变化）才退回「请求时刻快照」判定（占位 local_* 豁免，见上）。
+     */
+    const verdict = classifyResponseConv(text, convId || 'unknown');
+    if (verdict === 'foreign' || (verdict === 'unknown' && !isCurrentConvResponse(requestConvId))) {
+      dropForeignResponse('parse.sse', requestConvId, verdict, text);
       return;
     }
     const hasCreationBlock = text.includes('creation_block');
@@ -329,10 +362,15 @@ declare global {
   }
 
   function handleChain(text: string, requestConvId: string): void {
-    if (!isCurrentConvResponse(requestConvId)) {
-      diag('parse.chain', `丢弃异会话响应（请求 convId=${requestConvId} 当前=${convId || '-'}）len=${text.length}`, {
-        level: 'warn',
-      });
+    /*
+     * 与 handleSse 同一套两级判定（2026-09-27 第七轮）。
+     * 实测 Bug B：chain/single 是用户级 IM 同步通道，视频生成完成的消息会从**别的会话**
+     * 推到当前连接上 —— 只看「请求发给谁」时它被盖上当前会话的章入库，
+     * 造成「新视频跨对话出现在资源库」。现在按响应自报的 conversation_id 判定，异会话整体丢弃。
+     */
+    const verdict = classifyResponseConv(text, convId || 'unknown');
+    if (verdict === 'foreign' || (verdict === 'unknown' && !isCurrentConvResponse(requestConvId))) {
+      dropForeignResponse('parse.chain', requestConvId, verdict, text);
       return;
     }
     const hasMainUrl = new RegExp(CHAIN_MAIN_URL_RE.source, CHAIN_MAIN_URL_RE.flags).test(text);

@@ -89,6 +89,61 @@ export function retainConv(library: Library, convId: string): Library {
   return changed ? next : library;
 }
 
+/**
+ * 是否为「离开会话」的作用域上报：豆包域内的**非会话页**（首页 `/chat`、无会话 ID 的页面）。
+ *
+ * 2026-09-27 第八轮新增。L1 的语义补角：资源库 == 当前激活会话 ——
+ * 之前只定义了「切走即清空」，没定义「离开到非会话页」算什么，
+ * 结果 bg 永远不知道用户已离开会话，上个会话的条目残留进库
+ * （实测：豆包首页的弹窗在「未检测到豆包对话或分享页面」状态下显示上一会话的视频，`docs/03` §15）。
+ *
+ * bg 收到后应**清空资源库 + 置空作用域**；回到任何会话时 chain 历史重拉会照常恢复
+ * （与「切走即清空、回来靠重解析」同一语义，实测可恢复）。
+ * ⚠️ `local_*` 占位会话**不是**离开 —— 它仍是会话，由 `rekeyConv` 接手（第七轮）。
+ */
+export function isLeaveScope(scope: { convId?: string; kind?: string }): boolean {
+  if (scope.kind === 'none') return true;
+  return !scope.convId?.trim();
+}
+
+/**
+ * 把 `fromConvId` 会话下的所有条目**重键**到 `toConvId` 会话。
+ *
+ * 2026-09-27 第七轮新增。背景：新建会话时页面 URL 先是 `local_*` 占位 ID，
+ * 提交首条消息后才 replaceState 成真实 ID —— 占位窗口期入库的条目 convId 是占位值，
+ * 真实 ID 的 scope 到达时若直接 `retainConv()` 会把它们当「异会话」清掉（丢素材）。
+ * 调用方（`bg::applyScope`）检测到「占位 → 真实」的会话切换时，先重键再裁剪。
+ *
+ * 指纹冲突（同一素材在两个会话 ID 下各有一条）时合并 variants / meta，保留更完整的。
+ * 无占位条目时原样返回（便于调用方用 `next !== library` 判断是否需要落盘）。
+ */
+export function rekeyConv(library: Library, fromConvId: string, toConvId: string): Library {
+  if (!fromConvId || !toConvId || fromConvId === toConvId) return library;
+  const next: Library = { ...library };
+  let changed = false;
+  for (const item of Object.values(library)) {
+    if (item.convId !== fromConvId) continue;
+    const targetId = itemId(toConvId, item.fingerprint);
+    const existing = next[targetId];
+    if (existing) {
+      const variants = dedupeVariants([...existing.variants, ...item.variants]);
+      const primary = pickPrimaryVariant(variants);
+      next[targetId] = {
+        ...existing,
+        variants,
+        primary: primary?.url ?? existing.primary,
+        meta: metaMerge(existing.meta, item.meta),
+        lastSeen: Math.max(existing.lastSeen, item.lastSeen),
+      };
+    } else {
+      next[targetId] = { ...item, id: targetId, convId: toConvId };
+    }
+    delete next[item.id];
+    changed = true;
+  }
+  return changed ? next : library;
+}
+
 /** 拿到真实会话标题后，把该会话下**所有**条目的标题一并刷新（解除「兜底标题粘住」） */
 export function retitleConv(library: Library, convId: string, title: string): Library {
   // 只接受真实标题：弱标题（兜底值 / 站点通用名）写进去只会污染资源库

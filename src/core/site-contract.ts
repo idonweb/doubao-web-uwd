@@ -21,6 +21,51 @@ export const THREAD_PATH_PATTERN = /\/thread\//;
 /** 从 URL 中提取会话 ID 的特征（/chat/<id> 或 /thread/<id>） [上游] */
 export const CONV_ID_PATTERN = /\/(?:chat|thread)\/([A-Za-z0-9_-]+)/;
 
+/**
+ * 新建会话的**临时占位会话 ID 前缀** [实测 2026-09-27 · 单样本]
+ *
+ * 实测流程（2026-09-27 第七轮）：新建对话时站点先把 URL 导到 `/chat/local_<数字>`
+ * （此时服务端还没分配会话 ID），提交首条消息后才分配真实 ID 并 `replaceState` 换掉占位值。
+ * 因此「请求发出时刻」从 URL 提取的 convId 可能是占位值，而「响应到达时刻」页面已是真实 ID
+ * —— 两者永不相等，按旧逻辑会把携带 creation_block 的 SSE 生成响应误判为「异会话」整体丢弃
+ * （实测现象：新会话生成的视频在生成阶段无法入库，只能等几分钟后的 chain 推送）。
+ * ⚠️ 目前只有一次实测样本（`local_1371803923460589`）；站点若更换占位格式，改这里即可。
+ */
+export const LOCAL_CONV_ID_PREFIX = 'local_';
+
+/** 判断会话 ID 是否为「新建会话的临时占位 ID」 */
+export function isLocalConvId(convId: string | undefined | null): boolean {
+  return Boolean(convId && convId.startsWith(LOCAL_CONV_ID_PREFIX));
+}
+
+/**
+ * 运行期判断 URL 是否属于**豆包域**（doubao.com / dola.com 及其子域）。
+ *
+ * 2026-09-27 第八轮补充：弹窗的「非会话页」徽标需要区分
+ * 「豆包站内但尚未开始对话」（豆包首页）与「压根不在豆包」两种情形 ——
+ * 域名知识属于站点契约，集中在这里（与 `HOST_PERMISSIONS` / bg 的 `isDoubaoUrl` 同源）。
+ */
+export function isDoubaoHostUrl(url: string | undefined | null): boolean {
+  if (!url) return false;
+  try {
+    const { hostname } = new URL(url);
+    return /(?:^|\.)(?:doubao|dola)\.com$/.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 从 SSE / chain 响应**文本**里收集 conversation_id 的正则 [实测 2026-09-27]
+ *
+ * 为什么按文本正则而不是解析后取字段：conversation_id 在响应体里出现的位置不固定
+ * （SSE 的 SSE_ACK / FULL_MSG_NOTIFY、chain 的 `messages[].conversation_id`），
+ * 且经常被包在**多层转义的 JSON 字符串**里（`\"conversation_id\":\"38444...\"`）。
+ * 这里容忍 0~4 个反斜杠的转义深度；取值字符集与 CONV_ID_PATTERN 一致（含 `local_` 占位）。
+ */
+export const RESPONSE_CONV_ID_RE =
+  /\\{0,4}"conversation_id\\{0,4}"\s*:\s*\\{0,4}"([A-Za-z0-9_-]+)\\{0,4}"/g;
+
 /** SSE 流式响应端点：无水印原片 URL 的主要来源 [上游] */
 export const SSE_ENDPOINT = '/chat/completion';
 /** REST 端点：历史会话消息，main_url 为 base64 [上游] */
@@ -391,6 +436,13 @@ export const DOM_CONTRACT: DomContract = {
     '  会话标题元素可能还挂着旧节点、消息容器更是上一段对话的内容 —— 读到就采用会把',
     '  上一个对话的标题错位到新会话上（实测三度踩坑）。对策是 core/title.ts 的**快照闸门**',
     '  + **弱标题识别**（兜底值 / 站点通用名 `豆包 - 字节跳动旗下 AI 智能助手` 都不可当会话名）。',
+    '【实测 2026-09-27 · chain/single 是用户级 IM 同步通道】后台任务（视频生成）完成时，',
+    '  服务端会把**其它会话**的消息从当前打开的 chain 连接推送下来（实测：停留在会话 A 的页面',
+    '  收到了会话 B 的「生成完成」消息）。因此响应归属必须按**响应体自报的 conversation_id**',
+    '  判定（`classifyResponseConv`），不能只看「请求是发给哪个会话的」—— 后者拦不住跨会话推送。',
+    '【实测 2026-09-27 · 新会话占位 ID】新建对话时 URL 先是 `/chat/local_<数字>`，',
+    '  提交首条消息后才 replaceState 成真实 ID。涉及「请求时刻快照 convId」的判定都必须豁免',
+    '  `local_` 占位（`isLocalConvId`），否则新会话的生成响应会被异会话过滤器误杀。',
   ],
 };
 

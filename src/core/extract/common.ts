@@ -14,6 +14,7 @@ import {
   IMG_PREVIEW_PATH,
   IMG_RAW_PATH,
   IMG_THUMB_PATH,
+  RESPONSE_CONV_ID_RE,
   VID_DOWNLOAD_PATH,
   VID_MODEL_PATH,
   VID_RAW_PATH,
@@ -476,4 +477,49 @@ export function toDrafts(raws: RawMedia[], ctx: DraftContext): MediaDraft[] {
     if (draft) out.push(draft);
   }
   return out;
+}
+
+/* --------------------------------------------------------------------------- */
+/* 响应归属判定（2026-09-27 第七轮）                                              */
+/*                                                                             */
+/* 实测两个事实（诊断 JSON `uwd-diag-1790488525983`）：                           */
+/*   ① `/im/chain/single` 是**用户级 IM 同步通道** —— 后台任务（视频生成）完成时，  */
+/*      服务端会把**其它会话**的消息从当前打开的连接推送下来。只看「请求发给哪个会话」  */
+/*      拦不住这种跨会话推送，必须看响应体自报的 conversation_id。                  */
+/*   ② 新建会话的请求发出时 URL 还是 `local_*` 占位 ID，响应到达时已是真实 ID。      */
+/* --------------------------------------------------------------------------- */
+
+/** `classifyResponseConv` 的判定结果 */
+export type ResponseConvVerdict =
+  /** 响应自报的会话包含当前会话 → 接受 */
+  | 'match'
+  /** 响应自报的会话全部不是当前会话 → 跨会话推送，整体丢弃 */
+  | 'foreign'
+  /** 响应里读不到任何 conversation_id → 退回「请求时刻快照」判定 */
+  | 'unknown';
+
+/** 从响应文本收集 conversation_id（去重保序；容忍 0~4 级 JSON 转义） */
+export function collectConversationIds(text: string): string[] {
+  if (!text) return [];
+  const re = new RegExp(RESPONSE_CONV_ID_RE.source, RESPONSE_CONV_ID_RE.flags);
+  const out: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    if (match[1] && !out.includes(match[1])) out.push(match[1]);
+  }
+  return out;
+}
+
+/**
+ * 判定一条 SSE / chain 响应属于哪个会话。
+ *
+ * - `foreign` → 整体丢弃。不丢也不会更正：把异会话的素材盖当前会话的章入库，
+ *   正是实测「新视频跨对话出现在资源库」的成因；丢弃后用户切回那个会话时，
+ *   chain 历史照常补上，不损失资源。
+ * - `unknown` → 调用方退回「请求时刻快照」判定（占位 `local_*` 豁免，见 `page/hook.ts`）。
+ */
+export function classifyResponseConv(text: string, currentConvId: string): ResponseConvVerdict {
+  const ids = collectConversationIds(text);
+  if (!ids.length) return 'unknown';
+  return ids.includes(currentConvId) ? 'match' : 'foreign';
 }
