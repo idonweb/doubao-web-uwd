@@ -1,0 +1,30 @@
+{
+  "name": "doubao-web-uwd",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "UWD (UnWatermarked Download) — 豆包网页端无水印视频 / 图片下载浏览器扩展（Chrome / Edge MV3）",
+  "license": "GPL-3.0",
+  "author": "B站 @暮星河 (https://space.bilibili.com/400911)",
+  "contributors": [
+    "B站 Tps-pwd (https://space.bilibili.com/3546746508544573)",
+    "B站 嗯哼de呀 (https://space.bilibili.com/491672078)"
+  ],
+  "devDependencies": {
+    "@types/chrome": "^0.3.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "icons": "node scripts/gen-icons.mjs",
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "zip": "node scripts/zip.mjs",
+    "verify": "npm run typecheck && npm run test && npm run build"
+  }
+}

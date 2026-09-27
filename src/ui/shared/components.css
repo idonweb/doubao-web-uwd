@@ -1,0 +1,456 @@
+/** 共用组件样式（弹窗与资源库共享），令牌见 tokens.css */
+
+/* ---------- 按钮 ---------- */
+.btn {
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 8px 13px;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: 0.15s;
+  white-space: nowrap;
+}
+.btn:hover {
+  border-color: var(--brand-line);
+  color: var(--brand);
+  background: var(--brand-soft);
+}
+.btn.primary {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+}
+.btn.primary:hover {
+  background: var(--brand-hover);
+  border-color: var(--brand-hover);
+  color: #fff;
+}
+.btn.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+}
+.btn.ghost:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.btn.danger {
+  color: var(--danger);
+  border-color: var(--border-strong);
+}
+.btn.danger:hover {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.btn.grow {
+  flex: 1;
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn.sm {
+  padding: 5px 10px;
+  font-size: 11.5px;
+  border-radius: 6px;
+}
+
+.icon-btn {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: 0.15s;
+  flex-shrink: 0;
+}
+.icon-btn:hover {
+  color: var(--brand);
+  border-color: var(--brand-line);
+  background: var(--brand-soft);
+}
+.icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ---------- 徽标 / 标签 ---------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.badge .ic {
+  width: 11px;
+  height: 11px;
+  stroke-width: 2;
+}
+.b-chat {
+  background: var(--info-soft);
+  color: var(--info);
+}
+.b-thread {
+  background: var(--thread-soft);
+  color: var(--thread);
+}
+.b-none {
+  background: var(--surface-3);
+  color: var(--text-3);
+}
+.b-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.tag {
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 1.5px 6px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  line-height: 1.5;
+}
+.tag .ic {
+  width: 10px;
+  height: 10px;
+  stroke-width: 2.2;
+}
+.t-raw {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.t-thumb {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.t-mid {
+  background: var(--surface-2);
+  color: var(--text-3);
+}
+.t-fail {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* ---------- 状态点 ---------- */
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  position: relative;
+}
+.dot.ok {
+  background: var(--ok);
+}
+.dot.ok::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1.5px solid var(--ok);
+  opacity: 0.35;
+  animation: pulse 2s ease-out infinite;
+}
+.dot.off {
+  background: var(--text-4);
+}
+.dot.warn {
+  background: var(--warn);
+}
+@keyframes pulse {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.5;
+  }
+  70% {
+    transform: scale(1.5);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* ---------- 开关 ---------- */
+.sw {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.sw:last-child {
+  border-bottom: 0;
+}
+.sw-txt {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sw-txt .n {
+  font-size: 13px;
+  font-weight: 500;
+}
+.sw-txt .d {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.45;
+}
+.tg {
+  width: 38px;
+  height: 22px;
+  border-radius: 11px;
+  background: var(--surface-3);
+  position: relative;
+  flex-shrink: 0;
+  transition: background 0.2s;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+}
+.tg::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: transform 0.2s;
+}
+.tg.on {
+  background: var(--brand);
+}
+.tg.on::after {
+  transform: translateX(16px);
+}
+
+/* ---------- 分段控件 / 选择器 ---------- */
+.seg {
+  display: flex;
+  background: var(--surface-2);
+  border-radius: var(--r-md);
+  padding: 2px;
+  gap: 2px;
+}
+.seg button {
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 11px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.seg button.on {
+  background: var(--bg);
+  color: var(--brand);
+  box-shadow: var(--shadow-1);
+  font-weight: 500;
+}
+
+select.sel {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  outline: 0;
+}
+
+.vw {
+  display: flex;
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 1px;
+}
+.vw button {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  width: 24px;
+  height: 22px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.vw button.on {
+  background: var(--bg);
+  color: var(--brand);
+  box-shadow: var(--shadow-1);
+}
+
+/* ---------- 分段标题 ---------- */
+.sec-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+/* ---------- 勾选框 ---------- */
+.ck {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  opacity: 0;
+  transition: 0.15s;
+  z-index: 2;
+}
+.card:hover .ck,
+.card.sel .ck {
+  opacity: 1;
+}
+.card.sel .ck {
+  background: var(--brand);
+  border-color: var(--brand);
+}
+.ck .ic {
+  width: 11px;
+  height: 11px;
+  stroke-width: 2.6;
+}
+
+/* ---------- 空状态 ---------- */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  padding: 30px 20px;
+  gap: 10px;
+}
+.empty-ic {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  background: var(--surface-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-4);
+}
+.empty-ic .ic {
+  width: 24px;
+  height: 24px;
+  stroke-width: 1.5;
+}
+.empty h3 {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.empty p {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.65;
+  max-width: 280px;
+}
+
+/* ---------- 提示条 ---------- */
+.hint {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.6;
+  background: var(--surface);
+  border-radius: var(--r-md);
+  padding: 8px 10px;
+}
+.hint b {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+/* 行内文字链接 */
+.link {
+  color: var(--brand);
+  cursor: pointer;
+  text-decoration: none;
+  margin-left: 4px;
+}
+.link:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Toast ---------- */
+.toast-host {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  z-index: 100;
+  pointer-events: none;
+}
+.toast {
+  background: var(--text);
+  color: var(--bg);
+  font-size: 12px;
+  padding: 7px 12px;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-2);
+  opacity: 0;
+  transform: translateY(6px);
+  transition: 0.2s;
+  max-width: 320px;
+}
+.toast.show {
+  opacity: 0.94;
+  transform: translateY(0);
+}
+.toast.err {
+  background: var(--danger);
+  color: #fff;
+}

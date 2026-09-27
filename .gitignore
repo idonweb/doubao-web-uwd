@@ -1,0 +1,18 @@
+node_modules/
+dist/
+release/
+*.log
+.DS_Store
+Thumbs.db
+
+# 本机开发 / 调试所需，用户使用插件不需要 —— 均不入库
+# （docs/ 是本地工程文档专用目录：方案、六轮联调记录、工程说明、
+#   入库清单，以及两份工程记录 SESSION_CONTEXT.md / SESSION_ARCHIVE.md）
+.preview/
+demo/
+docs/
+reference/
+
+# Release 正文：发布时用 `gh release create --notes-file` 引用本地文件，
+# 内容在 GitHub 的 Releases 页面即可看到，仓库里不再放一份
+RELEASE_NOTES_*.md

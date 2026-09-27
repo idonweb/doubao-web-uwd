@@ -1,0 +1,137 @@
+/**
+ * 设计令牌 —— 与 `demo/ui-demo.html`（视觉验收基准）逐字对齐。
+ * 站点改版不涉及本文件；只有 UI 评审结论变化时才改。
+ */
+
+:root {
+  --brand: #0057ff;
+  --brand-hover: #0066ff;
+  --brand-soft: #e8f0ff;
+  --brand-line: #b8d0ff;
+
+  --bg: #ffffff;
+  --surface: #f7f8fa;
+  --surface-2: #f0f2f5;
+  --surface-3: #e8eaed;
+
+  --border: #e5e6eb;
+  --border-strong: #d5d8de;
+
+  --text: #1d2129;
+  --text-2: #5a6272;
+  --text-3: #8a93a3;
+  --text-4: #b8bec9;
+
+  --ok: #00b42a;
+  --ok-soft: #e8ffea;
+  --warn: #ff7d00;
+  --warn-soft: #fff7e8;
+  --danger: #f53f3f;
+  --danger-soft: #ffece8;
+  --info: #3491fa;
+  --info-soft: #e8f3ff;
+  --thread: #7a4dd8;
+  --thread-soft: #f3eeff;
+
+  /*
+   * 开发者署名专用（2026-09-27 用户指定）。
+   * 不属于语义色板，浅/深色主题共用同一个值，故只在 `:root` 定义、深色块不重复。
+   */
+  --author: #ff5488;
+
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.04), 0 0 1px rgba(0, 0, 0, 0.06);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.07), 0 1px 3px rgba(0, 0, 0, 0.05);
+
+  --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+}
+
+[data-theme='dark'] {
+  --brand: #3d7dff;
+  --brand-hover: #5a92ff;
+  --brand-soft: #16264a;
+  --brand-line: #2c4a85;
+
+  --bg: #1b1d21;
+  --surface: #22252a;
+  --surface-2: #282c32;
+  --surface-3: #31353c;
+
+  --border: #33373e;
+  --border-strong: #43484f;
+
+  --text: #e8eaed;
+  --text-2: #a8b0bc;
+  --text-3: #7d8492;
+  --text-4: #5c636e;
+
+  --ok: #3fbf52;
+  --ok-soft: #12301a;
+  --warn: #ffa23a;
+  --warn-soft: #33230c;
+  --danger: #ff6a5e;
+  --danger-soft: #3a1d1a;
+  --info: #5aa8ff;
+  --info-soft: #12243c;
+  --thread: #a98bff;
+  --thread-soft: #241a3a;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-2: 0 4px 14px rgba(0, 0, 0, 0.4);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  font-family: var(--sans);
+  color: var(--text);
+  background: var(--surface);
+  -webkit-font-smoothing: antialiased;
+  font-size: 13px;
+}
+
+svg {
+  display: block;
+}
+
+.ic {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+.ic-sm {
+  width: 14px;
+  height: 14px;
+}
+.ic-lg {
+  width: 18px;
+  height: 18px;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 5px;
+  border: 2.5px solid var(--bg);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

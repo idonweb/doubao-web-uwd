@@ -1,0 +1,578 @@
+@import '../shared/tokens.css';
+@import '../shared/components.css';
+
+/**
+ * 弹窗样式（单窗口：弹窗即资源库）。
+ *
+ * 2026-09-26 第五轮：原来的「设置视图 360px ⇄ 资源库视图 720px」两级窗口已取消，
+ * 因此这里不再需要 `body.wide` 切换、`#library-view` / iframe、设置视图的卡片与开关样式；
+ * 资源库的列表 / 卡片 / 批量条样式从已删除的 `library.css` 迁到这里。
+ */
+
+/* Chrome 弹窗上限 800×600；宽度按冻结口径取 720px。 */
+body {
+  width: 720px;
+  background: var(--bg);
+}
+
+/*
+ * 高度用固定值而不是 100vh：弹窗视口高度是由内容撑出来的，用 vh 会自我循环。
+ * 600 是 Chrome 的弹窗高度上限，这里留 6px 余量，与改造前 `#library-view` 的处理一致。
+ */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 594px;
+  min-width: 300px;
+}
+
+/* ---------- 头部 ---------- */
+.hd {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.hd-logo {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: var(--brand);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.hd-logo .ic {
+  width: 17px;
+  height: 17px;
+  stroke-width: 2;
+}
+.hd-title {
+  flex: 1;
+  min-width: 0;
+}
+.hd-title h1 {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+.hd-title p {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  margin-top: 1px;
+  /* 头部始终单行：版本号 / 作者信息过长时省略，悬停 title 看全文 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/*
+ * ⚠️ 选择器必须写到 `.hd-title .hd-author`（两个类）：上面那条 `.hd-title p`
+ * 是「类 + 元素」，只写 `.hd-author`（一个类）会被它压住，颜色仍是 --text-3。
+ */
+.hd-title .hd-author {
+  color: var(--author);
+  font-family: inherit;
+}
+.hd-title .hd-author a {
+  color: inherit;
+  text-decoration: none;
+}
+.hd-title .hd-author a:hover {
+  text-decoration: underline;
+}
+.hd-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ---------- 会话卡（原「状态卡 + 资源库会话头」二合一） ---------- */
+.sess {
+  margin: 12px 14px 0;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  flex-shrink: 0;
+}
+.sess .dot {
+  margin-top: 5px;
+}
+.sess-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.sess-l1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.st-text {
+  font-size: 12.5px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.conv-title {
+  font-size: 12.5px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sess-l2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11px;
+}
+.st-url {
+  font-family: var(--mono);
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.sep {
+  color: var(--text-4);
+  flex-shrink: 0;
+}
+.conv-dedup {
+  font-size: 10.5px;
+  color: var(--warn);
+  background: var(--warn-soft);
+  padding: 1px 6px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.conv-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  flex-shrink: 0;
+}
+
+/* ---------- 工具条（筛选 chips 里的数字 = 全局唯一计数） ---------- */
+.tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.chips {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.chips::-webkit-scrollbar {
+  display: none;
+}
+.chip {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px 9px;
+  border-radius: 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transition: 0.15s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.chip:hover {
+  border-color: var(--brand-line);
+  color: var(--brand);
+}
+.chip.on {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: #fff;
+  font-weight: 500;
+}
+.chip .n {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  opacity: 0.75;
+}
+.tb-right {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+/*
+ * 全选：勾选框 + 文字（取代原来的搜索栏位置）。
+ * 三态：未选（空框）/ 部分选中（实心 + 横杠）/ 全选（实心 + 勾）。
+ */
+.selall {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--text-2);
+  cursor: pointer;
+  padding: 3px 7px;
+  border-radius: 5px;
+  transition: 0.15s;
+  flex-shrink: 0;
+}
+.selall:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.selall.on {
+  color: var(--brand);
+  font-weight: 500;
+}
+.selall .box {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  border: 1.5px solid var(--border-strong);
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  transition: 0.15s;
+  flex-shrink: 0;
+}
+.selall:hover .box {
+  border-color: var(--brand-line);
+}
+.selall.on .box,
+.selall.some .box {
+  border-color: var(--brand);
+  background: var(--brand);
+}
+.selall .box .ic {
+  width: 11px;
+  height: 11px;
+  stroke-width: 2.8;
+}
+.selall .dash {
+  width: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: #fff;
+}
+
+/* ---------- 列表 ---------- */
+.list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+.grid-wrap {
+  display: grid;
+  gap: 9px;
+}
+.grid-2 {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+.list-mode {
+  grid-template-columns: 1fr;
+}
+
+/* ---------- 卡片 ---------- */
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--bg);
+  position: relative;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.card:hover {
+  border-color: var(--brand-line);
+  box-shadow: var(--shadow-2);
+  transform: translateY(-1px);
+}
+.card.sel {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px var(--brand-soft);
+}
+.thumb {
+  position: relative;
+  aspect-ratio: 1/1;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.thumb img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.thumb .ph {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-4);
+  background: var(--surface-2);
+}
+/* `hidden` 属性会被上面的 display:flex 覆盖，必须显式还原 */
+.thumb .ph[hidden] {
+  display: none;
+}
+.thumb-ov {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 14px 7px 5px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.55), transparent);
+}
+.pill {
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.42);
+  padding: 1.5px 5px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  backdrop-filter: blur(3px);
+}
+.play-ic {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+}
+.play-ic .ic {
+  width: 15px;
+  height: 15px;
+  margin-left: 1.5px;
+}
+.list-mode .card {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 8px;
+}
+.list-mode .thumb {
+  width: 52px;
+  height: 52px;
+  aspect-ratio: auto;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+.list-mode .card-body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 0;
+}
+.list-mode .card-meta {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+}
+.list-mode .card-tags {
+  margin: 0;
+}
+.list-mode .card-actions {
+  margin: 0;
+  flex-shrink: 0;
+}
+.card-body {
+  padding: 9px 10px;
+}
+.card-tags {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.card-meta {
+  font-size: 10.5px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  margin-top: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.card-actions {
+  display: flex;
+  gap: 3px;
+  margin-top: 8px;
+}
+.act {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 10.5px;
+  padding: 4px 2px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  transition: 0.15s;
+  white-space: nowrap;
+}
+.act:hover {
+  border-color: var(--brand-line);
+  color: var(--brand);
+  background: var(--brand-soft);
+}
+.act[data-act='rm']:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.act .ic {
+  width: 10px;
+  height: 10px;
+  stroke-width: 2;
+}
+
+/* ---------- 批量操作条 ---------- */
+.batch {
+  padding: 9px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.batch-info {
+  font-size: 12px;
+  color: var(--text-2);
+  margin-right: auto;
+}
+.batch-info b {
+  color: var(--brand);
+  font-family: var(--mono);
+}
+.batch-sum {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: var(--mono);
+}
+
+/* ---------- 底部状态条（常驻说明 + 下载进度 + 诊断入口） ---------- */
+.ft {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.ft-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ft-note .ic {
+  color: var(--ok);
+  flex-shrink: 0;
+}
+.ft-note .dim {
+  color: var(--text-3);
+}
+.ft-prog {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+.bar {
+  flex: 1;
+  max-width: 220px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.bar i {
+  display: block;
+  height: 100%;
+  background: var(--brand);
+  transition: width 0.2s;
+}
+.link-btn {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  flex-shrink: 0;
+}
+.link-btn:hover {
+  background: var(--surface-3);
+  color: var(--brand);
+}

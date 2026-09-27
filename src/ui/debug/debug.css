@@ -1,0 +1,189 @@
+@import '../shared/tokens.css';
+@import '../shared/components.css';
+
+body {
+  background: var(--surface);
+  min-width: 640px;
+}
+
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 18px 20px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.head h1 {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.head .spacer {
+  flex: 1;
+}
+
+.card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 14px 16px;
+}
+.card h2 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 14px;
+  font-size: 12.5px;
+}
+.kv dt {
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.kv dd {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  word-break: break-all;
+}
+.kv dd.ok {
+  color: var(--ok);
+}
+.kv dd.bad {
+  color: var(--danger);
+}
+.kv dd.warn {
+  color: var(--warn);
+}
+/* dd 内的行内注记（例如「已自动跟随最近打开的豆包页」），不继承等宽字体 */
+.kv dd .bad {
+  color: var(--danger);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.steps {
+  font-size: 12.5px;
+  line-height: 1.85;
+  color: var(--text-2);
+}
+.steps ol {
+  padding-left: 20px;
+}
+.steps code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--surface-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text);
+}
+.steps b {
+  color: var(--text);
+}
+
+.log {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 62vh;
+  overflow: auto;
+}
+.row {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  font-size: 12px;
+  /* 需要隐藏圆角溢出，但 `overflow:hidden` 会让 flex 子项的 `min-height:auto`
+     退化为 0 —— 于是在 .log 这个 flex 列容器里，条目一多就被均匀压扁成细线
+     （实机：164 条时整屏只剩横线）。必须显式 `flex-shrink:0` 锁住内容高度，
+     超出部分交给 .log 自己滚动。 */
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.row.warn {
+  border-color: var(--warn);
+}
+.row.error {
+  border-color: var(--danger);
+}
+.row > summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  list-style: none;
+}
+.row > summary::-webkit-details-marker {
+  display: none;
+}
+.row .t {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-4);
+  flex-shrink: 0;
+}
+.row .src {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.row .ev {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--brand);
+  flex-shrink: 0;
+}
+.row.warn .ev {
+  color: var(--warn);
+}
+.row.error .ev {
+  color: var(--danger);
+}
+.row .detail {
+  color: var(--text-2);
+  word-break: break-all;
+}
+.row pre {
+  margin: 0;
+  padding: 10px;
+  border-top: 1px dashed var(--border);
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 12.5px;
+}

@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>豆包无水印下载器</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <!--
+      单窗口：弹窗即资源库。
+
+      2026-09-26 第五轮起，「360px 设置视图 ⇄ 720px 资源库视图（iframe 内嵌 library.html）」
+      的两级窗口已整体取消 —— 唯一剩下的开关改为恒开（界面不再暴露），设置视图失去存在意义。
+      资源库的渲染逻辑随之并入 popup.ts，`ui/library/*` 已删除。
+    -->
+    <div id="app"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,150 @@
+import { describe, expect, it } from 'vitest';
+
+import { clip, describe as describeValue, isKeepEvent, makeRecord, pushBounded, sample } from '../src/core/diagnostics';
+import type { DiagRecord } from '../src/core/diagnostics';
+
+describe('clip 截断', () => {
+  it('短文本原样返回', () => {
+    expect(clip('abc')).toBe('abc');
+    expect(clip('')).toBe('');
+  });
+
+  it('长文本保留头尾并标注省略长度', () => {
+    const text = 'A'.repeat(500) + 'B'.repeat(500) + 'C'.repeat(500);
+    const out = clip(text, 300);
+    expect(out.startsWith('A')).toBe(true);
+    expect(out.endsWith('C')).toBe(true);
+    expect(out).toContain('中略');
+    expect(out.length).toBeLessThan(text.length);
+  });
+});
+
+describe('sample 采样', () => {
+  it('命中关键字时以关键字为中心取窗口', () => {
+    const text = 'x'.repeat(9000) + 'creation_block' + 'y'.repeat(9000);
+    const out = sample(text, 'creation_block', 400);
+    expect(out).toContain('creation_block');
+    expect(out).toContain('围绕 "creation_block"');
+    expect(out.length).toBeLessThan(700);
+  });
+
+  it('未命中关键字时退回头尾截断', () => {
+    const text = 'z'.repeat(9000);
+    const out = sample(text, 'creation_block', 400);
+    expect(out).not.toContain('围绕');
+    expect(out).toContain('中略');
+  });
+
+  it('短文本原样返回', () => {
+    expect(sample('hello', 'hello', 100)).toBe('hello');
+  });
+});
+
+describe('describe 安全摘要', () => {
+  it('处理常见类型', () => {
+    expect(describeValue(undefined)).toBe('undefined');
+    expect(describeValue(null)).toBe('null');
+    expect(describeValue('abc')).toBe('abc');
+    expect(describeValue(42)).toBe('42');
+    expect(describeValue(true)).toBe('true');
+    expect(describeValue({ a: 1 })).toBe('{"a":1}');
+  });
+
+  it('超长字符串被压缩', () => {
+    const out = describeValue('a'.repeat(300), 100);
+    expect(out).toContain('(+200)');
+  });
+
+  it('循环引用不抛异常', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => describeValue(cyclic)).not.toThrow();
+    expect(describeValue(cyclic)).toBe('[unserializable]');
+  });
+});
+
+describe('makeRecord 记录形状', () => {
+  it('默认级别为 info，detail 为空时不写入', () => {
+    const record = makeRecord('page', 'hook.fetch', undefined, { now: 123 });
+    expect(record).toEqual({ t: 123, src: 'page', event: 'hook.fetch', level: 'info' });
+  });
+
+  it('text 自动截断', () => {
+    const record = makeRecord('bg', 'parse.sse', 'x=1', { level: 'warn', text: 'a'.repeat(20000) });
+    expect(record.level).toBe('warn');
+    expect(record.detail).toBe('x=1');
+    expect(record.text?.length).toBeLessThan(20000);
+  });
+});
+
+describe('pushBounded 有界环形缓冲', () => {
+  const rec = (i: number): DiagRecord => ({ t: i, src: 'bg', event: 'e', level: 'info', detail: String(i) });
+
+  it('不超过条数上限，超出时丢最旧的', () => {
+    let list: DiagRecord[] = [];
+    for (let i = 0; i < 10; i++) list = pushBounded(list, rec(i), 5, 1_000_000);
+    expect(list).toHaveLength(5);
+    expect(list[0].detail).toBe('5');
+    expect(list[4].detail).toBe('9');
+  });
+
+  it('不超过字节上限（且至少保留一条，避免把当前这条也丢掉）', () => {
+    const big = (i: number): DiagRecord => ({
+      t: i,
+      src: 'bg',
+      event: 'e',
+      level: 'info',
+      text: 'x'.repeat(500),
+    });
+    let list: DiagRecord[] = [];
+    for (let i = 0; i < 20; i++) list = pushBounded(list, big(i), 1000, 2000);
+    const bytes = list.reduce((sum, item) => sum + JSON.stringify(item).length + 2, 0);
+    expect(bytes).toBeLessThanOrEqual(2000 + 600);
+    expect(list.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('单条记录本身就超上限时也保留', () => {
+    const list = pushBounded([], { t: 1, src: 'bg', event: 'e', level: 'info', text: 'y'.repeat(50_000) }, 100, 100);
+    expect(list).toHaveLength(1);
+  });
+});
+
+describe('关键记录保留策略（docs/03 §3 缺陷 3）', () => {
+  const plain = (i: number): DiagRecord => ({ t: i, src: 'bg', event: 'bg.upsert', level: 'info', detail: `p${i}` });
+  const keep = (i: number): DiagRecord => ({ t: i, src: 'page', event: 'hook.ready', level: 'info', detail: `k${i}` });
+
+  it('isKeepEvent 只认 hook. / net. / parse. 前缀', () => {
+    expect(isKeepEvent('hook.ready')).toBe(true);
+    expect(isKeepEvent('net.xhr')).toBe(true);
+    expect(isKeepEvent('parse.chain')).toBe(true);
+    expect(isKeepEvent('bg.upsert')).toBe(false);
+    expect(isKeepEvent('dom.vidscan')).toBe(false);
+  });
+
+  it('超限时先淘汰最旧的非关键记录，关键记录全部存活', () => {
+    let list: DiagRecord[] = [];
+    // 先放 3 条关键记录，再灌 20 条普通记录，上限只留 6 条
+    for (let i = 0; i < 3; i++) list = pushBounded(list, keep(i), 6, 1_000_000);
+    for (let i = 0; i < 20; i++) list = pushBounded(list, plain(i), 6, 1_000_000);
+
+    expect(list).toHaveLength(6);
+    expect(list.filter((r) => isKeepEvent(r.event))).toHaveLength(3);
+    expect(list.filter((r) => isKeepEvent(r.event)).map((r) => r.detail)).toEqual(['k0', 'k1', 'k2']);
+    // 普通记录只剩最新的 3 条
+    expect(list.filter((r) => !isKeepEvent(r.event)).map((r) => r.detail)).toEqual(['p17', 'p18', 'p19']);
+  });
+
+  it('关键记录自己超限时，从最旧的关键记录开始丢', () => {
+    let list: DiagRecord[] = [];
+    for (let i = 0; i < 10; i++) list = pushBounded(list, keep(i), 4, 1_000_000);
+    expect(list).toHaveLength(4);
+    expect(list.map((r) => r.detail)).toEqual(['k6', 'k7', 'k8', 'k9']);
+  });
+
+  it('关键记录不会被非关键记录的洪峰挤掉', () => {
+    let list: DiagRecord[] = [];
+    list = pushBounded(list, keep(0), 5, 1_000_000);
+    for (let i = 0; i < 500; i++) list = pushBounded(list, plain(i), 5, 1_000_000);
+    expect(list.some((r) => r.detail === 'k0')).toBe(true);
+  });
+});

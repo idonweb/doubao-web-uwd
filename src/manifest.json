@@ -1,0 +1,61 @@
+{
+  "manifest_version": 3,
+  "name": "豆包无水印下载器",
+  "short_name": "UWD",
+  "version": "1.0.0",
+  "description": "自动识别豆包对话页与分享链接页，解析并下载无水印视频 / 图片。仅供个人学习研究使用。",
+  "author": "doubao-web-uwd contributors",
+  "minimum_chrome_version": "114",
+  "permissions": ["storage", "downloads", "declarativeNetRequest", "tabs"],
+  "host_permissions": [
+    "*://*.doubao.com/*",
+    "*://*.dola.com/*",
+    "*://*.byteimg.com/*",
+    "*://*.ibyteimg.com/*",
+    "*://*.douyinvod.com/*",
+    "*://*.douyin.com/*"
+  ],
+  "background": {
+    "service_worker": "bg/service-worker.js"
+  },
+  "action": {
+    "default_title": "豆包无水印下载器",
+    "default_popup": "ui/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "uwd_watermark_rules",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.doubao.com/*", "*://*.dola.com/*"],
+      "js": ["content/bridge.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["*://*.doubao.com/*", "*://*.dola.com/*"],
+      "js": ["page/hook.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}
