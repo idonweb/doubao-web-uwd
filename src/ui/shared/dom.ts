@@ -68,8 +68,13 @@ export const STATE_TAG: Record<MediaState, { cls: string; label: string; icon: I
  * `meta.label` 是 vid 三步 API 按**原片真实宽高**派生的（`docs/03` §12.7），
  * 所以它与用户真正下载到的文件一致；解析还没回来（`pending` / `fail`）
  * 或尺寸不是已知档位时就没有后缀，只显示「无水印原片」。
+ *
+ * 「原片已超期」（2026-09-27 Finding C）：页面已翻遍整棵「我的创作」树仍未找到该 vid
+ * —— 站点对创作记录有保存期限，原片永远取不到了。这是确定性结论，与「获取失败」
+ * （下载失败 / 网络问题，可重试）区分开。样式沿用 fail 的红调。
  */
 export function stateTagLabel(item: MediaItem): string {
+  if (item.meta.expired) return '原片已超期';
   const base = STATE_TAG[item.state].label;
   return item.state === 'raw' && item.meta.label ? `${base}${item.meta.label}` : base;
 }

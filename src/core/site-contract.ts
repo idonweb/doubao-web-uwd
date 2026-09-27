@@ -83,12 +83,46 @@ export const AISPACE_GET_DOWNLOAD_INFO = '/samantha/aispace/get_download_info';
 /** 接口按「名称」匹配创作根节点，中文字面量 [上游] */
 export const CREATION_ROOT_NAME = '我的创作';
 
-/** 三步接口的固定请求体形状 [上游] */
-export const AISPACE_NODE_INFO_BODY = (cid: string) => ({
+/**
+ * node_info 单页条数 [实测 2026-09-27，Finding C 探针]
+ *
+ * 上游写死 `size: 50` 且只拉第一页。实测「我的创作」树是**图文混排、最新在前**的分页列表
+ * （2026-09-27 实测某账号全树 1420 条 = 1387 图 + 33 视频），条目超过 50 之后，
+ * 排在后面的 vid 就永远找不到 —— 树里有但解析失败。站点对 200 照单全收，故提到 200。
+ */
+export const AISPACE_NODE_PAGE_SIZE = 200;
+
+/** node_info 翻页的请求体游标字段名 [实测 2026-09-27：body.cursor = 上一页响应的 next_cursor] */
+export const AISPACE_CURSOR_PARAM = 'cursor';
+
+/** node_info 响应 data 里的翻页字段 [实测 2026-09-27] */
+export const AISPACE_NEXT_CURSOR_KEY = 'next_cursor';
+export const AISPACE_HAS_MORE_KEY = 'has_more';
+
+/**
+ * node_info 翻页上限。
+ *
+ * 10 页 × 200 = 2000 条，已大于实测全树（1420）；设上限是防异常大树打爆请求。
+ * ⚠️ 翻到底（`has_more=false`）仍未见该 vid = **确定性结论**：站点对「我的创作」有保存期限
+ * （2026-09-27 实测：6 月 23 日生成的视频原片仍可解析、5 月的 vid 已被清除 → 窗口约三个月，
+ * 以「最早可解析日」为准），该 vid 的原片**永远**取不到
+ * —— 这不是网络失败，重试没有意义（「原片已超期」状态的依据）。
+ */
+export const AISPACE_WALK_MAX_PAGES = 10;
+
+/** 三步接口的固定请求体形状 [上游 / 实测修正 2026-09-27]
+ *
+ * ⚠️ 两个实测事实：
+ *   1. `node_id` 等节点 id 在 JSON 里是**字符串**（数值超过 JS 安全整数），一律按字符串透传；
+ *   2. 节点 id 是**会话级的**（实测同一节点隔约 45 分钟后 `node not exist`，code=-672020004），
+ *      因此不能跨会话/长时间缓存 id —— 本项目的 resolver 每轮现取 homepage，天然满足。
+ */
+export const AISPACE_NODE_INFO_BODY = (cid: string, cursor?: string) => ({
   node_id: cid,
   need_full_path: true,
-  size: 50,
+  size: AISPACE_NODE_PAGE_SIZE,
   sort_param: { need_sort_config: true, sort_order: 1, sort_type: 0 },
+  ...(cursor ? { [AISPACE_CURSOR_PARAM]: cursor } : {}),
 });
 export const AISPACE_DOWNLOAD_INFO_BODY = (nid: string) => ({ requests: [{ node_id: nid }] });
 

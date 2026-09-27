@@ -156,6 +156,16 @@ onWindowMessage((env) => {
     return;
   }
 
+  // 原片已超期（2026-09-27 Finding C）：page 翻遍创作树未见该 vid，bg 据此把条目落成失败态
+  if (env.type === MSG.LibraryExpire) {
+    const payload = env.payload as { convId?: string; fingerprint?: string; vid?: string } | undefined;
+    if (payload?.convId && payload.fingerprint) {
+      diag('content.expire', `convId=${payload.convId} fingerprint=${payload.fingerprint}`);
+      void sendToBg(MSG.LibraryExpire, payload, 'content').catch(() => undefined);
+    }
+    return;
+  }
+
   // bg 请求重解析 vid 的应答（page → content）
   if (env.type === MSG.VidResolved) {
     const payload = env.payload as { reqId?: string; url?: string | null } | undefined;

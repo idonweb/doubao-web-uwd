@@ -23,6 +23,7 @@ import {
   type Library,
   filterDraftsByConv,
   isLeaveScope,
+  markExpired,
   markFailed,
   patchItem,
   rekeyConv,
@@ -700,6 +701,29 @@ onRuntimeMessage((env, sender, sendResponse) => {
       if (typeof sender.tab?.id === 'number') void rememberContentTab(sender.tab.id);
       if (scope && typeof scope.convId === 'string') {
         void applyScope(scope).then(() => sendResponse({ ok: true }));
+        return true;
+      }
+      sendResponse({ ok: false });
+      return undefined;
+    }
+
+    // 原片已超期（2026-09-27 Finding C）：页面翻遍创作树未见该 vid → 确定性失败，不再永挂「解析中」
+    case MSG.LibraryExpire: {
+      const payload = env.payload as { convId?: string; fingerprint?: string; vid?: string } | undefined;
+      if (payload?.convId && payload.fingerprint) {
+        void (async () => {
+          const library = await getLibrary();
+          const next = markExpired(library, payload.convId as string, payload.fingerprint as string);
+          if (next !== library) {
+            await persistLibrary(next);
+            diag(
+              'bg.expire',
+              `convId=${payload.convId} fingerprint=${payload.fingerprint} → 原片已超期（创作树全量扫描未见）`,
+              { level: 'warn' },
+            );
+          }
+          sendResponse({ ok: true });
+        })();
         return true;
       }
       sendResponse({ ok: false });

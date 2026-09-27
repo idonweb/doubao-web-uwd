@@ -6,6 +6,7 @@ import {
   isFallbackTitle,
   isWeakTitle,
   itemId,
+  markExpired,
   markFailed,
   queryLibrary,
   retainConv,
@@ -161,6 +162,27 @@ describe('失败标记', () => {
     const next = markFailed(library, itemId(CONV, 'vid:v0abc'), 9_999);
     expect(next[itemId(CONV, 'vid:v0abc')].state).toBe('fail');
     expect(next[itemId(CONV, 'vid:v0abc')].lastSeen).toBe(9_999);
+  });
+});
+
+describe('原片已超期（2026-09-27 Finding C：站点创作树有保存期限）', () => {
+  it('markExpired：state → fail + meta.expired，不存在的条目原样返回', () => {
+    const library = upsertDrafts({}, [draft({ state: 'pending' })], { now: 1 }).library;
+    const next = markExpired(library, CONV, 'vid:v0abc', 5_000);
+    const item = next[itemId(CONV, 'vid:v0abc')];
+    expect(item.state).toBe('fail');
+    expect(item.meta.expired).toBe(true);
+    expect(item.lastSeen).toBe(5_000);
+    expect(markExpired(library, CONV, 'vid:不存在', 5_000)).toBe(library);
+  });
+
+  it('超期条目不被后续 pending 草稿升回「解析中」（chain 重放每轮都会带来同一 vid）', () => {
+    const library = upsertDrafts({}, [draft({ state: 'pending' })], { now: 1 }).library;
+    const expired = markExpired(library, CONV, 'vid:v0abc', 2);
+    const again = upsertDrafts(expired, [draft({ state: 'pending' })], { now: 3 });
+    const item = again.library[itemId(CONV, 'vid:v0abc')];
+    expect(item.state).toBe('fail');
+    expect(item.meta.expired).toBe(true);
   });
 });
 

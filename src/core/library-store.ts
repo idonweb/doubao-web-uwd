@@ -254,7 +254,16 @@ export function upsertDrafts(library: Library, drafts: MediaDraft[], options: Up
     const primary = pickPrimaryVariant(variants);
     if (!primary) continue;
 
-    const nextState: MediaState = STATE_RANK[draft.state] > STATE_RANK[existing.state] ? draft.state : existing.state;
+    /*
+     * 「原片已超期」是确定性结论（2026-09-27 Finding C）：同 vid 的草稿之后还会随
+     * chain 历史重放反复到来（state=pending），不得把已判定的超期条目升回「解析中」——
+     * 否则每次 F5 都会在「解析中 ↔ 已超期」之间来回跳。
+     */
+    const nextState: MediaState = existing.meta.expired
+      ? existing.state
+      : STATE_RANK[draft.state] > STATE_RANK[existing.state]
+        ? draft.state
+        : existing.state;
 
     next[id] = {
       ...existing,
@@ -292,6 +301,21 @@ export function markFailed(library: Library, id: string, now = Date.now()): Libr
   const item = library[id];
   if (!item) return library;
   return { ...library, [id]: { ...item, state: 'fail', lastSeen: now } };
+}
+
+/**
+ * 把「原片已超期」落到条目上（2026-09-27 Finding C 修复）。
+ *
+ * 页面侧已**翻遍整棵「我的创作」树**仍未找到该 vid —— 站点对创作记录有保存期限
+ * （2026-09-27 实测约三个月：6.23 的原片可解析、5 月的 vid 已清除），原片永远取不到了。与下载失败（`markFailed`）不同：
+ * 这是确定性结论，条目除 `state='fail'` 外还带 `meta.expired`，界面据此显示
+ * 「原片已超期」而不是「获取失败」，且后续重解析不得把它升回「解析中」。
+ */
+export function markExpired(library: Library, convId: string, fingerprint: string, now = Date.now()): Library {
+  const id = itemId(convId, fingerprint);
+  const item = library[id];
+  if (!item) return library;
+  return { ...library, [id]: { ...item, state: 'fail', meta: { ...item.meta, expired: true }, lastSeen: now } };
 }
 
 /** 覆盖某个条目的 primary（例如 vid 三步 API 拿到更好的原片后） */

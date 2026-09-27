@@ -13,10 +13,13 @@ import { asNumber, asString, getPath, isObject } from './extract/common';
 import {
   AISPACE_DOWNLOAD_INFO_BODY,
   AISPACE_GET_DOWNLOAD_INFO,
+  AISPACE_HAS_MORE_KEY,
   AISPACE_HOMEPAGE,
+  AISPACE_NEXT_CURSOR_KEY,
   AISPACE_NODE_INFO,
   AISPACE_NODE_INFO_BODY,
   AISPACE_QUERY,
+  AISPACE_WALK_MAX_PAGES,
   CREATION_ROOT_NAME,
 } from './site-contract';
 
@@ -42,6 +45,37 @@ export function findNodeId(nodeInfo: unknown, vid: string): string | null {
     if (isObject(child) && String(child.key) === String(vid)) return asString(child.id) ?? null;
   }
   return null;
+}
+
+/**
+ * 第 2 步翻页（2026-09-27 Finding C 修复）：读出**单页** node_info 响应里的关键事实。
+ *
+ * 实测响应形状：`data.children[]`（图文混排、最新在前，`key` = vid 或图片路径、
+ * `id` = node id）+ `data.has_more` + `data.next_cursor`。请求体用 `cursor` 字段翻页。
+ * children 不是数组（结构变了 / 错误响应）返回 null，由调用方记「children=缺失」。
+ */
+export interface NodeInfoPage {
+  /** 本页条目（key / id 都转成字符串；站点的大整型 id 在 JSON 里本就是字符串） */
+  children: Array<{ key: string; id: string }>;
+  /** 是否还有下一页 */
+  hasMore: boolean;
+  /** 下一页游标（仅 hasMore 时有值） */
+  nextCursor: string | null;
+}
+
+export function readNodeInfoPage(nodeInfo: unknown): NodeInfoPage | null {
+  const children = getPath(nodeInfo, ['data', 'children']);
+  if (!Array.isArray(children)) return null;
+  const list: NodeInfoPage['children'] = [];
+  for (const child of children) {
+    if (!isObject(child)) continue;
+    if (child.key == null || child.id == null) continue;
+    list.push({ key: String(child.key), id: String(child.id) });
+  }
+  const rawHasMore = getPath(nodeInfo, ['data', AISPACE_HAS_MORE_KEY]);
+  const hasMore = rawHasMore === true || rawHasMore === 'true';
+  const nextCursor = asString(getPath(nodeInfo, ['data', AISPACE_NEXT_CURSOR_KEY]));
+  return { children: list, hasMore, nextCursor: hasMore ? (nextCursor ?? null) : null };
 }
 
 /** 第 3 步：data.download_infos[0].main_url */
@@ -111,6 +145,14 @@ export function formatVidStep(event: VidStepEvent): string {
   const detail = event.detail ? ` ${event.detail}` : '';
   return `step=${event.step} ${event.ok ? 'ok' : '失败'} ms=${event.ms}${status}${detail}`;
 }
+
+/** 步骤回调的封装签名（编排层内部使用） */
+type StepEmit = (
+  step: VidStepName,
+  ok: boolean,
+  startedAt: number,
+  extra?: { status?: number; detail?: string },
+) => void;
 
 /** HTTP 非 2xx：带上状态码与响应体片段（判断是不是风控页 / 登录页 / 被代理改写，看它最快） */
 class HttpStatusError extends Error {
@@ -187,8 +229,14 @@ export interface VidResolverOptions {
   /**
    * 缓存有效期（毫秒）。0 = 永久缓存（测试或特殊场景可用）。
    * 默认 `LIMITS.VID_RESOLVE_TTL_MS` —— 见该常量的说明：原片地址是带时效的签名 URL。
+   * 同时也是「确定性负缓存」（原片已超期）的有效期。
    */
   ttlMs?: number;
+  /**
+   * 「我的创作」树索引的缓存有效期（毫秒），默认 `LIMITS.VID_INDEX_TTL_MS`。
+   * 0 = 永久。索引只加速第 2 步，与原片地址的时效无关。
+   */
+  indexTtlMs?: number;
   /** 便于注入时钟（单测用） */
   now?: () => number;
   /**
@@ -203,9 +251,23 @@ export interface VidResolveOptions {
   force?: boolean;
 }
 
+/**
+ * 一次 vid 解析的完整结论。
+ *
+ * `expired = true` 是**确定性结论**：已翻遍整棵「我的创作」树（`has_more=false`）仍未见到
+ * 该 vid —— 站点对创作记录有保存期限，原片永远取不到，重试无意义。
+ * `expired = false` 的失败只是「这次没成」（网络 / 超时 / 达翻页上限），仍然可重试。
+ */
+export interface VidResolveOutcome {
+  url: string | null;
+  expired: boolean;
+}
+
 export interface VidResolver {
   /** 解析 vid；成功返回原片 URL，失败返回 null（不缓存失败，允许重试） */
   resolve(vid: string, options?: VidResolveOptions): Promise<string | null>;
+  /** 同 `resolve()`，但把「原片已超期」的确定性结论带给调用方 */
+  resolveDetailed(vid: string, options?: VidResolveOptions): Promise<VidResolveOutcome>;
   /** 最近一次成功解析时第 3 步带出的元数据（未命中缓存返回 null） */
   metaOf(vid: string): VidMeta | null;
   /** 是否已有**未过期**的缓存结果 */
@@ -221,12 +283,13 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   const timeoutMs = options.timeoutMs ?? LIMITS.VID_RESOLVE_TIMEOUT_MS;
   const maxConcurrency = Math.max(1, options.concurrency ?? 2);
   const ttlMs = options.ttlMs ?? LIMITS.VID_RESOLVE_TTL_MS;
+  const indexTtlMs = options.indexTtlMs ?? LIMITS.VID_INDEX_TTL_MS;
   const now = options.now ?? (() => Date.now());
   const onStep = options.onStep;
 
   /** vid → { url, meta, at }；`at` 用于 TTL 判定 */
   const cache = new Map<string, { url: string; meta: VidMeta; at: number }>();
-  const pending = new Map<string, Promise<string | null>>();
+  const pending = new Map<string, Promise<VidResolveOutcome>>();
   let running = 0;
   const waiting: Array<() => void> = [];
 
@@ -256,6 +319,195 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     if (next) next();
   }
 
+  /* ----------------------------------------------------------------------- */
+  /* 第 2 步：在「我的创作」树里找 vid（2026-09-27 Finding C 修复）              */
+  /*                                                                         */
+  /* 实测背景：创作树是**图文混排、最新在前**的分页列表，且站点对创作记录有       */
+  /* 保存期限（2026-09-27 实测约三个月：6.23 可解析、5 月已清除）—— 过期 vid 已被清除，      */
+  /* （确定性结论）；而树里**有的** vid 也可能排在第 1 页之外（上游与旧版都只     */
+  /* 拉 size=50 的一页 → 大量误杀）。                                           */
+  /* 对策：size=200 + cursor 有界翻页 + 索引短缓存 + head 校验；                 */
+  /* 翻到底仍未见 → 负缓存 +「原片已超期」。                                     */
+  /* ----------------------------------------------------------------------- */
+
+  /** 一次翻页扫描的产物 */
+  interface CreationIndex {
+    /** key(=vid) → node id */
+    map: Map<string, string>;
+    /** 去重后的条目数 / 页数（诊断用） */
+    total: number;
+    pages: number;
+    /** 是否翻到了树底（has_more=false）。只有到底，「未见」才是确定性结论 */
+    complete: boolean;
+    /** 扫描时第 1 页首条的 key：新创作插在树的最前面，head 不变 = 树自扫描后未变 */
+    headKey: string | null;
+    at: number;
+  }
+
+  const indexes = new Map<string, CreationIndex>();
+  /** 确定性负缓存：vid → 判定时间。TTL 与正缓存一致（到期后允许再确认一次） */
+  const negatives = new Map<string, number>();
+
+  function freshIndex(cid: string): CreationIndex | null {
+    const hit = indexes.get(cid);
+    if (!hit) return null;
+    if (indexTtlMs > 0 && now() - hit.at >= indexTtlMs) {
+      indexes.delete(cid);
+      return null;
+    }
+    return hit;
+  }
+
+  function freshNegative(vid: string): boolean {
+    const at = negatives.get(vid);
+    if (at === undefined) return false;
+    if (ttlMs > 0 && now() - at >= ttlMs) {
+      negatives.delete(vid);
+      return false;
+    }
+    return true;
+  }
+
+  /** 翻页扫描整棵创作树，建 key→node_id 索引。网络错误原样抛出（由调用方翻译成人话）。 */
+  async function walkCreationTree(
+    cid: string,
+  ): Promise<{ index: CreationIndex; lastPage: unknown; structureError: boolean }> {
+    const map = new Map<string, string>();
+    let cursor: string | undefined;
+    let pages = 0;
+    let complete = false;
+    let headKey: string | null = null;
+    let lastPage: unknown;
+    let structureError = false;
+
+    while (pages < AISPACE_WALK_MAX_PAGES) {
+      lastPage = await postJson(AISPACE_NODE_INFO, AISPACE_NODE_INFO_BODY(cid, cursor));
+      const page = readNodeInfoPage(lastPage);
+      if (!page) {
+        // children 不是数组（结构变了 / 错误响应）：按已有内容收场，不下确定性结论
+        structureError = pages === 0;
+        break;
+      }
+      if (pages === 0) headKey = page.children[0]?.key ?? null;
+      for (const entry of page.children) {
+        if (!map.has(entry.key)) map.set(entry.key, entry.id);
+      }
+      pages++;
+      if (!page.hasMore || page.nextCursor == null) {
+        complete = true;
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+
+    return { index: { map, total: map.size, pages, complete, headKey, at: now() }, lastPage, structureError };
+  }
+
+  function emitDefinitiveMiss(
+    emit: StepEmit,
+    vid: string,
+    startedAt: number,
+    info: { total: number; pages: number; lastPage: unknown },
+  ): void {
+    emit('node_info', false, startedAt, {
+      detail:
+        `没有 key=${vid} 的条目（${describeVidPayload(info.lastPage, 'children')}；` +
+        `全树 ${info.total} 条/${info.pages} 页已到底 → 原片已超期）`,
+    });
+  }
+
+  /** 第 2 步的查找结论：nodeId 为 null 时，expired=true 表示「确定性超期」 */
+  type NodeLookup = { nodeId: string | null; expired: boolean };
+
+  /**
+   * 第 2 步本体。所有 node_info 事件都从这里发出；网络错误被翻译成 `node_info` 失败事件，
+   * 不向上抛（与旧行为一致：解析失败返回 null，不让调用方接异常）。
+   */
+  async function findNodeForVid(
+    cid: string,
+    vid: string,
+    force: boolean,
+    startedAt: number,
+    emit: StepEmit,
+  ): Promise<NodeLookup> {
+    // 命中新鲜索引 → 直接查（一次扫描服务多个 vid，不重复翻树）
+    const cached = force ? null : freshIndex(cid);
+    if (cached) {
+      const hit = cached.map.get(vid);
+      if (hit) {
+        emit('node_info', true, startedAt, {
+          detail: `node id=${hit}（命中索引 ${cached.total} 条/${cached.pages} 页）`,
+        });
+        return { nodeId: hit, expired: false };
+      }
+      if (cached.complete) {
+        /*
+         * 索引新鲜且已翻到底但仍未见 —— 先做 **head 校验**：新创作会插到树的最前面，
+         * 第 1 页首条 key 没变 = 树自扫描后没变过 = 「未见」是确定性结论。
+         * （没有这一步，扫描之后几分钟内新生成的视频会被误判成「已超期」。）
+         */
+        let headRaw: unknown;
+        try {
+          headRaw = await postJson(AISPACE_NODE_INFO, AISPACE_NODE_INFO_BODY(cid));
+        } catch (error) {
+          emit('node_info', false, startedAt, {
+            detail: `head 校验未完成（${describeVidError(error, timeoutMs).detail}），暂不定论`,
+          });
+          return { nodeId: null, expired: false };
+        }
+        const head = readNodeInfoPage(headRaw);
+        if (head && (head.children[0]?.key ?? null) === cached.headKey) {
+          negatives.set(vid, now());
+          emitDefinitiveMiss(emit, vid, startedAt, { total: cached.total, pages: cached.pages, lastPage: headRaw });
+          return { nodeId: null, expired: true };
+        }
+        // head 变了 → 树有更新，走下面的全量扫描
+      } else {
+        // 上次扫描没到底（达页上限）→ 不能下确定性结论
+        emit('node_info', false, startedAt, {
+          detail: `没有 key=${vid} 的条目（索引 ${cached.total} 条/${cached.pages} 页未到底，暂不定论）`,
+        });
+        return { nodeId: null, expired: false };
+      }
+    }
+
+    let walk: Awaited<ReturnType<typeof walkCreationTree>>;
+    try {
+      walk = await walkCreationTree(cid);
+    } catch (error) {
+      emit('node_info', false, startedAt, describeVidError(error, timeoutMs));
+      return { nodeId: null, expired: false };
+    }
+    if (!walk.structureError) indexes.set(cid, walk.index);
+
+    const hit = walk.index.map.get(vid);
+    if (hit) {
+      emit('node_info', true, startedAt, {
+        detail: `node id=${hit}（${walk.index.total} 条/${walk.index.pages} 页${walk.index.complete ? '' : '，未到底'}）`,
+      });
+      return { nodeId: hit, expired: false };
+    }
+    if (walk.structureError) {
+      emit('node_info', false, startedAt, {
+        detail: `没有 key=${vid} 的条目（${describeVidPayload(walk.lastPage, 'children')}）`,
+      });
+      return { nodeId: null, expired: false };
+    }
+    if (walk.index.complete) {
+      negatives.set(vid, now());
+      emitDefinitiveMiss(emit, vid, startedAt, {
+        total: walk.index.total,
+        pages: walk.index.pages,
+        lastPage: walk.lastPage,
+      });
+      return { nodeId: null, expired: true };
+    }
+    emit('node_info', false, startedAt, {
+      detail: `没有 key=${vid} 的条目（${walk.index.total} 条/${walk.index.pages} 页达翻页上限，暂不定论）`,
+    });
+    return { nodeId: null, expired: false };
+  }
+
   async function postJson(pathName: string, body: unknown): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -278,8 +530,8 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
    * 串行三步。**每一步无论成败都回调 `onStep`** —— 这是「解析失败」可归因的唯一来源：
    * 原先只把 null 交给上层，风控、超时、结构变化在诊断页里长得一模一样。
    */
-  async function runThreeSteps(vid: string): Promise<{ url: string; meta: VidMeta } | null> {
-    const emit = (step: VidStepName, ok: boolean, startedAt: number, extra: { status?: number; detail?: string } = {}) => {
+  async function runThreeSteps(vid: string, force: boolean): Promise<VidResolveOutcome & { meta: VidMeta }> {
+    const emit: StepEmit = (step, ok, startedAt, extra = {}) => {
       onStep?.({ vid, step, ok, ms: Math.max(0, now() - startedAt), ...extra });
     };
 
@@ -290,75 +542,67 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
       homepage = await postJson(AISPACE_HOMEPAGE, {});
     } catch (error) {
       emit('homepage', false, startedAt, describeVidError(error, timeoutMs));
-      return null;
+      return { url: null, expired: false, meta: {} };
     }
     const cid = findCreationId(homepage);
     if (!cid) {
       emit('homepage', false, startedAt, { detail: `没有「我的创作」条目（${describeVidPayload(homepage, 'children')}）` });
-      return null;
+      return { url: null, expired: false, meta: {} };
     }
     emit('homepage', true, startedAt, { detail: `创作 id=${cid}` });
 
-    // ---- 第 2 步：按 vid 找该视频的 node id ----
+    // ---- 第 2 步：按 vid 找该视频的 node id（有界翻页 + 索引缓存，2026-09-27 Finding C） ----
     startedAt = now();
-    let nodeInfo: unknown;
-    try {
-      nodeInfo = await postJson(AISPACE_NODE_INFO, AISPACE_NODE_INFO_BODY(cid));
-    } catch (error) {
-      emit('node_info', false, startedAt, describeVidError(error, timeoutMs));
-      return null;
-    }
-    const nid = findNodeId(nodeInfo, vid);
-    if (!nid) {
-      emit('node_info', false, startedAt, {
-        detail: `没有 key=${vid} 的条目（${describeVidPayload(nodeInfo, 'children')}）`,
-      });
-      return null;
-    }
-    emit('node_info', true, startedAt, { detail: `node id=${nid}` });
+    const lookup = await findNodeForVid(cid, vid, force, startedAt, emit);
+    if (!lookup.nodeId) return { url: null, expired: lookup.expired, meta: {} };
 
     // ---- 第 3 步：取无水印原片地址 ----
     startedAt = now();
     let downloadInfo: unknown;
     try {
-      downloadInfo = await postJson(AISPACE_GET_DOWNLOAD_INFO, AISPACE_DOWNLOAD_INFO_BODY(nid));
+      downloadInfo = await postJson(AISPACE_GET_DOWNLOAD_INFO, AISPACE_DOWNLOAD_INFO_BODY(lookup.nodeId));
     } catch (error) {
       emit('get_download_info', false, startedAt, describeVidError(error, timeoutMs));
-      return null;
+      return { url: null, expired: false, meta: {} };
     }
     const url = findDownloadUrl(downloadInfo);
     if (!url) {
       emit('get_download_info', false, startedAt, {
         detail: `没有可用的 main_url（${describeVidPayload(downloadInfo, 'download_infos')}）`,
       });
-      return null;
+      return { url: null, expired: false, meta: {} };
     }
     emit('get_download_info', true, startedAt, { detail: describeVidPayload(downloadInfo, 'download_infos') });
-    return { url, meta: findDownloadMeta(downloadInfo) };
+    return { url, expired: false, meta: findDownloadMeta(downloadInfo) };
   }
 
-  async function resolve(vid: string, resolveOptions: VidResolveOptions = {}): Promise<string | null> {
-    if (!vid) return null;
+  async function resolveInternal(vid: string, resolveOptions: VidResolveOptions = {}): Promise<VidResolveOutcome> {
+    if (!vid) return { url: null, expired: false };
 
-    if (resolveOptions.force) cache.delete(vid);
-    else {
+    if (resolveOptions.force) {
+      cache.delete(vid);
+      negatives.delete(vid);
+    } else {
       const cached = freshCached(vid);
-      if (cached) return cached.url;
+      if (cached) return { url: cached.url, expired: false };
+      // 「原片已超期」是确定性结论：TTL 内不再重试（到期后允许再确认一次，树可能有新变化）
+      if (freshNegative(vid)) return { url: null, expired: true };
     }
 
     // 已有同一 vid 的在飞请求 → 复用它（在飞结果一定是新鲜的，不必重复发）
     const existing = pending.get(vid);
     if (existing) return existing;
 
-    const task = (async () => {
+    const force = resolveOptions.force === true;
+    const task = (async (): Promise<VidResolveOutcome> => {
       await acquire();
       try {
-        const result = await runThreeSteps(vid);
-        if (result) cache.set(vid, { url: result.url, meta: result.meta, at: now() });
-        return result?.url ?? null;
+        const outcome = await runThreeSteps(vid, force);
+        if (outcome.url) cache.set(vid, { url: outcome.url, meta: outcome.meta, at: now() });
+        return { url: outcome.url, expired: outcome.expired };
       } catch (error) {
         console.debug('[UWD] vid 解析失败', vid, error);
-        return null;
+        return { url: null, expired: false };
       } finally {
         release();
         pending.delete(vid);
@@ -370,11 +614,14 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   }
 
   return {
-    resolve,
+    resolve: async (vid, options) => (await resolveInternal(vid, options)).url,
+    resolveDetailed: resolveInternal,
     metaOf: (vid: string) => freshCached(vid)?.meta ?? null,
     has: (vid: string) => freshCached(vid) !== null,
     clear: () => {
       cache.clear();
+      indexes.clear();
+      negatives.clear();
     },
     get inflight() {
       return pending.size;

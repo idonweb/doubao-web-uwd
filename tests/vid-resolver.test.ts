@@ -8,6 +8,7 @@ import {
   findDownloadUrl,
   findNodeId,
   formatVidStep,
+  readNodeInfoPage,
   type VidStepEvent,
 } from '../src/core/vid-resolver';
 import {
@@ -15,6 +16,9 @@ import {
   HOMEPAGE_RESPONSE,
   NODE_INFO_RESPONSE,
 } from './fixtures/samples';
+
+/** 200 响应的极简替身（body 直接作为 json 返回） */
+const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as Response;
 
 describe('三步 API 的响应解析（纯函数）', () => {
   it('第 1 步：按「我的创作」这个中文字面量找创作 ID', () => {
@@ -42,6 +46,37 @@ describe('三步 API 的响应解析（纯函数）', () => {
     expect(findDownloadMeta({ data: { download_infos: [{ main_url: 'https://x' }] } })).toEqual({});
     expect(findDownloadMeta({ data: { download_infos: [{ width: 'bad' }] } })).toEqual({});
     expect(findDownloadMeta(undefined)).toEqual({});
+  });
+
+  it('第 2 步翻页（readNodeInfoPage）：读出 key/id/has_more/next_cursor，结构对不上返回 null', () => {
+    expect(
+      readNodeInfoPage({
+        code: 0,
+        data: {
+          children: [
+            { id: 'nid-1', key: 'v0abc' },
+            { id: 2, key: 123 }, // 数字形态也转成字符串
+            { key: 'no-id' }, // 缺 id 的条目跳过
+          ],
+          has_more: true,
+          next_cursor: 'c-2',
+        },
+      }),
+    ).toEqual({
+      children: [
+        { key: 'v0abc', id: 'nid-1' },
+        { key: '123', id: '2' },
+      ],
+      hasMore: true,
+      nextCursor: 'c-2',
+    });
+    // has_more=false → 游标清空（到底）
+    expect(readNodeInfoPage({ data: { children: [], has_more: false, next_cursor: 'c-9' } })).toEqual({
+      children: [],
+      hasMore: false,
+      nextCursor: null,
+    });
+    expect(readNodeInfoPage({ data: {} })).toBeNull();
   });
 });
 
@@ -81,19 +116,125 @@ describe('createVidResolver', () => {
     expect(count()).toBe(3);
   });
 
-  it('vid 查不到 node 时返回 null，且不缓存失败（允许重试）', async () => {
-    const { fn, count } = pathFakeFetch({
-      '/samantha/aispace/homepage': HOMEPAGE_RESPONSE,
-      '/samantha/aispace/node_info': { data: { children: [] } },
-    });
-    const resolver = createVidResolver({ fetchFn: fn });
+  it('翻遍整棵树（has_more=false）仍未见到 vid → 确定性「已超期」，TTL 内不重试', async () => {
+    let clock = 0;
+    const calls: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        // 单页、无 has_more → 已到底，但里面没有这个 vid
+        return ok({ code: 0, data: { children: [{ id: 'nid-1', key: 'v0other000000' }] } });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
 
-    expect(await resolver.resolve('v0missing')).toBeNull();
-    expect(resolver.has('v0missing')).toBe(false);
-    expect(count()).toBe(2);
+    const resolver = createVidResolver({ fetchFn, ttlMs: 1_000, indexTtlMs: 1_000, now: () => clock });
+    const first = await resolver.resolveDetailed('v0missing');
+    expect(first).toEqual({ url: null, expired: true });
+    expect(calls.length).toBe(2); // homepage + 1 页 node_info
 
-    await resolver.resolve('v0missing');
-    expect(count()).toBe(4);
+    // 确定性结论进了负缓存：TTL 内再问不发生请求
+    const second = await resolver.resolveDetailed('v0missing');
+    expect(second).toEqual({ url: null, expired: true });
+    expect(calls.length).toBe(2);
+
+    // TTL 过后允许再确认一次（树可能有新变化）
+    clock += 1_001;
+    await resolver.resolveDetailed('v0missing');
+    expect(calls.length).toBe(4);
+  });
+
+  it('达翻页上限（has_more 恒为 true）→ 不下确定性结论，仍可重试', async () => {
+    let seq = 0;
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        seq++;
+        return ok({
+          code: 0,
+          data: {
+            children: [{ id: `nid-${seq}`, key: `v0page${seq}` }],
+            has_more: true,
+            next_cursor: `cursor-${seq}`,
+          },
+        });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({ fetchFn, indexTtlMs: 0, ttlMs: 0 });
+    const outcome = await resolver.resolveDetailed('v0missing');
+    // 10 页上限（AISPACE_WALK_MAX_PAGES）+ 1 次 homepage；vid 未见但「未到底」→ expired=false
+    expect(outcome).toEqual({ url: null, expired: false });
+  });
+
+  it('vid 在第 2 页也能找到：cursor 翻页 + 请求体带游标', async () => {
+    const bodies: unknown[] = [];
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      bodies.push(init?.body);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        const cursor = JSON.parse(String(init?.body) || '{}')?.cursor;
+        if (!cursor) {
+          return ok({
+            code: 0,
+            data: {
+              children: [{ id: 'nid-1', key: 'v0page1item' }],
+              has_more: true,
+              next_cursor: 'cursor-2',
+            },
+          });
+        }
+        return ok({
+          code: 0,
+          data: { children: [{ id: 'nid-deep', key: 'v0deep0000001' }], has_more: false },
+        });
+      }
+      if (url.includes('/samantha/aispace/get_download_info')) return ok(DOWNLOAD_INFO_RESPONSE);
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({ fetchFn, indexTtlMs: 0, ttlMs: 0 });
+    expect(await resolver.resolve('v0deep0000001')).toBe(
+      'https://v3-dy.douyinvod.com/full/original.mp4?lr=unwatermarked',
+    );
+    expect(bodies.some((body) => String(body).includes('"cursor":"cursor-2"'))).toBe(true);
+  });
+
+  it('新鲜索引未见 → 先做 head 校验：树没变 = 确定性超期；树变了 = 重新扫描', async () => {
+    let clock = 0;
+    let headKey = 'v0head0000001';
+    const calls: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        return ok({ code: 0, data: { children: [{ id: 'nid-head', key: headKey }] } });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({ fetchFn, ttlMs: 60_000, indexTtlMs: 60_000, now: () => clock });
+
+    // 第 1 个 vid 建好索引（complete）；第 2 个 vid 未见 → head 没变 → 确定性超期
+    await resolver.resolveDetailed('v0head0000001');
+    const before = calls.length;
+    const miss = await resolver.resolveDetailed('v0other000000');
+    expect(miss.expired).toBe(true);
+    expect(calls.length).toBe(before + 2); // homepage + head 校验，各一次
+
+    // 树变了（新创作插到最前面，head 变化）→ 重新全量扫描，且此时树里还是找不到 → 仍超期
+    clock += 1; // 不让负缓存/索引过期（TTL 60s）
+    headKey = 'v0newhead00001';
+    const after = calls.length;
+    const miss2 = await resolver.resolveDetailed('v0fresh0000001');
+    expect(miss2.expired).toBe(true);
+    expect(calls.length).toBe(after + 3); // homepage + head 校验（发现变化）+ 全量重扫
   });
 
   it('请求 URL 带上契约里的固定 query', async () => {
@@ -164,6 +305,8 @@ describe('缓存 TTL / force / clear（第四轮：签名地址过期自愈）',
     const resolver = createVidResolver({
       fetchFn: spy as unknown as typeof fetch,
       ttlMs,
+      // 索引 TTL 与正缓存同寿命：让「TTL 过期后重新走三步」的请求计数保持可预期
+      indexTtlMs: ttlMs,
       now: () => clock,
     });
     return { resolver, spy, advance: (ms: number) => (clock += ms), calls: () => spy.mock.calls.length };

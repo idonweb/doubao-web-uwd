@@ -5,7 +5,7 @@ import type { Config } from './types';
 export const EXT_NAME = '豆包无水印下载器';
 export const EXT_SHORT_NAME = 'UWD';
 /** 扩展显示版本（与 package.json 保持同步；manifest 版本在构建期由 package.json 注入） */
-export const EXT_VERSION = '1.0.1';
+export const EXT_VERSION = '1.0.2';
 
 /**
  * GitHub 仓库地址（2026-09-27 首发时回填）。
@@ -57,6 +57,15 @@ export const LIMITS = {
    * 这里给缓存加一个保守的 TTL：过期即重新走三步 API 换新签名。
    */
   VID_RESOLVE_TTL_MS: 10 * 60_000,
+  /**
+   * 「我的创作」树索引的缓存有效期（2026-09-27 Finding C 修复）。
+   *
+   * node_info 是分页列表（图文混排、最新在前），一次翻页扫描建好的 key→node_id 索引
+   * 可以在短时间内服务多个 vid，避免每个 vid 都重扫整棵树。索引过期 ≠ 数据过期：
+   * 新创作会插到树的最前面，所以索引只做短 TTL 缓存；判定「原片已超期」前还会做
+   * head 校验（第 1 页首条 key 是否变化）确保树没变过。
+   */
+  VID_INDEX_TTL_MS: 60_000,
   /** 单次发送给 background 的草稿上限（防超大消息） */
   DRAFT_BATCH_MAX: 40,
   /** 诊断：最多保留多少条记录 */
@@ -91,6 +100,14 @@ export const MSG = {
   ReresolveVid: 'content:reresolve-vid',
   /** page → content：上一条的应答 */
   VidResolved: 'video-resolved',
+  /**
+   * page → content → bg：vid 的原片已超期（2026-09-27 Finding C 修复）。
+   *
+   * 页面侧翻遍整棵「我的创作」树仍未见到该 vid —— 站点对创作记录有保存期限，
+   * 原片**永远**取不到了。这是确定性结论（不是网络失败），bg 据此把条目
+   * 从「解析中」落成「原片已超期」（state=fail + meta.expired），不再永挂。
+   */
+  LibraryExpire: 'library:expire',
 
   /* ---- content ↔ bg（chrome.runtime.sendMessage） ---- */
   /** bg → content：索取当前页面信息（会再转问 MAIN world） */

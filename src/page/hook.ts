@@ -33,7 +33,7 @@ import {
   SSE_ENDPOINT,
   THREAD_PATH_PATTERN,
 } from '../core/site-contract';
-import { createVidResolver, formatVidStep, type VidStepEvent } from '../core/vid-resolver';
+import { createVidResolver, formatVidStep, type VidResolveOutcome, type VidStepEvent } from '../core/vid-resolver';
 import { cleanDocTitle, isStaleTitle, normalizeTitleSnapshot, pickFreshTitle } from '../core/title';
 import type { Config, MediaDraft, PageInfo, PageKind, RawMedia } from '../core/types';
 
@@ -94,22 +94,25 @@ declare global {
   /**
    * 跑一次 vid 解析，并把「哪一步失败、什么原因」收成一行诊断。
    * 命中缓存不会产生步骤事件，那行会如实写成「未产生步骤事件」而不是编一个原因。
+   * `expired=true` 是确定性结论：翻遍整棵创作树仍未见到该 vid（原片已超期），重试无意义。
    */
-  async function resolveVidWithDiag(vid: string, force = false): Promise<string | null> {
+  async function resolveVidWithDiag(vid: string, force = false): Promise<VidResolveOutcome> {
     vidSteps.delete(vid);
-    const url = await vidResolver.resolve(vid, force ? { force: true } : undefined);
+    const outcome = await vidResolver.resolveDetailed(vid, force ? { force: true } : undefined);
     const steps = vidSteps.get(vid) ?? [];
     vidSteps.delete(vid);
     const failed = steps.find((step) => !step.ok);
     const suffix = force ? '（重解析）' : '';
     diag(
       'vid.resolve',
-      url
+      outcome.url
         ? `vid=${vid} → ok${suffix}（${steps.length} 步）`
-        : `vid=${vid} → null${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`,
-      { level: url ? 'info' : 'warn' },
+        : outcome.expired
+          ? `vid=${vid} → 原片已超期${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`
+          : `vid=${vid} → null${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`,
+      { level: outcome.url ? 'info' : 'warn' },
     );
-    return url;
+    return outcome;
   }
 
   /* ------------------------------------------------------------------------- */
@@ -271,8 +274,20 @@ declare global {
   async function enrichWithResolvedVid(draft: MediaDraft): Promise<void> {
     const vid = draft.vid;
     if (!vid) return;
-    const url = await resolveVidWithDiag(vid);
-    if (!url) return;
+    const { url, expired } = await resolveVidWithDiag(vid);
+    if (!url) {
+      /*
+       * 确定性失败（2026-09-27 Finding C 修复）：翻遍整棵「我的创作」树仍未见到该 vid ——
+       * 站点对创作记录有保存期限，原片永远取不到了。通知 bg 把条目落成「原片已超期」，
+       * 取代过去「永远解析中」的挂死状态（网络失败不走这里，仍是可重试的 pending）。
+       */
+      if (expired && draft.convId === (convId || 'unknown')) {
+        postToWindow(
+          envelope('page', MSG.LibraryExpire, { convId: draft.convId, fingerprint: draft.fingerprint, vid }),
+        );
+      }
+      return;
+    }
     // 解析是异步的：回来时用户可能已经切走 —— 异会话的增强结果一律丢弃
     if (draft.convId !== (convId || 'unknown')) return;
     /*
@@ -855,8 +870,8 @@ declare global {
         return;
       }
       // force：必须绕过缓存，否则拿回来的还是那份过期地址
-      void resolveVidWithDiag(vid, true).then((url) => {
-        postToWindow(envelope('page', MSG.VidResolved, { reqId, vid, url }));
+      void resolveVidWithDiag(vid, true).then((outcome) => {
+        postToWindow(envelope('page', MSG.VidResolved, { reqId, vid, url: outcome.url }));
       });
     }
   });

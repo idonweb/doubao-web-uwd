@@ -55,6 +55,14 @@ export interface MediaMeta {
   size?: number;
   /** 清晰度标签 */
   label?: string;
+  /**
+   * 原片已超期（2026-09-27 Finding C 修复）。
+   *
+   * `true` = 页面侧已**翻遍整棵「我的创作」树**仍未找到该 vid —— 站点对创作记录有
+   * 保存期限（2026-09-27 实测约三个月：6.23 的原片可解析、5 月的 vid 已清除），原片永远取不到了。这是确定性结论而非网络失败：
+   * 条目 state 落为 `fail`、界面显示「原片已超期」，且后续重解析不得把它升回「解析中」。
+   */
+  expired?: boolean;
 }
 
 export interface MediaItem {
