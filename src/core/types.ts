@@ -211,6 +211,10 @@ export interface DownloadTarget {
    * 用途：原片地址是**带时效的签名 URL**，下载失败时靠它让页面重新解析一份新的。
    */
   vid?: string;
+  /** 资源真实生成时间（毫秒 epoch，= `meta.createdAt`）；缺失 → 文件名时间位回退下载时刻 */
+  createdAtMs?: number;
+  /** 资源所属对话页标题（= `convTitle`）；弱标题 / 缺失 → 文件名标题位回退会话 ID */
+  convTitle?: string;
 }
 
 export interface DownloadProgress {

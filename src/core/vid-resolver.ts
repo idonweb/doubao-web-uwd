@@ -18,9 +18,11 @@ import {
   AISPACE_NEXT_CURSOR_KEY,
   AISPACE_NODE_COVER_PATH,
   AISPACE_NODE_CREATE_TIME_KEY,
+  AISPACE_NODE_HEIGHT_PATH,
   AISPACE_NODE_INFO,
   AISPACE_NODE_INFO_BODY,
   AISPACE_NODE_SIZE_KEY,
+  AISPACE_NODE_WIDTH_PATH,
   AISPACE_QUERY,
   AISPACE_WALK_MAX_PAGES,
   CREATION_ROOT_NAME,
@@ -65,6 +67,9 @@ export interface NodeInfoPage {
     createTime: number | null;
     size: number | null;
     cover: string | null;
+    /** 视频节点的原片真实帧宽高（`node_cover.list_view`；站点不给 / 图片节点形态 → null） */
+    width: number | null;
+    height: number | null;
   }>;
   /** 是否还有下一页 */
   hasMore: boolean;
@@ -98,6 +103,15 @@ export function readNodeInfoPage(nodeInfo: unknown): NodeInfoPage | null {
        * 链式报文的 `video_thumb` 缺失/过期时用它兜底当卡片缩略图（视频节点上是整帧封面）。
        */
       cover: asString(getPath(node, AISPACE_NODE_COVER_PATH)) ?? null,
+      /*
+       * `node_cover.list_view.image_width / image_height` = 视频节点的**原片真实帧宽高**
+       * （2026-09-28 第十二轮探针 37 条样本证实，含 1470×630 超宽幅）。
+       * 报文里 video 对象的宽高是 384×216 预览规格、download_infos 基本不给 ——
+       * 树节点的这个字段是卡片真实宽高与清晰度标签的来源。⚠️ 图片节点上是缩略图尺寸，
+       * 不能用于图片；本路径只有视频会走，天然无碍。
+       */
+      width: asNumber(getPath(node, AISPACE_NODE_WIDTH_PATH)) ?? null,
+      height: asNumber(getPath(node, AISPACE_NODE_HEIGHT_PATH)) ?? null,
     });
   }
   const rawHasMore = getPath(nodeInfo, ['data', AISPACE_HAS_MORE_KEY]);
@@ -275,6 +289,11 @@ export interface VidResolverOptions {
    * 首次「树里未见」只记录；窗口到点后重新全量扫描仍未见才判定超期。
    */
   expiredConfirmMs?: number;
+  /**
+   * 网络层失败后的重试冷却（毫秒），默认 `LIMITS.VID_RETRY_COOLDOWN_MS`。
+   * 0 = 不冷却。冷却期内 `resolve()` 直接短路不发请求（`force: true` 不受限）。
+   */
+  retryCooldownMs?: number;
   /** 便于注入时钟（单测用） */
   now?: () => number;
   /**
@@ -322,6 +341,12 @@ export interface VidResolver {
   clear(): void;
   /** 当前在飞请求数 */
   readonly inflight: number;
+  /**
+   * 该 vid 的失败冷却剩余毫秒数（2026-09-28 第十二轮）。
+   * null = 不在冷却期；> 0 = 冷却中（`resolve()` 会短路不发请求，直到冷却结束）。
+   * 供诊断层区分「网络失败退避中」与「真的什么都没发生」。
+   */
+  cooldownOf(vid: string): number | null;
 }
 
 export function createVidResolver(options: VidResolverOptions = {}): VidResolver {
@@ -331,6 +356,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   const ttlMs = options.ttlMs ?? LIMITS.VID_RESOLVE_TTL_MS;
   const indexTtlMs = options.indexTtlMs ?? LIMITS.VID_INDEX_TTL_MS;
   const expiredConfirmMs = options.expiredConfirmMs ?? LIMITS.VID_EXPIRED_CONFIRM_MS;
+  const retryCooldownMs = options.retryCooldownMs ?? LIMITS.VID_RETRY_COOLDOWN_MS;
   const now = options.now ?? (() => Date.now());
   const onStep = options.onStep;
 
@@ -380,13 +406,24 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   /** 一次翻页扫描的产物 */
   interface CreationIndex {
     /**
-     * key(=vid) → { node id, 作品真实生成时间（秒级 Unix），文件体积（字节） }
+     * key(=vid) → { node id, 作品真实生成时间（秒级 Unix），文件体积（字节），真实帧宽高 }
      *
-     * 顺带记这两项是 2026-09-28 第十轮加的：时间供排序与卡片标签（此前用 `lastSeen`，
-     * 会把「刚被判超期」这种本地事件误当「最新」）；体积供「文件大小」显示
-     * （报文里 creation 的 video 对象与 download_infos 都基本不给 size）。
+     * 顺带记这三项：时间是 2026-09-28 第十轮加的（供排序与卡片标签，此前用 `lastSeen`，
+     * 会把「刚被判超期」这种本地事件误当「最新」）；体积供「文件大小」显示；
+     * 宽高是第十二轮加的（供卡片真实宽高与清晰度标签，取代 384×216 预览规格）——
+     * 报文里 creation 的 video 对象与 download_infos 都基本不给 size / 真实宽高。
      */
-    map: Map<string, { id: string; createTime: number | null; size: number | null; cover: string | null }>;
+    map: Map<
+      string,
+      {
+        id: string;
+        createTime: number | null;
+        size: number | null;
+        cover: string | null;
+        width: number | null;
+        height: number | null;
+      }
+    >;
     /** 去重后的条目数 / 页数（诊断用） */
     total: number;
     pages: number;
@@ -398,6 +435,17 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   }
 
   const indexes = new Map<string, CreationIndex>();
+  /**
+   * 翻树的**在飞共享**（2026-09-28 第十二轮 §23.5）：cid → 正在进行的翻树 Promise。
+   *
+   * 一次翻树 = 8 页请求；并发解析多个 vid 时（同一棵账号级树），不共享就会把 8 页 × N
+   * 同时打出去 —— 实测这正是触发站点软限流（200 + 空响应体）的请求来源。
+   * 单飞后 N 个 vid 共享同一次翻树；结束（成功或失败）即从表里移除，
+   * 成功的结果落在 `indexes`，失败则允许下一个调用方重新发起。
+   */
+  const walks = new Map<string, Promise<Awaited<ReturnType<typeof walkCreationTree>>>>();
+  /** 失败冷却：vid → 冷却到期时刻（§23.5，见 `LIMITS.VID_RETRY_COOLDOWN_MS`） */
+  const cooldowns = new Map<string, number>();
   /** 确定性负缓存：vid → 判定时间。TTL 与正缓存一致（到期后允许再确认一次） */
   const negatives = new Map<string, number>();
   /**
@@ -415,14 +463,45 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     negatives.delete(vid);
   }
 
+  /**
+   * 新鲜索引（TTL 内）。⚠️ 过期的索引**不从表里删除**（只返回 null）——
+   * 它还是「翻树失败后的降级数据源」（§23.5：旧索引也比重新翻 8 页强）；
+   * 真正的清理由下一次成功的翻树覆盖或 `clear()` 完成。
+   */
   function freshIndex(cid: string): CreationIndex | null {
     const hit = indexes.get(cid);
     if (!hit) return null;
-    if (indexTtlMs > 0 && now() - hit.at >= indexTtlMs) {
-      indexes.delete(cid);
+    if (indexTtlMs > 0 && now() - hit.at >= indexTtlMs) return null;
+    return hit;
+  }
+
+  /**
+   * 翻树的单飞入口：同一 cid 已有在飞翻树就直接共享它的结果（§23.5）。
+   * 成功 → 结果进 `indexes`（由 `walkCreationTree` 的调用方写入，见 `findNodeForVid`）；
+   * 失败 → 从表里移除，让下一个调用方可以重新发起（不把失败缓存住）。
+   */
+  function walkCreationTreeShared(
+    cid: string,
+  ): Promise<Awaited<ReturnType<typeof walkCreationTree>>> {
+    const existing = walks.get(cid);
+    if (existing) return existing;
+    const task = walkCreationTree(cid).finally(() => {
+      walks.delete(cid);
+    });
+    walks.set(cid, task);
+    return task;
+  }
+
+  /** 该 vid 是否在失败冷却期内（返回剩余毫秒；不在则 null） */
+  function coolingDown(vid: string): number | null {
+    const until = cooldowns.get(vid);
+    if (until === undefined) return null;
+    const remaining = until - now();
+    if (remaining <= 0) {
+      cooldowns.delete(vid);
       return null;
     }
-    return hit;
+    return remaining;
   }
 
   function freshNegative(vid: string): boolean {
@@ -463,6 +542,8 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
             createTime: entry.createTime,
             size: entry.size,
             cover: entry.cover,
+            width: entry.width,
+            height: entry.height,
           });
         }
       }
@@ -499,6 +580,9 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     size: number | null;
     /** 命中时顺带带回的站点封面图（带签名；站点不给则 null） */
     cover: string | null;
+    /** 命中时顺带带回的原片真实帧宽高（`node_cover.list_view`；站点不给则 null） */
+    width: number | null;
+    height: number | null;
     /** 确定性超期（已走完二次确认窗口，重扫仍未见） */
     expired: boolean;
     /** 树里未见但未到确认窗口 —— 不下结论，调用方稍后复查 */
@@ -511,6 +595,8 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     createTime: null,
     size: null,
     cover: null,
+    width: null,
+    height: null,
     expired: false,
     pendingConfirm: false,
   };
@@ -535,19 +621,19 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     if (firstAt === undefined) {
       misses.set(vid, now());
       emit('node_info', false, startedAt, { detail: `${head} —— 首次未见，${waitSec}s 后复查仍未见才判定超期` });
-      return { nodeId: null, createTime: null, size: null, cover: null, expired: false, pendingConfirm: true };
+      return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: false, pendingConfirm: true };
     }
     const elapsed = now() - firstAt;
     if (elapsed < expiredConfirmMs) {
       emit('node_info', false, startedAt, {
         detail: `${head} —— 距首次未见 ${(elapsed / 1000).toFixed(1)}s < ${waitSec}s，暂不定论`,
       });
-      return { nodeId: null, createTime: null, size: null, cover: null, expired: false, pendingConfirm: true };
+      return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: false, pendingConfirm: true };
     }
     misses.delete(vid);
     negatives.set(vid, now());
     emitDefinitiveMiss(emit, vid, startedAt, info);
-    return { nodeId: null, createTime: null, size: null, cover: null, expired: true, pendingConfirm: false };
+    return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: true, pendingConfirm: false };
   }
 
   /**
@@ -577,7 +663,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
         emit('node_info', true, startedAt, {
           detail: `node id=${hit.id}（命中索引 ${cached.total} 条/${cached.pages} 页）`,
         });
-        return { nodeId: hit.id, createTime: hit.createTime, size: hit.size, cover: hit.cover, expired: false, pendingConfirm: false };
+        return { nodeId: hit.id, createTime: hit.createTime, size: hit.size, cover: hit.cover, width: hit.width, height: hit.height, expired: false, pendingConfirm: false };
       }
       if (cached.complete) {
         /*
@@ -614,9 +700,26 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
 
     let walk: Awaited<ReturnType<typeof walkCreationTree>>;
     try {
-      walk = await walkCreationTree(cid);
+      walk = await walkCreationTreeShared(cid);
     } catch (error) {
       emit('node_info', false, startedAt, describeVidError(error, timeoutMs));
+      /*
+       * 降级（2026-09-28 第十二轮 §23.5）：翻树失败时，先看手里有没有**过期索引** ——
+       * 站点此刻多半在软限流，重新翻 8 页大概率还是失败，还会把限流喂得更久。
+       * 旧索引只用于**正命中**（vid 在里面就接着走第 3 步）；索引里没有则不下任何结论
+       * （树可能早已长出新条目，过期索引的「未见」不可信），保持可重试的 pending。
+       */
+      const stale = indexes.get(cid);
+      if (stale) {
+        const hit = stale.map.get(vid);
+        if (hit) {
+          forgetMiss(vid);
+          emit('node_info', true, startedAt, {
+            detail: `node id=${hit.id}（翻树失败，降级命中过期索引 ${stale.total} 条/${stale.pages} 页）`,
+          });
+          return { nodeId: hit.id, createTime: hit.createTime, size: hit.size, cover: hit.cover, width: hit.width, height: hit.height, expired: false, pendingConfirm: false };
+        }
+      }
       return NO_VERDICT;
     }
     if (!walk.structureError) indexes.set(cid, walk.index);
@@ -627,7 +730,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
       emit('node_info', true, startedAt, {
         detail: `node id=${hit.id}（${walk.index.total} 条/${walk.index.pages} 页${walk.index.complete ? '' : '，未到底'}）`,
       });
-      return { nodeId: hit.id, createTime: hit.createTime, size: hit.size, cover: hit.cover, expired: false, pendingConfirm: false };
+      return { nodeId: hit.id, createTime: hit.createTime, size: hit.size, cover: hit.cover, width: hit.width, height: hit.height, expired: false, pendingConfirm: false };
     }
     if (walk.structureError) {
       emit('node_info', false, startedAt, {
@@ -723,17 +826,25 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     }
     emit('get_download_info', true, startedAt, { detail: describeVidPayload(downloadInfo, 'download_infos') });
     /*
-     * 元数据随解析一起带回（2026-09-28 第十轮）：
+     * 元数据随解析一起带回（2026-09-28 第十/十二轮）：
      *   · `size` —— **创作树节点的 `size`**（实测与下载到的原片字节数完全一致）。
      *     报文里 creation 的 video 对象与 `download_infos` 实测基本都不给 size，
      *     所以视频的「文件大小」过去一直显示不出来；这里优先用 download_infos 给的，
      *     没有才用节点值（两者本就指同一个文件）。
+     *   · `width` / `height` —— **创作树节点的 `node_cover.list_view` 宽高**
+     *     （第十二轮探针 37 条样本证实 = 原片真实帧尺寸，含 1470×630 超宽幅）。
+     *     报文里 video 对象的 384×216 是预览规格、download_infos 基本不给 —— 这里同样
+     *     「download_infos 优先、节点兜底」；两处都没有就不写（卡片维持预览规格，不编造）。
      *   · `createdAt` —— 创作树节点的 `create_time`（秒级 → 毫秒）。
      *     ⚠️ 它只是**兜底**：优先用的是消息自带的 `create_time`（`MESSAGE_CREATE_TIME_KEY`），
      *     创作树只保留约三个月，且图片根本不走这条路。
      */
     const meta = findDownloadMeta(downloadInfo);
     if (meta.size === undefined && lookup.size !== null) meta.size = lookup.size;
+    if (meta.width === undefined && lookup.width !== null) {
+      meta.width = lookup.width;
+      meta.height = lookup.height ?? undefined;
+    }
     const createdMs = siteTimeToMs(lookup.createTime);
     if (createdMs !== undefined) meta.createdAt = createdMs;
     /*
@@ -748,19 +859,27 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     if (!vid) return none;
 
     if (resolveOptions.force) {
-      // force = 「换一份新签名」的主动重解析：一并作废负缓存与「首次未见」记录，
-      // 让这次结果重新参与二次确认（不把旧的否定结论套在新证据上）
+      // force = 「换一份新签名」的主动重解析：一并作废负缓存、「首次未见」记录与失败冷却，
+      // 让这次结果重新参与判定（不把旧的否定结论套在新证据上）
       cache.delete(vid);
       forgetMiss(vid);
+      cooldowns.delete(vid);
     } else {
       const cached = freshCached(vid);
       if (cached) {
-        // 拿到过原片 = 正证据 → 旧的「未见/超期」结论一律作废（站点创作树曾延迟的情况）
+        // 拿到过原片 = 正证据 → 旧的「未见/超期/失败冷却」结论一律作废
         forgetMiss(vid);
+        cooldowns.delete(vid);
         return { url: cached.url, expired: false, pendingConfirm: false };
       }
       // 「原片已超期」是二次确认后的确定性结论：TTL 内不再重试（到期后允许再确认一次）
       if (freshNegative(vid)) return { url: null, expired: true, pendingConfirm: false };
+      /*
+       * 失败冷却（2026-09-28 第十二轮 §23.5）：网络层失败（软限流 / 超时 / 断连）后
+       * 冷却期内直接短路 —— chain 每 ~60s 重放都会重新触发解析，若不冷却就会
+       * 「重试 → 重翻 8 页树 → 仍被限流」地死循环。冷却结束后的下一次重放自然恢复。
+       */
+      if (coolingDown(vid) !== null) return none;
     }
 
     // 已有同一 vid 的在飞请求 → 复用它（在飞结果一定是新鲜的，不必重复发）
@@ -775,10 +894,19 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
         if (outcome.url) {
           cache.set(vid, { url: outcome.url, meta: outcome.meta, cover: outcome.cover ?? null, at: now() });
           forgetMiss(vid);
+          cooldowns.delete(vid);
+        } else if (!outcome.expired && !outcome.pendingConfirm) {
+          /*
+           * 「不下结论」的失败（网络层 / 超时 / 结构变化）→ 进入冷却（§23.5）：
+           * 界面保持「解析中」，但冷却期内不再对站点发任何请求，
+           * 避免把软限流喂成持续状态。超期 / 待复查路径有自己的结论语义，不走这里。
+           */
+          if (retryCooldownMs > 0) cooldowns.set(vid, now() + retryCooldownMs);
         }
         return { url: outcome.url, expired: outcome.expired, pendingConfirm: outcome.pendingConfirm };
       } catch (error) {
         console.debug('[UWD] vid 解析失败', vid, error);
+        if (retryCooldownMs > 0) cooldowns.set(vid, now() + retryCooldownMs);
         return none;
       } finally {
         release();
@@ -796,11 +924,13 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     metaOf: (vid: string) => freshCached(vid)?.meta ?? null,
     coverOf: (vid: string) => freshCached(vid)?.cover ?? null,
     has: (vid: string) => freshCached(vid) !== null,
+    cooldownOf: (vid: string) => coolingDown(vid),
     clear: () => {
       cache.clear();
       indexes.clear();
       negatives.clear();
       misses.clear();
+      cooldowns.clear();
     },
     get inflight() {
       return pending.size;

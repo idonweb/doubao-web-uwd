@@ -363,6 +363,20 @@ body {
   font-family: var(--mono);
   backdrop-filter: blur(3px);
 }
+/* 格式药丸按资源类型分色（2026-09-28 用户要求：一眼区分「视频 / 图片」）——
+ * 视频（MP4）= 橙黄色系（与会话卡「合并 N 条」的 `.conv-dedup` 同款 --warn / --warn-soft）；
+ * 图片（PNG / JPEG）= 蓝色系（--info / --info-soft）；两组都是语义令牌，浅深色主题自动跟随。
+ * 同排的时长药丸维持黑灰。 */
+.pill-fmt {
+  color: var(--warn);
+  background: var(--warn-soft);
+  backdrop-filter: none;
+}
+.pill-fmt-img {
+  color: var(--info);
+  background: var(--info-soft);
+  backdrop-filter: none;
+}
 
 /* ---------------------------------------------------------------------------
  * 真实生成时间（2026-09-28 第十轮，`meta.createdAt` = 站点 `create_time`）

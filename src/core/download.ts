@@ -1,15 +1,18 @@
 /**
  * 下载链路：文件名生成（纯函数）+ 单并发队列。
  *
- * 文件名规则（方案 §7.1，已冻结）：
- *   doubao-<convId>-<时间戳>.<ext>
- *   时间戳 = `YYYY-M-D HH-mm-ss`（年月日不补零，时分秒补零，日期与时间之间一个空格）
- *   多文件序号：首个不编号，同名冲突时从 `-02` 起两位补零
+ * 文件名规则（2026-09-28 第十二轮改版，取代方案 §7.1 的 `doubao-<convId>-<下载时刻>`）：
+ *   doubao_<资源真实生成时间> <该资源所属对话页标题>.<ext>
+ *   时间 = `YYYY-M-D HH-mm-ss`（年月日不补零，时分秒补零），取 `meta.createdAt`；
+ *          拿不到时回退为**下载时刻**（用户拍板）。
+ *   标题 = 条目的 `convTitle`（弱标题一律视为没有）；拿不到时回退为**会话 ID**（用户拍板）。
+ *   多文件序号：首个不编号，同名冲突时从 `-02` 起两位补零。
  *
  * 取流方式由 `bg/service-worker.ts` 实现（方案 A / B），本文件只负责编排与命名。
  */
 
 import { LIMITS } from './constants';
+import { isWeakTitle } from './library-store';
 import type { DownloadProgress } from './types';
 
 /* --------------------------------------------------------------------------- */
@@ -39,9 +42,30 @@ export function sanitizeExt(ext: string): string {
   return cleaned || 'bin';
 }
 
+/** 文件名生成的输入（全部可选字段都有兜底，见文件头注释） */
+export interface FilenameInput {
+  /** 资源所属会话 ID（标题兜底；内联下载没有条目时它是唯一标识） */
+  convId: string;
+  ext: string;
+  /** 资源真实生成时间（毫秒 epoch，= 条目的 `meta.createdAt`）；缺失 → 用 `now` */
+  createdAtMs?: number;
+  /** 资源所属对话页标题；弱标题 / 缺失 → 用 `convId` */
+  convTitle?: string;
+  /** 兜底时刻（缺省 = 当前时刻，即下载时刻） */
+  now?: Date;
+}
+
+/** 标题位取值：弱标题（兜底值 / 站点通用名）一律视为没有 → 回退会话 ID；命中标题同样要净化非法字符 */
+function titleSlot(convId: string, convTitle: string | undefined): string {
+  const text = (convTitle ?? '').trim();
+  if (text && !isWeakTitle(text)) return sanitizeSegment(text);
+  return sanitizeSegment(convId);
+}
+
 /** 基础文件名（不含序号） */
-export function baseFilename(convId: string, ext: string, date: Date): string {
-  return `doubao-${sanitizeSegment(convId)}-${formatTimestamp(date)}.${sanitizeExt(ext)}`;
+export function baseFilename(input: FilenameInput): string {
+  const when = formatTimestamp(input.createdAtMs ? new Date(input.createdAtMs) : (input.now ?? new Date()));
+  return `doubao_${when} ${titleSlot(input.convId, input.convTitle)}.${sanitizeExt(input.ext)}`;
 }
 
 /** 带序号的候选名：index 从 2 起，两位补零 */
@@ -64,8 +88,8 @@ export class FilenameAllocator {
     return [...this.used];
   }
 
-  next(convId: string, ext: string, date: Date = new Date()): string {
-    const base = baseFilename(convId, ext, date);
+  next(input: FilenameInput): string {
+    const base = baseFilename(input);
     if (!this.used.has(base)) {
       this.used.add(base);
       return base;

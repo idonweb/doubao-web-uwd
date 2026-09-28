@@ -128,9 +128,11 @@ export const AISPACE_WALK_MAX_PAGES = 10;
  *   · `conversation_id` —— 该创作所属会话（可用于归属校验，目前未用）；
  *   · `node_type` —— 4 = 图片、6 = 视频（实测值）；
  *   · `content.duration` —— 视频时长（秒，如 15.05）；
- *   · `node_cover.list_view.image_width / image_height` —— 封面尺寸（⚠️ 视频节点上是
- *     整帧尺寸 720×1280，但**图片节点上是缩略图尺寸**（实测 28×28 / 116×116），
- *     因此**不能**拿它给图片补真实宽高）。
+ *   · `node_cover.list_view.image_width / image_height` —— 视频节点上是**整帧尺寸**，
+ *     即原片真实帧宽高（2026-09-28 第十二轮探针 37 条样本证实：34 条落在 720P 横/竖档位、
+ *     3 条 1470×630 超宽幅也经用户核对为真实尺寸 —— 异形尺寸同样如实反映）。
+ *     ⚠️ **图片节点上是缩略图尺寸**（实测 28×28 / 116×116），因此**不能**拿它给图片补真实宽高；
+ *     本字段只随 vid 解析路径使用（该路径只有视频），天然不会碰到图片节点。
  *
  * ⚠️ 请求体里的 `sort_param: {sort_type: 0, sort_order: 1}` 是照搬上游的固定值；
  * 实测响应**不回** `sort_config`（为 `null`），也未见别的排序类型 —— 站点侧不可配。
@@ -159,6 +161,19 @@ export const AISPACE_NODE_SIZE_KEY = 'size';
  * 签名过期就只能回退占位（F5 重解析会换一份新的）。
  */
 export const AISPACE_NODE_COVER_PATH = ['node_cover', 'list_view', 'cover_url'] as const;
+/**
+ * 创作树视频节点的**原片真实帧宽高**（`node_cover.list_view.image_width / image_height`）。
+ *
+ * [实测 2026-09-28 第十二轮探针，`docs/probe-video-dims.js`] 全树 37 条视频样本：
+ * 34 条落在 720P 横版（1280×720）/ 竖版（720×1280）且与视频方向一一对应；
+ * 3 条 1470×630（≈21:9）**经用户核对确为真实帧尺寸** —— 字段是视频整帧尺寸，异形也如实。
+ * 用途：vid 解析成功时给卡片补真实宽高 + 派生清晰度标签（取代报文里 384×216 的预览规格）。
+ * ⚠️ **图片节点上是缩略图尺寸**（28×28 / 116×116）—— 本字段只随 vid 解析路径使用
+ * （该路径只有视频），不会碰到图片节点；不要把它扩展到图片链路。
+ * 非已知档位（如 630 短边）`qualityFromDims` 派生不出标签，界面只显示真实宽高（宁缺勿假）。
+ */
+export const AISPACE_NODE_WIDTH_PATH = ['node_cover', 'list_view', 'image_width'] as const;
+export const AISPACE_NODE_HEIGHT_PATH = ['node_cover', 'list_view', 'image_height'] as const;
 /** 实测 node_type：4 = 图片、6 = 视频 */
 export const AISPACE_NODE_TYPE_IMAGE = 4;
 export const AISPACE_NODE_TYPE_VIDEO = 6;

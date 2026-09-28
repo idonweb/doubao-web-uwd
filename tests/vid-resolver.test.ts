@@ -72,8 +72,9 @@ describe('三步 API 的响应解析（纯函数）', () => {
       }),
     ).toEqual({
       children: [
-        { key: 'v0abc', id: 'nid-1', createTime: 1790520877, size: 8_698_069, cover: 'https://p26-sign.douyinpic.com/c.jpeg' },
-        { key: '123', id: '2', createTime: null, size: null, cover: null },
+        // list_view 里没给 image_width/height → null（不编造）
+        { key: 'v0abc', id: 'nid-1', createTime: 1790520877, size: 8_698_069, cover: 'https://p26-sign.douyinpic.com/c.jpeg', width: null, height: null },
+        { key: '123', id: '2', createTime: null, size: null, cover: null, width: null, height: null },
       ],
       hasMore: true,
       nextCursor: 'c-2',
@@ -85,6 +86,24 @@ describe('三步 API 的响应解析（纯函数）', () => {
       nextCursor: null,
     });
     expect(readNodeInfoPage({ data: {} })).toBeNull();
+    // 视频节点的真实帧宽高（node_cover.list_view；1470×630 超宽幅也如实读出 —— 2026-09-28 探针证实）
+    expect(
+      readNodeInfoPage({
+        code: 0,
+        data: {
+          children: [
+            {
+              id: 'nid-9',
+              key: 'v0wide000000',
+              node_cover: { list_view: { cover_url: 'https://p26-sign.douyinpic.com/w.jpeg', image_width: 1470, image_height: 630 } },
+            },
+          ],
+          has_more: false,
+        },
+      })?.children,
+    ).toEqual([
+      { key: 'v0wide000000', id: 'nid-9', createTime: null, size: null, cover: 'https://p26-sign.douyinpic.com/w.jpeg', width: 1470, height: 630 },
+    ]);
   });
 });
 
@@ -97,7 +116,7 @@ describe('createVidResolver', () => {
       count++;
       const key = Object.keys(map).find((path) => url.includes(path));
       const body = key === undefined ? {} : map[key];
-      return { ok: true, status: 200, json: async () => body } as Response;
+      return { ok: true, status: 200, json: async () => body } as unknown as Response;
     }) as unknown as typeof fetch;
     return { fn, count: () => count };
   }
@@ -154,6 +173,51 @@ describe('createVidResolver', () => {
     expect(resolver.metaOf('v0abc123def456')?.size).toBe(NODE_INFO_VIDEO_SIZE);
   });
 
+  it('视频宽高：download_infos 不给时用创作树节点的 node_cover.list_view（原片真实帧尺寸）', async () => {
+    // fixture 的 nid-2 节点带 list_view 720×1280（竖版）；download_infos 只有 main_url
+    const downloadInfoNoDims = { data: { download_infos: [{ main_url: 'https://v3-dy.douyinvod.com/full/original.mp4?lr=unwatermarked' }] } };
+    const { fn } = pathFakeFetch({
+      '/samantha/aispace/homepage': HOMEPAGE_RESPONSE,
+      '/samantha/aispace/node_info': NODE_INFO_RESPONSE,
+      '/samantha/aispace/get_download_info': downloadInfoNoDims,
+    });
+    const resolver = createVidResolver({ fetchFn: fn });
+    await resolver.resolve('v0abc123def456');
+    expect(resolver.metaOf('v0abc123def456')?.width).toBe(720);
+    expect(resolver.metaOf('v0abc123def456')?.height).toBe(1280);
+  });
+
+  it('视频宽高：超宽幅（1470×630）同样如实带回；节点没给则缺省不编造', async () => {
+    const nodeInfoWide = {
+      code: 0,
+      data: {
+        children: [
+          {
+            id: 'nid-wide',
+            key: 'v0wide000000',
+            node_type: 6,
+            node_cover: { list_view: { cover_url: 'https://p26-sign.douyinpic.com/w.jpeg', image_width: 1470, image_height: 630 } },
+          },
+          { id: 'nid-none', key: 'v0nodims00000' },
+        ],
+      },
+    };
+    const downloadInfoOnly = { data: { download_infos: [{ main_url: 'https://v3-dy.douyinvod.com/full/original.mp4' }] } };
+    const { fn } = pathFakeFetch({
+      '/samantha/aispace/homepage': HOMEPAGE_RESPONSE,
+      '/samantha/aispace/node_info': nodeInfoWide,
+      '/samantha/aispace/get_download_info': downloadInfoOnly,
+    });
+    const resolver = createVidResolver({ fetchFn: fn });
+    await resolver.resolve('v0wide000000');
+    expect(resolver.metaOf('v0wide000000')?.width).toBe(1470);
+    expect(resolver.metaOf('v0wide000000')?.height).toBe(630);
+    // 节点没给宽高 → meta 不写（卡片维持「预览 384×216」，宁缺勿假）
+    await resolver.resolve('v0nodims00000');
+    expect(resolver.metaOf('v0nodims00000')?.width).toBeUndefined();
+    expect(resolver.metaOf('v0nodims00000')?.height).toBeUndefined();
+  });
+
   it('两处都有 size 时以 download_infos 为准（它就是「下载这道口」给的文件）', async () => {
     const downloadInfoWithSize = { data: { download_infos: [{ main_url: 'https://v3-dy.douyinvod.com/full/original.mp4', size: 41_000_000 }] } };
     const { fn } = pathFakeFetch({
@@ -172,6 +236,88 @@ describe('createVidResolver', () => {
     expect(resolver.coverOf('v0abc123def456')).toBeNull(); // 解析前没有缓存
     await resolver.resolve('v0abc123def456');
     expect(resolver.coverOf('v0abc123def456')).toBe(NODE_INFO_VIDEO_COVER);
+  });
+
+  it('翻树单飞：并发解析多个 vid 共享同一次翻树，不把 8 页 ×N 打给站点（§23.5 限流修复）', async () => {
+    const nodeInfoCalls = vi.fn();
+    const fn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.includes('/samantha/aispace/homepage')
+        ? HOMEPAGE_RESPONSE
+        : url.includes('/samantha/aispace/node_info')
+          ? (nodeInfoCalls(), NODE_INFO_RESPONSE)
+          : DOWNLOAD_INFO_RESPONSE;
+      return { ok: true, status: 200, json: async () => body } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const resolver = createVidResolver({ fetchFn: fn, concurrency: 2 });
+    // 两个不同 vid 同时解析（冷索引）：不共享翻树就是 2 次全树扫描
+    await Promise.all([resolver.resolve('v0other000000'), resolver.resolve('v0abc123def456')]);
+    expect(nodeInfoCalls).toHaveBeenCalledTimes(1);
+  });
+
+  it('翻树失败 → 降级命中过期索引：vid 仍可解析，不重新翻树（§23.5）', async () => {
+    let clock = 1_000_000;
+    let nodeInfoOk = true;
+    let nodeInfoCalls = 0;
+    const fn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/samantha/aispace/node_info')) {
+        nodeInfoCalls++;
+        if (!nodeInfoOk) {
+          // 实测限流的形状：200 + 空响应体 → response.json() 抛 SyntaxError
+          return { ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } } as unknown as Response;
+        }
+        return { ok: true, status: 200, json: async () => NODE_INFO_RESPONSE } as unknown as Response;
+      }
+      const body = url.includes('/samantha/aispace/homepage') ? HOMEPAGE_RESPONSE : DOWNLOAD_INFO_RESPONSE;
+      return { ok: true, status: 200, json: async () => body } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const resolver = createVidResolver({ fetchFn: fn, indexTtlMs: 50, now: () => clock, retryCooldownMs: 0 });
+
+    // 第一次解析成功并建好索引
+    expect(await resolver.resolve('v0abc123def456')).toBeTruthy();
+    expect(nodeInfoCalls).toBe(1);
+    clock += 1_000; // 索引过期（TTL 50ms）
+    nodeInfoOk = false; // 站点开始软限流：node_info 一律空响应体
+    // 另一个 vid 解析：重翻树失败 → 降级用过期索引正命中 → 照样走通第 3 步
+    expect(await resolver.resolve('v0other000000')).toBeTruthy();
+    expect(nodeInfoCalls).toBe(2); // 只多花 1 次失败的请求，没有反复重翻
+  });
+
+  it('网络失败进入冷却：冷却期内 resolve 短路不发请求，冷却结束自动恢复，force 旁路（§23.5）', async () => {
+    let clock = 1_000_000;
+    let nodeInfoCalls = 0;
+    const fn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/samantha/aispace/node_info')) {
+        nodeInfoCalls++;
+        return { ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } } as unknown as Response;
+      }
+      const body = url.includes('/samantha/aispace/homepage') ? HOMEPAGE_RESPONSE : DOWNLOAD_INFO_RESPONSE;
+      return { ok: true, status: 200, json: async () => body } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const resolver = createVidResolver({ fetchFn: fn, retryCooldownMs: 180_000, now: () => clock });
+
+    // 首次解析：翻树失败 → 不下结论 + 进入冷却
+    expect(await resolver.resolve('v0abc123def456')).toBeNull();
+    expect(nodeInfoCalls).toBe(1);
+    expect(resolver.cooldownOf('v0abc123def456')).toBeGreaterThan(0);
+
+    // 冷却期内 chain 重放再次触发解析 → 短路，一个请求都不发（打破死循环的关键）
+    expect(await resolver.resolve('v0abc123def456')).toBeNull();
+    expect(nodeInfoCalls).toBe(1);
+
+    // 冷却结束 → 下一次解析正常重试
+    clock += 181_000;
+    expect(resolver.cooldownOf('v0abc123def456')).toBeNull();
+    expect(await resolver.resolve('v0abc123def456')).toBeNull();
+    expect(nodeInfoCalls).toBe(2);
+
+    // force（下载失败自愈路径）不受冷却限制
+    clock += 1_000;
+    expect(resolver.cooldownOf('v0abc123def456')).toBeGreaterThan(0);
+    await resolver.resolveDetailed('v0abc123def456', { force: true });
+    expect(nodeInfoCalls).toBe(3);
   });
 
   it('翻遍整棵树未见：首次只记录（待复查），确认窗口后重扫仍未见才判「已超期」并进负缓存', async () => {
@@ -373,7 +519,7 @@ describe('createVidResolver', () => {
     const calls: string[] = [];
     const spy = (async (input: RequestInfo | URL) => {
       calls.push(String(input));
-      return { ok: true, status: 200, json: async () => ({}) } as Response;
+      return { ok: true, status: 200, json: async () => ({}) } as unknown as Response;
     }) as unknown as typeof fetch;
 
     await createVidResolver({ fetchFn: spy }).resolve('v0x');
@@ -432,7 +578,7 @@ describe('缓存 TTL / force / clear（第四轮：签名地址过期自愈）',
     const spy = vi.fn(async () => {
       const url = urls[Math.min(Math.floor(step / 3), urls.length - 1)];
       step++;
-      return { ok: true, status: 200, json: async () => responseFor(step, url) } as Response;
+      return { ok: true, status: 200, json: async () => responseFor(step, url) } as unknown as Response;
     });
     const resolver = createVidResolver({
       fetchFn: spy as unknown as typeof fetch,
@@ -503,7 +649,7 @@ describe('三步 API 的步骤级诊断（P1，2026-09-27）', () => {
       const url = String(input);
       const key = Object.keys(map).find((path) => url.includes(path));
       const body = key === undefined ? {} : map[key];
-      return { ok: true, status: 200, json: async () => body } as Response;
+      return { ok: true, status: 200, json: async () => body } as unknown as Response;
     }) as unknown as typeof fetch;
     return fn;
   }

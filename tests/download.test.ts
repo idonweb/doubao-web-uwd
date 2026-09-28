@@ -37,7 +37,7 @@ describe('字节数实测的响应解析（parseTotalBytes，2026-09-28 体积�
   });
 });
 
-describe('文件名规则（方案 §7.1，已冻结）', () => {
+describe('文件名规则（第十二轮改版：doubao_<真实生成时间> <会话标题>）', () => {
   it('时间戳格式 YYYY-M-D HH-mm-ss（年月日不补零，时分秒补零）', () => {
     expect(formatTimestamp(new Date(2026, 8, 26, 17, 3, 24))).toBe('2026-9-26 17-03-24');
     expect(formatTimestamp(new Date(2026, 11, 1, 0, 0, 5))).toBe('2026-12-1 00-00-05');
@@ -56,28 +56,74 @@ describe('文件名规则（方案 §7.1，已冻结）', () => {
     expect(sanitizeExt('')).toBe('bin');
   });
 
-  it('完整示例与方案文档一致', () => {
-    expect(baseFilename('7f3a92c1-08b4', 'mp4', new Date(2026, 8, 26, 17, 3, 24))).toBe(
-      'doubao-7f3a92c1-08b4-2026-9-26 17-03-24.mp4',
+  it('常规路径：doubao_<meta.createdAt 的生成时间> <对话页标题>.<ext>', () => {
+    // 2026-09-27 22:54:37 本地时间 = 探针实测的创作树 create_time 1790520877（秒）
+    expect(
+      baseFilename({
+        convId: '38443981251120898',
+        ext: 'mp4',
+        createdAtMs: 1_790_520_877_000,
+        convTitle: '0925_AI视频提示词运镜分析与修改',
+        now: new Date(2026, 8, 28, 15, 0, 0),
+      }),
+    ).toBe('doubao_2026-9-27 22-54-37 0925_AI视频提示词运镜分析与修改.mp4');
+  });
+
+  it('标题里的非法字符被净化（站点标题可能带 / : ? 等）', () => {
+    expect(
+      baseFilename({
+        convId: 'c1',
+        ext: 'png',
+        createdAtMs: 1_790_520_877_000,
+        convTitle: 'A/B:C?测试',
+        now: new Date(2026, 8, 28, 15, 0, 0),
+      }),
+    ).toBe('doubao_2026-9-27 22-54-37 A_B_C_测试.png');
+  });
+
+  it('标题缺失 / 弱标题 → 回退会话 ID（用户拍板）', () => {
+    const now = new Date(2026, 8, 28, 15, 0, 0);
+    expect(baseFilename({ convId: '38443981', ext: 'mp4', now })).toBe('doubao_2026-9-28 15-00-00 38443981.mp4');
+    expect(baseFilename({ convId: '38443981', ext: 'mp4', convTitle: '', now })).toBe(
+      'doubao_2026-9-28 15-00-00 38443981.mp4',
+    );
+    // 弱标题（兜底文案 / 站点通用名）不能当文件名标题
+    expect(baseFilename({ convId: '38443981', ext: 'mp4', convTitle: '豆包-AI 智能助手', now })).toBe(
+      'doubao_2026-9-28 15-00-00 38443981.mp4',
+    );
+    expect(baseFilename({ convId: '38443981', ext: 'mp4', convTitle: '豆包 - 字节跳动旗下 AI 智能助手', now })).toBe(
+      'doubao_2026-9-28 15-00-00 38443981.mp4',
     );
   });
 
-  it('序号从 -02 起两位补零，加在时间戳之后', () => {
-    expect(sequencedFilename('doubao-a-2026-9-26 17-03-24.mp4', 2)).toBe(
-      'doubao-a-2026-9-26 17-03-24-02.mp4',
+  it('createdAt 缺失 → 时间位回退下载时刻（用户拍板）；此时标题仍可用', () => {
+    expect(
+      baseFilename({ convId: 'c1', ext: 'mp4', convTitle: '真实标题', now: new Date(2026, 8, 28, 15, 20, 11) }),
+    ).toBe('doubao_2026-9-28 15-20-11 真实标题.mp4');
+  });
+
+  it('序号从 -02 起两位补零，加在扩展名之前', () => {
+    expect(sequencedFilename('doubao_2026-9-26 17-03-24 标题.mp4', 2)).toBe(
+      'doubao_2026-9-26 17-03-24 标题-02.mp4',
     );
-    expect(sequencedFilename('doubao-a-2026-9-26 17-03-24.mp4', 10)).toBe(
-      'doubao-a-2026-9-26 17-03-24-10.mp4',
+    expect(sequencedFilename('doubao_2026-9-26 17-03-24 标题.mp4', 10)).toBe(
+      'doubao_2026-9-26 17-03-24 标题-10.mp4',
     );
   });
 
-  it('分配器：首个不编号，冲突时依次加序号', () => {
+  it('分配器：首个不编号，冲突时依次加序号（同一条目重试同名 → -02）', () => {
     const allocator = new FilenameAllocator();
-    const date = new Date(2026, 8, 26, 17, 3, 24);
-    expect(allocator.next('conv-1', 'mp4', date)).toBe('doubao-conv-1-2026-9-26 17-03-24.mp4');
-    expect(allocator.next('conv-1', 'mp4', date)).toBe('doubao-conv-1-2026-9-26 17-03-24-02.mp4');
-    expect(allocator.next('conv-1', 'mp4', date)).toBe('doubao-conv-1-2026-9-26 17-03-24-03.mp4');
-    expect(allocator.next('conv-2', 'mp4', date)).toBe('doubao-conv-2-2026-9-26 17-03-24.mp4');
+    const input = {
+      convId: 'c1',
+      ext: 'mp4',
+      createdAtMs: 1_790_520_877_000,
+      convTitle: '会话标题',
+      now: new Date(2026, 8, 26, 17, 3, 24),
+    };
+    expect(allocator.next(input)).toBe('doubao_2026-9-27 22-54-37 会话标题.mp4');
+    expect(allocator.next(input)).toBe('doubao_2026-9-27 22-54-37 会话标题-02.mp4');
+    expect(allocator.next(input)).toBe('doubao_2026-9-27 22-54-37 会话标题-03.mp4');
+    expect(allocator.next({ ...input, convTitle: '另一会话' })).toBe('doubao_2026-9-27 22-54-37 另一会话.mp4');
     expect(allocator.allocated).toHaveLength(4);
   });
 });

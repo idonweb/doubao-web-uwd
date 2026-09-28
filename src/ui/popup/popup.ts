@@ -234,7 +234,7 @@ function cardHtml(item: MediaItem): string {
       ${whenPill}
       <div class="thumb-ov">
         ${item.meta.duration ? `<span class="pill">${esc(fmtDuration(item.meta.duration))}</span>` : ''}
-        <span class="pill">${esc((item.meta.ext || 'bin').toUpperCase())}</span>
+        <span class="pill ${item.kind === 'video' ? 'pill-fmt' : 'pill-fmt-img'}">${esc((item.meta.ext || 'bin').toUpperCase())}</span>
       </div>
       <div class="ck">${icon('check')}</div>
     </div>

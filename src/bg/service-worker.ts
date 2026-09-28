@@ -670,7 +670,15 @@ async function buildTargets(request: DownloadRequest): Promise<DownloadTarget[]>
   for (const id of ids) {
     const item = library[id];
     if (!item) continue;
-    const target: DownloadTarget = { itemId: item.id, convId: item.convId, url: item.primary, ext: item.meta.ext };
+    const target: DownloadTarget = {
+      itemId: item.id,
+      convId: item.convId,
+      url: item.primary,
+      ext: item.meta.ext,
+      // 文件名要用的两个站点真值：真实生成时间 + 所属对话页标题（弱/缺失时 download.ts 里兜底）
+      createdAtMs: item.meta.createdAt,
+      convTitle: item.convTitle,
+    };
     // 视频指纹形如 `vid:<x>` —— 签名地址过期时靠它让页面重新解析
     if (item.fingerprint.startsWith('vid:')) target.vid = item.fingerprint.slice(4);
     targets.push(target);
@@ -713,14 +721,14 @@ async function handleDownloadRequest(
       id: target.itemId,
       label: target.url,
       run: async () => {
-        const filename = allocator.next(target.convId, target.ext);
+        const filename = allocator.next(target);
         try {
           await performDownload(target, filename, tabId);
         } catch (error) {
           // 第一次失败 → 换一份新签名再试一次（常见的失败原因就是签名过期）
           const fresh = await refreshTargetUrl(target, tabId);
           if (!fresh) throw error;
-          await performDownload({ ...target, url: fresh }, allocator.next(target.convId, target.ext), tabId);
+          await performDownload({ ...target, url: fresh }, allocator.next(target), tabId);
         }
       },
     })),

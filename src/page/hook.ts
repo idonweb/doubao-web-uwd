@@ -113,17 +113,27 @@ declare global {
     vidSteps.delete(vid);
     const failed = steps.find((step) => !step.ok);
     const suffix = force ? '（重解析）' : '';
-    diag(
-      'vid.resolve',
-      outcome.url
-        ? `vid=${vid} → ok${suffix}（${steps.length} 步）`
-        : outcome.expired
-          ? `vid=${vid} → 原片已超期${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`
-          : outcome.pendingConfirm
-            ? `vid=${vid} → 待复查${suffix}（树里首次未见）：${failed ? formatVidStep(failed) : '未产生步骤事件'}`
-            : `vid=${vid} → null${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`,
-      { level: outcome.url ? 'info' : 'warn' },
-    );
+    let detail: string;
+    if (outcome.url) {
+      detail = `vid=${vid} → ok${suffix}（${steps.length} 步）`;
+    } else if (outcome.expired) {
+      detail = `vid=${vid} → 原片已超期${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`;
+    } else if (outcome.pendingConfirm) {
+      detail = `vid=${vid} → 待复查${suffix}（树里首次未见）：${failed ? formatVidStep(failed) : '未产生步骤事件'}`;
+    } else {
+      const cooldown = vidResolver.cooldownOf(vid);
+      if (failed) {
+        detail = `vid=${vid} → null${suffix}：${formatVidStep(failed)}${
+          cooldown !== null ? `（进入失败退避 ${Math.round(cooldown / 1000)}s，期间不发请求）` : ''
+        }`;
+      } else if (cooldown !== null) {
+        // 冷却期内的 chain 重放会走到这里短路 —— 不对站点发任何请求（§23.5）
+        detail = `vid=${vid} → null${suffix}：网络失败退避中（剩 ${Math.round(cooldown / 1000)}s），本轮不发请求`;
+      } else {
+        detail = `vid=${vid} → null${suffix}：未产生步骤事件`;
+      }
+    }
+    diag('vid.resolve', detail, { level: outcome.url ? 'info' : 'warn' });
     return outcome;
   }
 
