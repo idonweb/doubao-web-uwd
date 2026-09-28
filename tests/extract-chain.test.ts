@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
-import { collectChainCreations, decodeChainUrls, extractChainRaw, matchChainMainUrls } from '../src/core/extract/chain';
+import {
+  collectChainCreations,
+  decodeChainUrls,
+  extractChainRaw,
+  matchChainMainUrls,
+  walkChainCreations,
+} from '../src/core/extract/chain';
 import { toDrafts } from '../src/core/extract/common';
 import {
   CHAIN_DURATION,
   CHAIN_FALLBACK_API,
+  CHAIN_MESSAGE_CREATE_TIME,
   CHAIN_RESPONSE,
   CHAIN_RESPONSE_NOT_JSON,
   CHAIN_RESPONSE_URL_ONLY,
@@ -52,11 +59,38 @@ describe('chain/single 结构化解析（P0-1 修复）', () => {
     expect(raws[0].fallbackApi).toBe(CHAIN_FALLBACK_API);
   });
 
+  it('封面字段是 video.cover.image_thumb.url（2026-09-28 实测；旧路径 video_thumb 不存在）', () => {
+    // 回归锁：若有人把字段路径改回 `video_thumb`，这条会失败
+    expect(raws[0].thumb).toBe(VIDEO_THUMB);
+    expect(toDrafts(raws, CTX)[0].cover).toBe(VIDEO_THUMB);
+  });
+
   it('video_model 的多层转义能被解开，main_url 不含 unwatermarked 也照样保留', () => {
     expect(raws[0].videoModel).toContain('video_list');
     const urls = raws[0].videoModel ?? '';
     // 断言它确实是被转义的形态（引号前带反斜杠），而不是普通 JSON
     expect(urls).toContain('\\"main_url\\"');
+  });
+
+  it('消息自带的 create_time 向下继承给 creation（秒级原样），并换算成毫秒写进 meta', () => {
+    // 实测量级：`data.downlink_body.pull_singe_chain_downlink_body.messages[i].create_time`
+    expect(raws[0].createdAt).toBe(CHAIN_MESSAGE_CREATE_TIME);
+
+    const drafts = toDrafts(raws, CTX);
+    expect(drafts[0].meta.createdAt).toBe(CHAIN_MESSAGE_CREATE_TIME * 1000);
+    // 图片 / 视频都靠这条链路拿时间，不受「创作树只留约三个月」的限制
+    expect(walkChainCreations(CHAIN_RESPONSE)[0].createdAt).toBe(CHAIN_MESSAGE_CREATE_TIME);
+  });
+
+  it('消息没有 create_time 时不编造（createdAt 缺省）', () => {
+    const noTime = JSON.stringify({
+      data: { downlink_body: { pull_singe_chain_downlink_body: { messages: [{ content_block: [] }] } } },
+    });
+    expect(extractChainRaw(noTime)).toEqual([]);
+    // 有 creation 但没有时间 → raw 里不写 createdAt，draft.meta 里也不写
+    const stripped = CHAIN_RESPONSE.replace(/"create_time":\d+,?/g, '');
+    const drafts = toDrafts(extractChainRaw(stripped), CTX);
+    expect(drafts[0].meta.createdAt).toBeUndefined();
   });
 
   it('链式响应里没有 ori_raw，因此不伪装成原片（raw 为空，等三步 API）', () => {

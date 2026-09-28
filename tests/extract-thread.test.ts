@@ -17,6 +17,7 @@ import {
   FN_ARGS_UNRELATED,
   IMAGE_RAW,
   SHARE_INFO,
+  THREAD_MESSAGE_CREATE_TIME,
 } from './fixtures/samples';
 
 const CTX = { convId: 'w8kD2mQv7p', convKind: 'thread' as const, convTitle: '分享 · 赛博朋克街道' };
@@ -136,6 +137,14 @@ describe('extractThreadRaw', () => {
     expect(candidate?.url).toContain('lr=video_gen_no_watermark');
     expect(candidate?.isRaw).toBe(false);
     expect(image?.state).toBe('raw');
+  });
+
+  it('分享页消息的 create_time 也会写进草稿（视频与图片都有，毫秒）', () => {
+    const drafts = toDrafts(raws, CTX);
+    expect(drafts.map((draft) => draft.meta.createdAt)).toEqual([
+      THREAD_MESSAGE_CREATE_TIME * 1000,
+      THREAD_MESSAGE_CREATE_TIME * 1000,
+    ]);
   });
 
   it('数据缺失时返回空数组，不抛异常', () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_CONFIG, LIMITS, SCHEMA_VERSION, STORAGE } from '../src/core/constants';
-import { normalizeConfig, normalizeLibrary, normalizeSchemaVersion } from '../src/core/storage';
+import { dropStaleImageSizes, normalizeConfig, normalizeLibrary, normalizeSchemaVersion, type Library } from '../src/core/storage';
 import { LEGACY_STORAGE_KEYS } from '../src/core/site-contract';
 
 describe('配置归一化（纯函数）', () => {
@@ -75,6 +75,49 @@ describe('schema 版本归一化', () => {
     expect(normalizeSchemaVersion('1')).toBe(SCHEMA_VERSION);
     expect(normalizeSchemaVersion(0)).toBe(SCHEMA_VERSION);
     expect(normalizeSchemaVersion(3)).toBe(3);
+  });
+});
+
+/**
+ * schema v1 → v2 的一次性清理（2026-09-28）：图片旧体积不可信，必须丢掉重测。
+ * 实机反例：卡片 378 KB ↔ 实际下载 3.81 MB 的 PNG。
+ */
+describe('dropStaleImageSizes（v1→v2 迁移，纯函数）', () => {
+  const item = (kind: 'video' | 'image', size?: number) => ({
+    id: `c::${kind}`,
+    convId: 'c',
+    convKind: 'chat' as const,
+    convTitle: 't',
+    fingerprint: kind,
+    kind,
+    state: 'raw' as const,
+    variants: [],
+    primary: 'https://a.com/x',
+    cover: null,
+    meta: size === undefined ? { ext: 'png' } : { ext: 'png', size },
+    firstSeen: 1,
+    lastSeen: 2,
+  });
+
+  it('图片条目的 size 被清掉，其它字段与视频条目原样保留', () => {
+    const library = {
+      'c::image': item('image', 378_043),
+      'c::video': item('video', 8_698_069),
+      'c::image2': item('image'),
+    } as unknown as Library;
+    const { library: next, changed } = dropStaleImageSizes(library);
+    expect(changed).toBe(true);
+    expect(next['c::image'].meta.size).toBeUndefined();
+    expect(next['c::video'].meta.size).toBe(8_698_069); // 视频的树 size 已验证，不动
+    expect(next['c::image2'].meta).toEqual({ ext: 'png' });
+    // 不原地改传入对象
+    expect(library['c::image'].meta.size).toBe(378_043);
+  });
+
+  it('没有图片体积时 changed=false（幂等，不产生无谓写入）', () => {
+    const library = { 'c::video': item('video', 1_000) } as unknown as Library;
+    expect(dropStaleImageSizes(library).changed).toBe(false);
+    expect(dropStaleImageSizes({} as Library).changed).toBe(false);
   });
 });
 

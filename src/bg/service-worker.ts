@@ -18,11 +18,12 @@
 
 import { DOWNLOAD_STRATEGY, EXT_VERSION, LIMITS, MSG, STORAGE } from '../core/constants';
 import { makeRecord, pushBounded, type DiagRecord } from '../core/diagnostics';
-import { DownloadQueue, FilenameAllocator } from '../core/download';
+import { DownloadQueue, FilenameAllocator, parseTotalBytes } from '../core/download';
 import {
   type Library,
   filterDraftsByConv,
   isLeaveScope,
+  itemId,
   markExpired,
   markFailed,
   patchItem,
@@ -36,6 +37,8 @@ import { broadcast, onRuntimeMessage, trySendToTab } from '../core/messaging';
 import { migrate, onStateChanged, patchConfig, readConfig, readLibrary, readState, writeLibrary } from '../core/storage';
 import {
   CHAT_PATH_PATTERN,
+  CONV_ID_PATTERN,
+  SIZE_PROBE_RANGE,
   THREAD_PATH_PATTERN,
   isDoubaoHostUrl,
   isLocalConvId,
@@ -47,6 +50,7 @@ import type {
   DownloadRequest,
   DownloadTarget,
   MediaDraft,
+  MediaItem,
   PageInfo,
   StateRequest,
   StateResponse,
@@ -324,6 +328,131 @@ async function flushDrafts(): Promise<void> {
     `in=${drafts.length} added=${result.added} merged=${result.merged} skipped=${result.skipped} evicted=${result.evicted} total=${Object.keys(result.library).length} skipThumbOnly=${config.skipThumbOnly}`,
     result.added || result.merged ? {} : { level: 'warn' },
   );
+
+  // 体积兜底：创作树里查不到体积的条目（超期视频 / 超过约三个月的旧图片）实测一次字节数。
+  // ⚠️ **不 await**：每条最多 8s，等在这里会把入库链路拖住几十秒，期间别的写入
+  // （`bg.expire` 的超期落库等）可能被旧快照回写覆盖 —— 实测踩过这个坑。
+  void backfillSizes(drafts.map((draft) => itemId(draft.convId, draft.fingerprint)));
+}
+
+/* --------------------------------------------------------------------------- */
+/* 体积兜底（2026-09-28 第十轮补丁）                                              */
+/*                                                                             */
+/* 体积的**首选来源**是创作树节点 `size`（视频由 vid 三步 API 带回、图片由页面侧         */
+/* `imageSizeOf` 查树带回）—— 零额外请求、实测与落盘字节数一致。                      */
+/* 树里没有的条目（超期视频 / 超过约三个月的旧图片）就只能**实测**：                       */
+/* 对条目 `primary`（点下载真正会拿到的那个地址）发一次 `Range: bytes=0-0`，             */
+/* 从 `Content-Range` 读总长 —— 只下 1 字节。                                      */
+/*                                                                             */
+/* ⚠️ 必须在这里（background）发：页面里发会被 CORS 挡住响应头（探针实测              */
+/* `content-range=null`）；扩展上下文有 host_permissions，能读全。                     */
+/* ⚠️ 只测「已定局」的条目（`pending` 表示还在解析中，体积等一下就会随解析结果来），        */
+/* 且同一条目在一个 SW 生命周期内只测一次（失败不重试，等 F5 重解析）。                  */
+/* --------------------------------------------------------------------------- */
+
+const probedSizeIds = new Set<string>();
+
+/** 该条目现在还值得测体积吗（已定局、缺体积、地址是可取的 http(s)） */
+function needsSizeProbe(item: MediaItem): boolean {
+  if (item.meta.size !== undefined) return false;
+  if (item.state === 'pending') return false;
+  if (probedSizeIds.has(item.id)) return false;
+  return /^https?:/i.test(item.primary);
+}
+
+/**
+ * 单次探测：先按 `Range: bytes=0-0` 试，读到总长就返回。
+ *
+ * 兜底原因（2026-09-28 实机/探针）：这两个来源的行为不一样 ——
+ *   · 视频 CDN 支持 Range → **206** + `Content-Range: bytes 0-0/<总长>`，只下 1 字节；
+ *   · 图片 CDN（`*-flow-imagex-sign.byteimg.com`）实测 **`accept-ranges: null`**，
+ *     给了 Range 也可能忽略 → 回 **200** + `Content-Length`（完整长度），此时必须**立刻中断响应体**。
+ * 所以两种都认；都读不到再退回「不带 Range 的普通 GET」（同样读 `Content-Length` 后中断）——
+ * 这条路径在页面探针里**实测可用**（`content-length=4414234`）。
+ */
+async function probeSizeOnce(url: string, useRange: boolean): Promise<{ size?: number; note: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LIMITS.SIZE_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      ...(useRange ? { headers: { Range: SIZE_PROBE_RANGE } } : {}),
+      signal: controller.signal,
+    });
+    const size = parseTotalBytes(response.status, (name) => response.headers.get(name));
+    // 200（没按 Range 回）= 整个响应体正在流下来 → 立刻掐掉，只留头信息
+    if (response.status === 200) void response.body?.cancel().catch(() => undefined);
+    return {
+      size,
+      note: `status=${response.status} len=${response.headers.get('content-length') ?? '-'} range=${
+        response.headers.get('content-range') ?? '-'
+      }${size ? '' : '（认不出总长）'}`,
+    };
+  } catch (error) {
+    return { note: `❌ ${(error as Error).name} ${(error as Error).message}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 实测一个地址的文件总字节数；读不到返回 undefined（宁缺勿假）。`note` 只用于诊断。 */
+async function measureBytes(url: string): Promise<{ size?: number; note: string }> {
+  const ranged = await probeSizeOnce(url, true);
+  if (ranged.size !== undefined) return ranged;
+  const plain = await probeSizeOnce(url, false);
+  return { size: plain.size, note: `带 Range：${ranged.note}｜不带 Range：${plain.note}` };
+}
+
+/**
+ * 给「体积仍缺失且已定局」的条目实测字节数，回写 `meta.size`。
+ * 每轮最多 `SIZE_PROBE_MAX_PER_ROUND` 条、串行执行（避免对 CDN 打出脉冲）。
+ *
+ * 入参是**条目 id**（`itemId()` 的产物）—— upsert 后与「原片已超期」落库后都要走一次。
+ */
+async function backfillSizes(ids: Iterable<string>): Promise<void> {
+  const unique = [...new Set(ids)];
+  if (!unique.length) return;
+  const library = await getLibrary();
+  const candidates = unique
+    .map((id) => library[id])
+    .filter((item): item is MediaItem => !!item && needsSizeProbe(item));
+  const todo = candidates.slice(0, LIMITS.SIZE_PROBE_MAX_PER_ROUND);
+  const rest = candidates.slice(LIMITS.SIZE_PROBE_MAX_PER_ROUND).map((item) => item.id);
+  if (!todo.length) return;
+
+  let measured = 0;
+  let failed = 0;
+  const notes: string[] = [];
+  for (const item of todo) {
+    probedSizeIds.add(item.id);
+    const result = await measureBytes(item.primary);
+    if (result.size === undefined) {
+      failed += 1;
+      if (notes.length < 2) notes.push(result.note);
+      continue;
+    }
+    /*
+     * 每条**重新读一次**当前库再打补丁：批量下载/解析期间别的路径（如 `bg.expire`、
+     * 页面新草稿）也在写库，用旧快照整体回写会把它们的成果抹掉。
+     */
+    const current = (await getLibrary())[item.id];
+    if (!current) continue;
+    await persistLibrary(patchItem(await getLibrary(), item.id, { meta: { ...current.meta, size: result.size } }));
+    measured += 1;
+  }
+  diag(
+    'bg.size',
+    `实测字节：成功 ${measured} 条 / 失败 ${failed} 条（候选 ${todo.length} 条${
+      rest.length ? `，余 ${rest.length} 条下一轮继续` : ''
+    }）${notes.length ? `｜失败原因：${notes.join(' ; ')}` : ''}`,
+    measured ? {} : { level: 'warn' },
+  );
+  /*
+   * 一个会话里可能压着几十条待测（例如整屏都是超过三个月的旧图片），而每轮只放
+   * `SIZE_PROBE_MAX_PER_ROUND` 条 —— 剩下的**分批续跑**（一次性定时器，不是轮询；
+   * 每轮都会把测过的 id 记进 `probedSizeIds`，所以一定会收敛到「没有候选」而停下）。
+   */
+  if (rest.length) setTimeout(() => void backfillSizes(rest), LIMITS.SIZE_PROBE_CONTINUE_MS);
 }
 
 /* --------------------------------------------------------------------------- */
@@ -615,6 +744,17 @@ function isDoubaoUrl(url: string | undefined): boolean {
   }
 }
 
+/**
+ * 豆包域内的**会话页 / 分享页**（路径里带会话 ID）。
+ *
+ * 与 `isDoubaoUrl` 的区别只在「有没有会话 ID」：首页 `/chat/` 会命中 `CHAT_PATH_PATTERN`
+ * 但没有 ID，它属于「豆包非对话页」而不是「会话页待刷新」（2026-09-28 第十轮，与页面侧
+ * `detectKind` 同一条口径）。
+ */
+function isDoubaoConversationUrl(url: string | undefined): boolean {
+  return isDoubaoUrl(url) && CONV_ID_PATTERN.test(url ?? '');
+}
+
 const NONE_PAGE: PageInfo = { kind: 'none', convId: '', title: '', url: '', injected: false };
 
 async function buildStateResponse(request?: StateRequest): Promise<StateResponse> {
@@ -634,9 +774,10 @@ async function buildStateResponse(request?: StateRequest): Promise<StateResponse
         await applyScope({ convId: page.convId, title: page.title, kind: page.kind });
       }
     } else {
-      // 内容脚本没应答：区分「豆包页但没注入」与「压根不是豆包页」
+      // 内容脚本没应答：区分「豆包会话页但没注入」与「压根不是会话页」
+      // ⚠️ 只对**带会话 ID 的页面**才算「待刷新」——首页 `/chat/` 没有会话，刷新也不会变成会话
       const tabUrl = await tabUrlOf(tabId);
-      stale = isDoubaoUrl(tabUrl);
+      stale = isDoubaoConversationUrl(tabUrl);
       if (stale) void rememberContentTab(tabId);
       page = { ...NONE_PAGE, url: tabUrl };
       diag(
@@ -718,9 +859,15 @@ onRuntimeMessage((env, sender, sendResponse) => {
             await persistLibrary(next);
             diag(
               'bg.expire',
-              `convId=${payload.convId} fingerprint=${payload.fingerprint} → 原片已超期（创作树全量扫描未见）`,
+              `convId=${payload.convId} fingerprint=${payload.fingerprint} → 原片已超期（创作树二次确认仍未见）`,
               { level: 'warn' },
             );
+            /*
+             * 超期条目拿不到创作树节点 `size`（作品已被站点清除），但它的 `primary` 仍是
+             * 站点可下载的那个文件 —— 实测一次字节数，卡片就有「文件大小」了
+             * （口径：显示的是**能下载到的那个文件**的体积，用户已拍板，2026-09-28）。
+             */
+            void backfillSizes([itemId(payload.convId as string, payload.fingerprint as string)]);
           }
           sendResponse({ ok: true });
         })();
@@ -771,6 +918,34 @@ onRuntimeMessage((env, sender, sendResponse) => {
         .catch((error: unknown) =>
           sendResponse({ ok: false, queued: 0, error: String((error as Error)?.message ?? error) }),
         );
+      return true;
+    }
+
+    /*
+     * 资源库卡片点了「预览」（2026-09-28 第十轮）→ 让**页面**去定位这条资源并尽力唤起
+     * 豆包自己的预览（用户拍板：插件不自己造播放器，只当「豆包功能的另一个入口」）。
+     * 页面返回 `found`（是否在 DOM 里找到）—— 找不到时弹窗会如实提示，而不是假装成功。
+     */
+    case MSG.PreviewLocate: {
+      const keys = (env.payload as { keys?: string[] } | undefined)?.keys;
+      if (!Array.isArray(keys) || !keys.length) {
+        sendResponse({ found: false });
+        return undefined;
+      }
+      void (async () => {
+        const { tabId } = await resolveReportTarget(undefined, false);
+        if (tabId === null) {
+          diag('bg.preview', '定位请求失败：没有可用的标签页', { level: 'warn' });
+          sendResponse({ found: false, error: '没有可用的标签页' });
+          return;
+        }
+        const res = await trySendToTab<{ found?: boolean }>(tabId, MSG.PreviewLocate, { keys }, 8_000);
+        const found = res?.found === true;
+        diag('bg.preview', `定位 keys=${keys.length} → ${found ? 'found' : 'not-found'}（tab #${tabId}）`, {
+          level: found ? 'info' : 'warn',
+        });
+        sendResponse({ found });
+      })();
       return true;
     }
 

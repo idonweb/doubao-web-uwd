@@ -15,6 +15,8 @@ import {
   DOWNLOAD_INFO_RESPONSE,
   HOMEPAGE_RESPONSE,
   NODE_INFO_RESPONSE,
+  NODE_INFO_VIDEO_COVER,
+  NODE_INFO_VIDEO_SIZE,
 } from './fixtures/samples';
 
 /** 200 响应的极简替身（body 直接作为 json 返回） */
@@ -48,14 +50,20 @@ describe('三步 API 的响应解析（纯函数）', () => {
     expect(findDownloadMeta(undefined)).toEqual({});
   });
 
-  it('第 2 步翻页（readNodeInfoPage）：读出 key/id/has_more/next_cursor，结构对不上返回 null', () => {
+  it('第 2 步翻页（readNodeInfoPage）：读出 key/id/create_time/size/cover/has_more/next_cursor，结构对不上返回 null', () => {
     expect(
       readNodeInfoPage({
         code: 0,
         data: {
           children: [
-            { id: 'nid-1', key: 'v0abc' },
-            { id: 2, key: 123 }, // 数字形态也转成字符串
+            {
+              id: 'nid-1',
+              key: 'v0abc',
+              create_time: 1790520877,
+              size: 8_698_069,
+              node_cover: { list_view: { cover_url: 'https://p26-sign.douyinpic.com/c.jpeg' } },
+            },
+            { id: 2, key: 123 }, // 数字形态也转成字符串；缺的字段一律 null（不编造）
             { key: 'no-id' }, // 缺 id 的条目跳过
           ],
           has_more: true,
@@ -64,14 +72,14 @@ describe('三步 API 的响应解析（纯函数）', () => {
       }),
     ).toEqual({
       children: [
-        { key: 'v0abc', id: 'nid-1' },
-        { key: '123', id: '2' },
+        { key: 'v0abc', id: 'nid-1', createTime: 1790520877, size: 8_698_069, cover: 'https://p26-sign.douyinpic.com/c.jpeg' },
+        { key: '123', id: '2', createTime: null, size: null, cover: null },
       ],
       hasMore: true,
       nextCursor: 'c-2',
     });
-    // has_more=false → 游标清空（到底）
-    expect(readNodeInfoPage({ data: { children: [], has_more: false, next_cursor: 'c-9' } })).toEqual({
+    // has_more=false → 游标清空（到底；实测站点此时返回 next_cursor: -1）
+    expect(readNodeInfoPage({ data: { children: [], has_more: false, next_cursor: -1 } })).toEqual({
       children: [],
       hasMore: false,
       nextCursor: null,
@@ -108,7 +116,13 @@ describe('createVidResolver', () => {
     expect(url).toBe('https://v3-dy.douyinvod.com/full/original.mp4?lr=unwatermarked');
     expect(count()).toBe(3);
     // 第 3 步顺带带回的元数据也能从缓存读出（fixture 里给了 1280×720 / 41MB）
-    expect(resolver.metaOf('v0abc123def456')).toEqual({ width: 1280, height: 720, size: 41_000_000 });
+    // + 创作树节点的 create_time（秒级 → 毫秒）就是「作品真实生成时间」
+    expect(resolver.metaOf('v0abc123def456')).toEqual({
+      width: 1280,
+      height: 720,
+      size: 41_000_000,
+      createdAt: 1_790_520_877_000,
+    });
     expect(resolver.has('v0abc123def456')).toBe(true);
 
     // 第二次直接走缓存
@@ -116,7 +130,51 @@ describe('createVidResolver', () => {
     expect(count()).toBe(3);
   });
 
-  it('翻遍整棵树（has_more=false）仍未见到 vid → 确定性「已超期」，TTL 内不重试', async () => {
+  it('节点没有 create_time（站点不给）→ 不编造，meta.createdAt 缺省', async () => {
+    const { fn } = pathFakeFetch({
+      '/samantha/aispace/homepage': HOMEPAGE_RESPONSE,
+      '/samantha/aispace/node_info': { code: 0, data: { children: [{ id: 'nid-x', key: 'v0notime0000' }] } },
+      '/samantha/aispace/get_download_info': DOWNLOAD_INFO_RESPONSE,
+    });
+    const resolver = createVidResolver({ fetchFn: fn });
+    expect(await resolver.resolve('v0notime0000')).toBeTruthy();
+    expect(resolver.metaOf('v0notime0000')?.createdAt).toBeUndefined();
+  });
+
+  it('视频体积：download_infos 不给 size 时用创作树节点的 size（实测与落盘原片一致）', async () => {
+    // 只有 main_url、没有 width/height/size —— 这正是实机上的样子（docs/03 §12）
+    const downloadInfoNoSize = { data: { download_infos: [{ main_url: 'https://v3-dy.douyinvod.com/full/original.mp4?lr=unwatermarked' }] } };
+    const { fn } = pathFakeFetch({
+      '/samantha/aispace/homepage': HOMEPAGE_RESPONSE,
+      '/samantha/aispace/node_info': NODE_INFO_RESPONSE,
+      '/samantha/aispace/get_download_info': downloadInfoNoSize,
+    });
+    const resolver = createVidResolver({ fetchFn: fn });
+    await resolver.resolve('v0abc123def456');
+    expect(resolver.metaOf('v0abc123def456')?.size).toBe(NODE_INFO_VIDEO_SIZE);
+  });
+
+  it('两处都有 size 时以 download_infos 为准（它就是「下载这道口」给的文件）', async () => {
+    const downloadInfoWithSize = { data: { download_infos: [{ main_url: 'https://v3-dy.douyinvod.com/full/original.mp4', size: 41_000_000 }] } };
+    const { fn } = pathFakeFetch({
+      '/samantha/aispace/homepage': HOMEPAGE_RESPONSE,
+      '/samantha/aispace/node_info': NODE_INFO_RESPONSE,
+      '/samantha/aispace/get_download_info': downloadInfoWithSize,
+    });
+    const resolver = createVidResolver({ fetchFn: fn });
+    await resolver.resolve('v0abc123def456');
+    expect(resolver.metaOf('v0abc123def456')?.size).toBe(41_000_000);
+  });
+
+  it('顺带带回站点封面图（coverOf），供链式报文没给缩略图时兜底', async () => {
+    const { fn } = pathFakeFetch(FULL_MAP);
+    const resolver = createVidResolver({ fetchFn: fn });
+    expect(resolver.coverOf('v0abc123def456')).toBeNull(); // 解析前没有缓存
+    await resolver.resolve('v0abc123def456');
+    expect(resolver.coverOf('v0abc123def456')).toBe(NODE_INFO_VIDEO_COVER);
+  });
+
+  it('翻遍整棵树未见：首次只记录（待复查），确认窗口后重扫仍未见才判「已超期」并进负缓存', async () => {
     let clock = 0;
     const calls: string[] = [];
     const fetchFn = (async (input: RequestInfo | URL) => {
@@ -130,20 +188,83 @@ describe('createVidResolver', () => {
       throw new Error('unexpected');
     }) as unknown as typeof fetch;
 
-    const resolver = createVidResolver({ fetchFn, ttlMs: 1_000, indexTtlMs: 1_000, now: () => clock });
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 1_000,
+      indexTtlMs: 1_000,
+      expiredConfirmMs: 30_000,
+      now: () => clock,
+    });
+
+    // ① 首次未见：不下结论（站点创作树对刚生成的视频有提交延迟）
     const first = await resolver.resolveDetailed('v0missing');
-    expect(first).toEqual({ url: null, expired: true });
+    expect(first).toEqual({ url: null, expired: false, pendingConfirm: true });
     expect(calls.length).toBe(2); // homepage + 1 页 node_info
 
-    // 确定性结论进了负缓存：TTL 内再问不发生请求
+    // ② 窗口内再问一次：仍不下结论，且确实又查了一次树（不是拿旧结论复用）
+    clock += 1_000;
     const second = await resolver.resolveDetailed('v0missing');
-    expect(second).toEqual({ url: null, expired: true });
-    expect(calls.length).toBe(2);
-
-    // TTL 过后允许再确认一次（树可能有新变化）
-    clock += 1_001;
-    await resolver.resolveDetailed('v0missing');
+    expect(second).toEqual({ url: null, expired: false, pendingConfirm: true });
     expect(calls.length).toBe(4);
+
+    // ③ 窗口到点后复查（重新扫一棵新鲜的树）仍未见 → 确定性超期
+    clock += 30_000;
+    const third = await resolver.resolveDetailed('v0missing');
+    expect(third).toEqual({ url: null, expired: true, pendingConfirm: false });
+    const afterConfirm = calls.length;
+
+    // ④ 确定性结论进负缓存：TTL 内再问不发生请求
+    const fourth = await resolver.resolveDetailed('v0missing');
+    expect(fourth).toEqual({ url: null, expired: true, pendingConfirm: false });
+    expect(calls.length).toBe(afterConfirm);
+
+    // ⑤ TTL 过后允许再确认一次（树可能有新变化）→ 重新开始「首次未见」
+    clock += 1_001;
+    const fifth = await resolver.resolveDetailed('v0missing');
+    expect(fifth).toEqual({ url: null, expired: false, pendingConfirm: true });
+    expect(calls.length).toBe(afterConfirm + 2);
+  });
+
+  it('新视频稍后出现在树里：确认窗口后的复查直接解析成功（复现第十轮的误判场景）', async () => {
+    let clock = 0;
+    let headKey = 'v0old00000001';
+    const calls: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        return ok({ code: 0, data: { children: [{ id: `nid-${headKey}`, key: headKey }] } });
+      }
+      if (url.includes('/samantha/aispace/get_download_info')) return ok(DOWNLOAD_INFO_RESPONSE);
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 60_000,
+      indexTtlMs: 60_000,
+      expiredConfirmMs: 30_000,
+      now: () => clock,
+    });
+
+    // 站点刚生成完、创作树还没提交 → 首次未见：只是「待复查」，不判超期、不进负缓存
+    const miss = await resolver.resolveDetailed('v0new0000001');
+    expect(miss).toEqual({ url: null, expired: false, pendingConfirm: true });
+
+    // 33s 后（页面排的那次复查）：站点已把新视频提交进树 → 复查直接拿到原片
+    clock += 33_000;
+    headKey = 'v0new0000001';
+    const found = await resolver.resolveDetailed('v0new0000001');
+    expect(found.expired).toBe(false);
+    expect(found.url).toBe('https://v3-dy.douyinvod.com/full/original.mp4?lr=unwatermarked');
+
+    // 拿下原片后「未见」记录与负缓存都已作废 → 再问是命中缓存，不再发请求
+    const before = calls.length;
+    expect(await resolver.resolve('v0new0000001')).toBe(
+      'https://v3-dy.douyinvod.com/full/original.mp4?lr=unwatermarked',
+    );
+    expect(calls.length).toBe(before);
   });
 
   it('达翻页上限（has_more 恒为 true）→ 不下确定性结论，仍可重试', async () => {
@@ -167,8 +288,9 @@ describe('createVidResolver', () => {
 
     const resolver = createVidResolver({ fetchFn, indexTtlMs: 0, ttlMs: 0 });
     const outcome = await resolver.resolveDetailed('v0missing');
-    // 10 页上限（AISPACE_WALK_MAX_PAGES）+ 1 次 homepage；vid 未见但「未到底」→ expired=false
-    expect(outcome).toEqual({ url: null, expired: false });
+    // 10 页上限（AISPACE_WALK_MAX_PAGES）+ 1 次 homepage；vid 未见但「未到底」
+    // → expired=false 且 pendingConfirm=false（连「待复查」都不算：达上限是可重试的失败）
+    expect(outcome).toEqual({ url: null, expired: false, pendingConfirm: false });
   });
 
   it('vid 在第 2 页也能找到：cursor 翻页 + 请求体带游标', async () => {
@@ -205,7 +327,7 @@ describe('createVidResolver', () => {
     expect(bodies.some((body) => String(body).includes('"cursor":"cursor-2"'))).toBe(true);
   });
 
-  it('新鲜索引未见 → 先做 head 校验：树没变 = 确定性超期；树变了 = 重新扫描', async () => {
+  it('新鲜索引未见 → head 校验：树没变只记「待复查」，树变了立刻重扫（不等确认窗口）', async () => {
     let clock = 0;
     let headKey = 'v0head0000001';
     const calls: string[] = [];
@@ -214,27 +336,37 @@ describe('createVidResolver', () => {
       calls.push(url);
       if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
       if (url.includes('/samantha/aispace/node_info')) {
-        return ok({ code: 0, data: { children: [{ id: 'nid-head', key: headKey }] } });
+        return ok({ code: 0, data: { children: [{ id: `nid-${headKey}`, key: headKey }] } });
       }
+      if (url.includes('/samantha/aispace/get_download_info')) return ok(DOWNLOAD_INFO_RESPONSE);
       throw new Error('unexpected');
     }) as unknown as typeof fetch;
 
-    const resolver = createVidResolver({ fetchFn, ttlMs: 60_000, indexTtlMs: 60_000, now: () => clock });
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 60_000,
+      indexTtlMs: 60_000,
+      expiredConfirmMs: 30_000,
+      now: () => clock,
+    });
 
-    // 第 1 个 vid 建好索引（complete）；第 2 个 vid 未见 → head 没变 → 确定性超期
-    await resolver.resolveDetailed('v0head0000001');
+    // 第 1 个 vid 建好索引（complete = 已翻到底）
+    await resolver.resolve('v0head0000001');
     const before = calls.length;
+
+    // 第 2 个 vid 未见 → head 校验：树没变 → 只记「首次未见」，不判超期
     const miss = await resolver.resolveDetailed('v0other000000');
-    expect(miss.expired).toBe(true);
+    expect(miss).toEqual({ url: null, expired: false, pendingConfirm: true });
     expect(calls.length).toBe(before + 2); // homepage + head 校验，各一次
 
-    // 树变了（新创作插到最前面，head 变化）→ 重新全量扫描，且此时树里还是找不到 → 仍超期
-    clock += 1; // 不让负缓存/索引过期（TTL 60s）
-    headKey = 'v0newhead00001';
-    const after = calls.length;
-    const miss2 = await resolver.resolveDetailed('v0fresh0000001');
-    expect(miss2.expired).toBe(true);
-    expect(calls.length).toBe(after + 3); // homepage + head 校验（发现变化）+ 全量重扫
+    // 树变了（新创作插到最前面）→ 同一 vid 再问：**不等确认窗口**，立刻重新全量扫描并命中
+    clock += 1;
+    headKey = 'v0other000000';
+    const found = await resolver.resolveDetailed('v0other000000');
+    expect(found.expired).toBe(false);
+    expect(found.url).toBe('https://v3-dy.douyinvod.com/full/original.mp4?lr=unwatermarked');
+    // 至此仍未到 30s 的确认窗口 —— 说明走的是「head 变了 → 立刻重扫」这条分支
+    expect(clock).toBeLessThan(30_000);
   });
 
   it('请求 URL 带上契约里的固定 query', async () => {

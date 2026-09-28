@@ -21,7 +21,7 @@ import { RANK, toDrafts, classifyResponseConv, collectConversationIds, type Draf
 import { extractChainRaw } from '../core/extract/chain';
 import { extractSseRaw } from '../core/extract/sse';
 import { extractThreadRaw, describeTitleFields, findShareInfo, parseFnArgs, shareTitle, FN_ARGS_SELECTOR } from '../core/extract/thread';
-import { dedupeVariants, isUsableCover } from '../core/media-url';
+import { dedupeVariants, isUsableCover, mediaLookupKeys, mediaPathKey } from '../core/media-url';
 import { qualityFromDims } from '../core/quality';
 import {
   CHAIN_ENDPOINT,
@@ -64,6 +64,15 @@ declare global {
   /** vid → 最近一次解析的步骤事实（按 vid 收，避免并发解析互相覆盖） */
   const vidSteps = new Map<string, VidStepEvent[]>();
 
+  /**
+   * vid → 「原片已超期」二次确认的复查定时器（2026-09-28 第十轮）。
+   *
+   * 首次「创作树里未见」不下结论，只在这里排一次**有界的一次性复查**（窗口 + 余量）：
+   * 到点后重新解析该 vid，由 resolver 用一棵新鲜的树做二次确认。
+   * 每个 vid 至多一个在飞定时器；切换会话 / 页面卸载时统一清掉（守则 4：低频、可停止）。
+   */
+  const recheckTimers = new Map<string, number>();
+
   const vidResolver = createVidResolver({
     concurrency: 2,
     /*
@@ -94,7 +103,8 @@ declare global {
   /**
    * 跑一次 vid 解析，并把「哪一步失败、什么原因」收成一行诊断。
    * 命中缓存不会产生步骤事件，那行会如实写成「未产生步骤事件」而不是编一个原因。
-   * `expired=true` 是确定性结论：翻遍整棵创作树仍未见到该 vid（原片已超期），重试无意义。
+   * `expired=true` 是**走完二次确认窗口后**的确定性结论：翻遍整棵创作树仍未见到该 vid
+   * （原片已超期），重试无意义；`pendingConfirm=true` 是「首次未见、待复查」，不下结论。
    */
   async function resolveVidWithDiag(vid: string, force = false): Promise<VidResolveOutcome> {
     vidSteps.delete(vid);
@@ -109,7 +119,9 @@ declare global {
         ? `vid=${vid} → ok${suffix}（${steps.length} 步）`
         : outcome.expired
           ? `vid=${vid} → 原片已超期${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`
-          : `vid=${vid} → null${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`,
+          : outcome.pendingConfirm
+            ? `vid=${vid} → 待复查${suffix}（树里首次未见）：${failed ? formatVidStep(failed) : '未产生步骤事件'}`
+            : `vid=${vid} → null${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`,
       { level: outcome.url ? 'info' : 'warn' },
     );
     return outcome;
@@ -119,7 +131,15 @@ declare global {
   /* 页面类型判定                                                               */
   /* ------------------------------------------------------------------------- */
 
-  function detectKind(pathname: string = location.pathname): PageKind {
+  function detectKind(pathname: string = location.pathname, id: string = detectConvId()): PageKind {
+    /*
+     * ⚠️ 没有会话 ID 就不算会话页（2026-09-28 第十轮修正）。
+     *
+     * 豆包首页是 `/chat/`（带尾斜杠）——它会命中 `CHAT_PATH_PATTERN`，于是以前被判成
+     * `kind=chat` + **空 convId**：弹窗的 `kind === 'none'` 闸门与页面徽标双双失效。
+     * 现在改成与 `isLeaveScope` 同一条口径：先要求 convId（`local_*` 占位 ID 也算会话）。
+     */
+    if (!id) return 'none';
     if (CHAT_PATH_PATTERN.test(pathname)) return 'chat';
     if (THREAD_PATH_PATTERN.test(pathname)) return 'thread';
     return 'none';
@@ -251,14 +271,170 @@ declare global {
   /* 产出草稿                                                                   */
   /* ------------------------------------------------------------------------- */
 
+  /**
+   * 在页面里按「路径键」找这条资源对应的 DOM 媒体元素（**只读**）。
+   *
+   * 匹配依据（`docs/03` §17.10.1）：DOM 的媒体路径与报文候选地址**同源同路径**，只差结尾
+   * 规格后缀与签名段 → 用 `mediaPathKey()` 取出的 `<hash>` 作匹配键。
+   * ⚠️ 豆包消息列表是**懒渲染**的：没滚到的旧消息不在 DOM 里，找不到属正常（如实返回 null）。
+   */
+  function findMediaInPage(keys: Iterable<string>): HTMLElement | null {
+    const wanted = new Set(keys);
+    if (!wanted.size) return null;
+    const nodes = document.querySelectorAll<HTMLElement>('img, video');
+    for (const el of Array.from(nodes)) {
+      const src =
+        (el as HTMLImageElement).currentSrc || el.getAttribute('src') || el.getAttribute('poster') || '';
+      const key = mediaPathKey(src);
+      if (key && wanted.has(key)) return el;
+    }
+    return null;
+  }
+
+  /**
+   * 取该元素所在媒体块里**站点自己的封面图**（实测 `img.cover-…`）。
+   * 视频块里 `<video>` 与封面是**两个不同 hash 的资源**，所以只能靠「同一块」来找，不能靠键匹配。
+   */
+  function coverInSameBlock(el: HTMLElement): string | null {
+    const block =
+      el.closest('[class*="image-box-grid-item"], [class*="block-video"], [class*="video-hover-button-group"]') ??
+      el.parentElement;
+    const cover = block?.querySelector<HTMLImageElement>('img[class*="cover"]');
+    const src = cover?.src || el.getAttribute('poster') || '';
+    if (src) return src;
+    return el.tagName === 'IMG' ? ((el as HTMLImageElement).currentSrc || el.getAttribute('src')) : null;
+  }
+
+  /**
+   * 一次「像人一样」的点击（2026-09-28 第十轮）。
+   *
+   * ⚠️ 站点可能校验事件可信度（`isTrusted`）—— 那合成事件一律无效，这里只是**尽力**：
+   * 成了就直接弹出豆包自己的预览，不成就让用户手点一下（目标已被滚到视口中央）。
+   * 只 `dispatchEvent`，不覆盖站点处理器（守则 2）。
+   */
+  function humanClick(el: HTMLElement): void {
+    const rect = el.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const common = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: 0 };
+    const fire = (type: string, extra: Record<string, unknown> = {}, Ctor: typeof MouseEvent = MouseEvent) => {
+      try {
+        el.dispatchEvent(new Ctor(type, { ...common, ...extra }));
+      } catch {
+        /* 某些构造器不接受某些字段，忽略 */
+      }
+    };
+    const pointer = { pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    fire('pointerover', { ...pointer, buttons: 0 }, PointerEvent as unknown as typeof MouseEvent);
+    fire('mouseover');
+    fire('pointerenter', { ...pointer, buttons: 0 }, PointerEvent as unknown as typeof MouseEvent);
+    fire('mouseenter');
+    fire('mousemove');
+    fire('pointerdown', { ...pointer, buttons: 1 }, PointerEvent as unknown as typeof MouseEvent);
+    fire('mousedown');
+    try {
+      el.focus?.();
+    } catch {
+      /* 不可聚焦时忽略 */
+    }
+    fire('pointerup', { ...pointer, buttons: 0 }, PointerEvent as unknown as typeof MouseEvent);
+    fire('mouseup');
+    fire('click');
+  }
+
+  /**
+   * 在页面里**定位这条资源**并尽力唤起豆包自己的预览（守则 2/3：只读 DOM + 派发事件，
+   * 不注入任何元素/样式，也不覆盖站点处理器）。
+   * 返回值 = 是否在 DOM 里找到了它（找不到多半是「消息还没滚到、未渲染」）。
+   */
+  function locateAndPreview(keys: string[]): boolean {
+    const el = findMediaInPage(keys);
+    if (!el) return false;
+    try {
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    } catch {
+      /* 老浏览器忽略 */
+    }
+    humanClick(el);
+    return true;
+  }
+
+  /**
+   * 在页面里按「路径键」找回这条资源、取它的封面图（**只读**，2026-09-28 第十轮）。
+   *
+   * 为什么需要：卡片封面的两个站点来源是「链式报文的 `video_thumb`」与「创作树的 `node_cover`」。
+   * 对**原片已超期**的旧作品，vid 早已不在创作树里，报文那条也没给 → 卡片只剩灰底；
+   * 但页面里其实还挂着站点自己渲染的**带水印封面**（实测 `img.cover-u1rIsU…`）。
+   * ⚠️ 只**读** URL 交给弹窗自己加载：不注入元素、不改样式、不点击。
+   * ⚠️ 边界：只覆盖**当前已渲染**的媒体（懒渲染，滚不到的旧消息不在 DOM 里）。
+   */
+  function domCoverFor(draft: MediaDraft): string | null {
+    const keys = mediaLookupKeys(draft.variants.map((variant) => variant.url));
+    if (!keys.length) return null;
+    const el = findMediaInPage(keys);
+    return el ? coverInSameBlock(el) : null;
+  }
+
+  /** 给「站点两个来源都没给封面」的草稿补一次 DOM 回读 */
+  function fillCoversFromDom(drafts: MediaDraft[]): { filled: MediaDraft[]; missing: MediaDraft[] } {
+    const filled: MediaDraft[] = [];
+    const missing: MediaDraft[] = [];
+    for (const draft of drafts) {
+      if (draft.cover) continue;
+      const cover = domCoverFor(draft);
+      if (cover) {
+        draft.cover = cover;
+        filled.push(draft);
+      } else {
+        missing.push(draft);
+      }
+    }
+    return { filled, missing };
+  }
+
+  /**
+   * 封面回读的**有界重试**：chain 响应常常早于页面把媒体渲染出来（差几百毫秒），
+   * 首次回读可能扑空。按 0.4s / 1.2s / 3s 各再试一次（有界、可停止，守则 4），
+   * 命中就补发一条带 cover 的同指纹草稿 —— `upsertDrafts` 的 `existing.cover || draft.cover`
+   * 会把空封面填上，state 取优先级高者、不会回退。
+   */
+  function scheduleCoverRetry(drafts: MediaDraft[]): void {
+    let pending = drafts;
+    for (const delay of [400, 1200, 3000]) {
+      window.setTimeout(() => {
+        if (!pending.length || pageKind === 'none') return;
+        const current = pending.filter((draft) => draft.convId === (convId || 'unknown'));
+        if (!current.length) return;
+        const { filled, missing } = fillCoversFromDom(current);
+        pending = missing;
+        if (!filled.length) return;
+        diag('page.cover', `页面回读补齐 ${filled.length} 条封面（仍缺 ${missing.length}）`);
+        postToWindow(envelope('page', MSG.MediaCaptured, filled));
+      }, delay);
+    }
+  }
+
   function emitDrafts(drafts: MediaDraft[]): void {
     if (!drafts.length || pageKind === 'none') return;
     const filtered = config.skipThumbOnly ? drafts.filter((draft) => draft.state !== 'thumb') : drafts;
+
+    /*
+     * 封面补齐：站点来源（链式报文的 `video_thumb`、创作树的 `node_cover`）都没有封面时，
+     * 在**页面里按路径键回读**一次（典型场景 = 「原片已超期」的旧作品：vid 早已不在创作树里，
+     * 但页面里仍挂着站点自己的带水印封面）。
+     */
+    const { missing } = fillCoversFromDom(filtered);
+    if (missing.length) scheduleCoverRetry(missing);
+
+    /*
+     * `cover=` 是 2026-09-28 加的诊断：卡片缩略图显示不出来时，一眼就能区分
+     * 「站点没给缩略图、页面里也回读不到」与「有 URL 但加载 403（签名/防盗链）」。
+     */
     diag(
       'draft.emit',
-      `in=${drafts.length} out=${filtered.length} skipThumbOnly=${config.skipThumbOnly} kinds=${filtered
-        .map((draft) => `${draft.kind}:${draft.state}`)
-        .join(',')}`,
+      `in=${drafts.length} out=${filtered.length} skipThumbOnly=${config.skipThumbOnly} cover=${
+        filtered.filter((draft) => draft.cover).length
+      }/${filtered.length} kinds=${filtered.map((draft) => `${draft.kind}:${draft.state}`).join(',')}`,
       { level: filtered.length ? 'info' : 'warn' },
     );
     if (!filtered.length) return;
@@ -270,22 +446,53 @@ declare global {
     }
   }
 
+  /**
+   * 排一次「原片已超期」二次确认的复查（一次性、低频、可停止，守则 4）。
+   *
+   * 成因见 `LIMITS.VID_EXPIRED_CONFIRM_MS`：站点创作树对**刚生成的视频有提交延迟**
+   * （实测：生成完成消息到达后 0.5s 查树未见，50s 后同一个查询即可见）——
+   * 「首次未见」不足以判定超期。到点后重新解析该 vid，由 resolver 用**一棵新鲜的树**做二次确认：
+   * 找到 → 正常入库（raw）；仍未见 → 才落「原片已超期」。
+   *
+   * 余量 3s：避开「定时器比确认窗口早几毫秒触发」这种边界。
+   */
+  function scheduleExpiredRecheck(vid: string, draft: MediaDraft): void {
+    if (recheckTimers.has(vid)) return;
+    const delay = LIMITS.VID_EXPIRED_CONFIRM_MS + 3000;
+    diag('vid.recheck', `vid=${vid} → ${Math.round(delay / 1000)}s 后复查（首次未见，暂不定论）`);
+    const timer = window.setTimeout(() => {
+      recheckTimers.delete(vid);
+      // 用户已经切走 → 这次复查没有意义（切回时会重新走 chain 解析）
+      if (draft.convId !== (convId || 'unknown')) return;
+      void enrichWithResolvedVid(draft);
+    }, delay);
+    recheckTimers.set(vid, timer);
+  }
+
+  function cancelRechecks(): void {
+    recheckTimers.forEach((timer) => clearTimeout(timer));
+    recheckTimers.clear();
+  }
+
   /** 用 vid 三步 API 的结果补一条高清原片变体，再次上报（同指纹 → 走 upsert 合并） */
   async function enrichWithResolvedVid(draft: MediaDraft): Promise<void> {
     const vid = draft.vid;
     if (!vid) return;
-    const { url, expired } = await resolveVidWithDiag(vid);
+    const { url, expired, pendingConfirm } = await resolveVidWithDiag(vid);
     if (!url) {
       /*
-       * 确定性失败（2026-09-27 Finding C 修复）：翻遍整棵「我的创作」树仍未见到该 vid ——
-       * 站点对创作记录有保存期限，原片永远取不到了。通知 bg 把条目落成「原片已超期」，
-       * 取代过去「永远解析中」的挂死状态（网络失败不走这里，仍是可重试的 pending）。
+       * 确定性失败（2026-09-27 Finding C）：翻遍整棵「我的创作」树**且走完二次确认窗口**
+       * 仍未见到该 vid —— 站点对创作记录有保存期限，原片永远取不到了。通知 bg 把条目落成
+       * 「原片已超期」，取代过去「永远解析中」的挂死状态（网络失败不走这里，仍是可重试的 pending）。
        */
       if (expired && draft.convId === (convId || 'unknown')) {
         postToWindow(
           envelope('page', MSG.LibraryExpire, { convId: draft.convId, fingerprint: draft.fingerprint, vid }),
         );
+        return;
       }
+      // 树里首次未见（2026-09-28 第十轮）：给站点创作树的提交延迟留余地，排一次复查再定论
+      if (pendingConfirm) scheduleExpiredRecheck(vid, draft);
       return;
     }
     // 解析是异步的：回来时用户可能已经切走 —— 异会话的增强结果一律丢弃
@@ -310,9 +517,29 @@ declare global {
       if (quality) meta.label = quality;
     }
     if (resolvedMeta?.size !== undefined) meta.size = resolvedMeta.size;
+    /*
+     * 作品生成时间（2026-09-28 第十轮）：**消息时间优先，创作树时间兜底**。
+     *
+     * 草稿若已带上消息的 `create_time`（图片 / 视频都有，且与网页显示一致），就以它为准；
+     * 只有当草稿没有时，才用 vid 三步 API 顺带取回的创作树节点 `create_time` 补上
+     * （树只保留约三个月，旧作品与图片都不在树里 —— 所以它只是兜底）。
+     * 站点不给就都不写：界面上该条目显示不出时间，排序时排在末尾，而不是编一个。
+     */
+    if (meta.createdAt === undefined && resolvedMeta?.createdAt !== undefined) {
+      meta.createdAt = resolvedMeta.createdAt;
+    }
+    /*
+     * 封面兜底（2026-09-28 第十轮）：链式报文里的 `video_thumb` 缺失或签名过期时，
+     * 用 vid 三步 API 顺带带回的**创作树封面图**（`node_cover`）顶上 ——
+     * 卡片缩略图就用站点自己的带水印封面（省流量、与站点显示一致，不抓原片帧）。
+     * `upsertDrafts` 的合并是 `existing.cover || draft.cover`，所以后到的兜底值能补上空封面。
+     */
+    const treeCover = vidResolver.coverOf(vid);
+    const cover = draft.cover || treeCover || null;
     const enriched: MediaDraft = {
       ...draft,
       meta,
+      cover,
       state: 'raw',
       variants: dedupeVariants([
         { url, label: '无水印原片（高清）', rank: RANK.resolved, isRaw: true },
@@ -778,8 +1005,8 @@ declare global {
   }
 
   function syncContext(): void {
-    const kind = detectKind();
     const id = detectConvId();
+    const kind = detectKind(location.pathname, id);
     const changed = kind !== pageKind || id !== convId;
 
     if (changed) {
@@ -804,6 +1031,8 @@ declare global {
       vidResolver.clear();
       // ② 清掉 DOM 扫描标记，让当前页面里的视频重新参与采集
       resetVideoScanMarks();
+      // ③ 「原片已超期」二次确认的复查定时器一并作废（它们的目标 vid 属于上一个会话）
+      cancelRechecks();
     }
 
     if (pageKind !== 'none') refreshTitle();
@@ -873,6 +1102,20 @@ declare global {
       void resolveVidWithDiag(vid, true).then((outcome) => {
         postToWindow(envelope('page', MSG.VidResolved, { reqId, vid, url: outcome.url }));
       });
+    }
+
+    // 资源库点了「预览」→ 在页面里定位这条资源、尽力唤起豆包自己的预览（2026-09-28 第十轮）
+    if (env.type === MSG.PreviewLocate) {
+      const payload = env.payload as { reqId?: string; keys?: string[] } | undefined;
+      const reqId = payload?.reqId ?? '';
+      const keys = Array.isArray(payload?.keys) ? payload.keys : [];
+      const found = locateAndPreview(keys);
+      diag(
+        'page.preview',
+        `定位请求 keys=${keys.length} → ${found ? '已滚动并派发点击' : '页面里没找到（可能未渲染）'}`,
+        { level: found ? 'info' : 'warn' },
+      );
+      postToWindow(envelope('page', MSG.PreviewLocated, { reqId, found }));
     }
   });
 

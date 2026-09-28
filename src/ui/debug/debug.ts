@@ -63,8 +63,10 @@ function stepsCard(): string {
             <li><code>net.fetch</code> / <code>net.xhr</code> → <b>有没有截到 <code>/chat/completion</code></b></li>
             <li><code>parse.sse</code> → 解析出了几条（<code>raws=0</code> 就是字段路径变了）</li>
             <li><code>dom.vidscan</code> → 页面里已有视频的反推结果</li>
-            <li><code>vid.step</code> / <code>vid.resolve</code> → 无水印原片三步 API：<code>vid.step</code> 会写清
-              <b>哪一步失败、HTTP 状态、耗时与原因</b>（卡片长期停在「解析中」时看这两行）</li>
+            <li><code>vid.step</code> / <code>vid.resolve</code> / <code>vid.recheck</code> → 无水印原片三步 API：
+              <code>vid.step</code> 会写清<b>哪一步失败、HTTP 状态、耗时与原因</b>（卡片长期停在
+              「解析中」时看这三行）；<code>vid.recheck</code> 是「树里首次未见、暂不定论」后
+              排的那次复查（约 33s 后），复查仍未见才会出现「原片已超期」</li>
             <li><code>bg.upsert</code> → 入库结果（<code>skipped</code> 多说明被「过滤纯缩略图」挡了）</li>
           </ul>
         </li>

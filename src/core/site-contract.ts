@@ -107,8 +107,110 @@ export const AISPACE_HAS_MORE_KEY = 'has_more';
  * （2026-09-27 实测：6 月 23 日生成的视频原片仍可解析、5 月的 vid 已被清除 → 窗口约三个月，
  * 以「最早可解析日」为准），该 vid 的原片**永远**取不到
  * —— 这不是网络失败，重试没有意义（「原片已超期」状态的依据）。
+ * ⚠️ 2026-09-28 补正：**一个观测不足以定论** —— 站点创作树对刚生成的视频有提交延迟
+ * （实测：生成完成消息到达后 0.5s 查树「翻到底未见」，50s 后同一个查询即可见）。
+ * 现行做法是 30s 二次确认窗口（`LIMITS.VID_EXPIRED_CONFIRM_MS`，见 `vid-resolver.ts`）。
  */
 export const AISPACE_WALK_MAX_PAGES = 10;
+
+/* ---------------------------------------------------------------------------
+ * node_info 的**节点字段**（2026-09-28 只读探针实测，种子样本 149 条）
+ *
+ * 实测一个节点的完整字段：
+ *   id / name / key / node_type / size / source / content / name_review_status /
+ *   content_review_status / risk_review_status / **conversation_id** / operation_status /
+ *   node_cover / parent_id / **create_time** / **update_time**
+ *
+ * 有用的几个：
+ *   · `key`      —— 视频是 **vid**、图片是无水印原片路径（去查询参数后的路径）；
+ *   · `create_time` / `update_time` —— **秒级 Unix 时间戳**，就是「作品真实生成时间」
+ *     （资源库「最新/最早」的排序依据，2026-09-28 第十轮补做）；
+ *   · `conversation_id` —— 该创作所属会话（可用于归属校验，目前未用）；
+ *   · `node_type` —— 4 = 图片、6 = 视频（实测值）；
+ *   · `content.duration` —— 视频时长（秒，如 15.05）；
+ *   · `node_cover.list_view.image_width / image_height` —— 封面尺寸（⚠️ 视频节点上是
+ *     整帧尺寸 720×1280，但**图片节点上是缩略图尺寸**（实测 28×28 / 116×116），
+ *     因此**不能**拿它给图片补真实宽高）。
+ *
+ * ⚠️ 请求体里的 `sort_param: {sort_type: 0, sort_order: 1}` 是照搬上游的固定值；
+ * 实测响应**不回** `sort_config`（为 `null`），也未见别的排序类型 —— 站点侧不可配。
+ * ⚠️ 到底时 `next_cursor` 返回 `-1`（不是缺省）；`has_more=false` 已足以判定到底。
+ * ------------------------------------------------------------------------- */
+export const AISPACE_NODE_CREATE_TIME_KEY = 'create_time';
+export const AISPACE_NODE_UPDATE_TIME_KEY = 'update_time';
+export const AISPACE_NODE_CONVERSATION_KEY = 'conversation_id';
+export const AISPACE_NODE_TYPE_KEY = 'node_type';
+/**
+ * 创作树节点的**文件体积**（字节）。
+ *
+ * [实测 2026-09-28] 与用户实际下载到的原片**字节数完全一致**（样例：节点 `size = 8698069`
+ * ↔ 落盘的 `doubao-*.mp4` 恰好 8 698 069 字节）。⚠️ 与 §12 的结论不冲突：
+ * 报文里 **creation 的 video 对象**没有 size 字段、`download_infos` 实测也基本不给 ——
+ * 所以视频的体积过去一直显示不出来，**这个节点字段是目前唯一可用的来源**。
+ * 只在 vid 能解析（树里还有该作品）时才有；「原片已超期」的条目取不到（也不影响：它本来下不了）。
+ */
+export const AISPACE_NODE_SIZE_KEY = 'size';
+/**
+ * 创作树节点的**封面图路径**（卡片缩略图的兜底来源）。
+ *
+ * [实测 2026-09-28] `node_cover.list_view.cover_url`（带签名，`~tplv-noop.image`）。
+ * 视频节点上它是**整帧封面**（720×1280 与真实原片一致），正好当卡片缩略图。
+ * ⚠️ 带时效签名：链式报文的 `video_thumb` 若缺/过期，用它能兜住；
+ * 签名过期就只能回退占位（F5 重解析会换一份新的）。
+ */
+export const AISPACE_NODE_COVER_PATH = ['node_cover', 'list_view', 'cover_url'] as const;
+/** 实测 node_type：4 = 图片、6 = 视频 */
+export const AISPACE_NODE_TYPE_IMAGE = 4;
+export const AISPACE_NODE_TYPE_VIDEO = 6;
+
+/**
+ * **图片体积的取数口径**（2026-09-28 实机结论，`docs/03` §18）—— 这里只留痕，没有对应常量。
+ *
+ * 图片的「文件大小」**只由 background 实测** `primary` 的真实字节数得到
+ * （`Range: bytes=0-0` → `Content-Range`；见 `core/download.ts::parseTotalBytes`、
+ * `bg/service-worker.ts::backfillSizes`）。两条**被否决**的来源记在这里，避免日后走回头路：
+ *
+ * ① ⛔ **报文里 image 子对象的 `size`**：宽高取自 `image_ori_raw`，而 `size` 可能来自
+ *    **另一个子对象**（如 `image_preview`）——两者不是同一个文件。实机反例：卡片显示 378 KB，
+ *    而 `image_ori_raw.url` 下回来的是 **3.81 MB 的 PNG**（3 996 293 字节）。
+ * ② ⛔ **创作树图片节点的 `size`**：节点 key 形如 `tos-cn-i-a9rns2rl98/rc_gen_image/<32位hash>.jpeg`
+ *    （2026-09-28 探针实测，原片 URL 的 hash 能命中），但**没有任何实测证据**表明
+ *    它与「`…<hash>.jpeg~tplv-…-image_raw.png` 那个可下载文件」是同一个字节数
+ *    （视频节点验证过、图片没有）；而且为图片触发一次整树翻页比实测 1 字节更重。
+ *
+ * 📌 与之相对：**视频**的节点 `size` 是**已验证**的（实测与落盘原片字节数完全一致，§17.9），
+ * 所以视频仍用「创作树 `size` 优先」。
+ */
+
+/**
+ * 「按需实测文件字节数」的 Range 取值（2026-09-28 探针实测）。
+ *
+ * 用途：创作树里没有的条目（超期视频 / 超过约三个月的旧图片）拿不到节点 `size`，
+ * 由 **background** 对该条目 `primary` 发一次 `Range: bytes=0-0` 的 GET，
+ * 从响应头读总字节数 —— 量到的就是「点下载真正会拿到的那个文件」的体积。
+ * 实测：服务器**支持** Range（回 206，`content-length: 1`，只下 1 字节）。
+ * ⚠️ 只允许在**扩展上下文**（bg）里发：页面里发会被 CORS 挡住响应头
+ * （`Content-Range` 不在安全列表里，实测 `content-range=null`）。
+ */
+export const SIZE_PROBE_RANGE = 'bytes=0-0';
+
+/**
+ * **聊天报文里的消息生成时间**（2026-09-28 只读探针实测，v2 覆盖 XHR 通道）。
+ *
+ * 实测路径：
+ *   `data.downlink_body.pull_singe_chain_downlink_body.messages[i].create_time`
+ *   （注意站点字段名拼写就是 `pull_singe_chain`，不是 `single`；**秒级** Unix）
+ *
+ * 时间点与网页上每条生成结果下面显示的时间**完全一致**（实例：`1779538923` = 2026-05-23 20:22:03
+ * ↔ 页面显示「5月23日 20:22」）。
+ *
+ * 为什么**优先用它**而不是创作树节点的 `create_time`：
+ *   · 创作树只保留约三个月的作品（`AISPACE_WALK_MAX_PAGES` 注释），5 月的旧作品早已不在树里；
+ *   · 图片**从不查询创作树**（图片走 `image_ori_raw` 那条链路），树里有没有都取不到；
+ *   · 消息自带的这个时间随聊天历史长期存在，**图片、视频、已过期的旧视频通吃**。
+ * 因此：消息时间优先，创作树时间退为兜底（`page/hook.ts::enrichWithResolvedVid`）。
+ */
+export const MESSAGE_CREATE_TIME_KEY = 'create_time';
 
 /** 三步接口的固定请求体形状 [上游 / 实测修正 2026-09-27]
  *
@@ -144,21 +246,46 @@ export const PATH_CREATIONS = ['creations'] as const;
 
 /** 图片：thumb → ori_raw [上游] */
 export const IMG_THUMB_PATH = ['image', 'image_thumb', 'url'] as const;
-export const IMG_PREVIEW_PATH = ['image', 'image_preview', 'url'] as const;
+/**
+ * 图片**预览图**的字段路径（候选；2026-09-28 临时探针实测）。
+ * 实测 image 对象的字段：`image_ori / image_thumb / key / request_id / preview_img / private_img`
+ * —— 预览在 **`preview_img`**，旧版读的 `image_preview` 不存在。
+ */
+export const IMG_PREVIEW_PATHS: ReadonlyArray<ReadonlyArray<string>> = [
+  ['image', 'preview_img', 'url'],
+  ['image', 'image_preview', 'url'],
+];
 export const IMG_RAW_PATH = ['image', 'image_ori_raw', 'url'] as const;
 
 /**
  * 图片宽高所在的**子对象**回退链（2026-09-27 实测探针，`docs/03` §12）。
  *
- * 实测成品 image 的结构：`image` 顶层**没有** width / height / size，
+ * 实测成品 image 的结构：`image` 顶层**没有** width / height，
  * 宽高在 `image_ori_raw / image_ori / image_preview / image_thumb` 各子对象里
- * （`{url, width, height, url_formats}`，全部一致，如 2720×1520）。
- * 按「质量最高优先」排列；`size` 字段整个对象树里都不存在（站点不给）。
+ * （`{url, width, height, url_formats}`，全部一致，如 2720×1520），按「质量最高优先」排列。
+ *
+ * ⚠️ 这些子对象里**可能出现 `size`**（2026-09-28 实机遇到），但它**不可信** ——
+ * 它与 `image_ori_raw.url` 那个可下载文件不是同一个字节数（实机反例：字段 378 KB ↔
+ * 实际下载 3.81 MB 的 PNG）。因此本项目**只从这里取 width / height，绝不取 size**：
+ * 图片体积一律由 background 实测 `primary`（见上方「图片体积的取数口径」）。
  */
 export const IMG_DIMS_SUBOBJECTS = ['image_ori_raw', 'image_ori', 'image_preview', 'image_thumb'] as const;
 
 /** 视频：thumb → ori_raw、vid、download_url、video_model [上游] */
-export const VID_THUMB_PATH = ['video', 'video_thumb', 'url'] as const;
+/**
+ * 视频**封面图**的字段路径（候选，按可信度排序；2026-09-28 临时探针实测）。
+ *
+ * 实测报文里 video 对象的字段：`vid / cover / status / width / height / duration /
+ * video_type / download_url / video_model / download_filehash` —— **封面在 `cover` 里**：
+ *   `video.cover.{image_thumb | image_preview}.url`
+ * ⚠️ 上游与本项目旧版读的 `video.video_thumb.url` **在当前站点不存在**（实测 `cover=0/5`，
+ * 封面长期为空的根因之一）；`video_thumb` 已从候选里移除，不要凭印象加回来。
+ * 顺序：`image_thumb`（小图，卡片够用、加载快）→ `image_preview`（更大，兜底）。
+ */
+export const VID_COVER_PATHS: ReadonlyArray<ReadonlyArray<string>> = [
+  ['video', 'cover', 'image_thumb', 'url'],
+  ['video', 'cover', 'image_preview', 'url'],
+];
 export const VID_RAW_PATH = ['video', 'video_ori_raw', 'url'] as const;
 export const VID_ID_PATH = ['video', 'vid'] as const;
 export const VID_DOWNLOAD_PATH = ['video', 'download_url'] as const;
@@ -214,7 +341,19 @@ export const CHAIN_UNWATERMARK_TAG = 'unwatermarked';
  */
 export const CHAIN_REQUIRE_UNWATERMARK_TAG = false;
 
-/** thread 分享页：内联脚本选择器与数据路径 [上游] */
+/**
+ * thread 分享页：内联脚本选择器 [上游]。
+ *
+ * ⚠️ **[实测 2026-09-28 只读探针]** 当前站点的分享页（`/thread/xxx`）**页面上没有
+ * `script[data-fn-args]`** —— 分享页的数据实际由页面自身的 chain / SSE 请求带回
+ * （我们 hook 照常解析：非本人账号也能拿到带水印候选与 `vid`），分享标题退回 `document.title`。
+ * 也就意味着：**分享页拿不拿得到原片，取决于 `vid` 在不在当前账号的「我的创作」树里**
+ * （原片只对作品所属账号开放），与这个选择器无关。
+ *
+ * 这条选择器**保留**，作为旧版 / 服务端渲染分享页的兜底：命中就照旧解析
+ * （诊断 `parse.thread` 的 `scripts=N raws=M` 能看出是否命中），未命中无副作用。
+ * ⛔ 别因为「探针没看到」就删掉整条 thread 抽取链（`core/extract/thread.ts`）。
+ */
 export const FN_ARGS_SELECTOR = 'script[data-fn-args]';
 export const SHARE_INFO_KEY = 'shareInfo';
 /** 结构① ["thread_x/page","shareInfo",{...}] */
@@ -358,6 +497,25 @@ export const HOST_IMAGE_CDN_SUFFIXES = [
   'p9-ibyteimg.com',
   'ibytedtos.com',
   'doubao.com',
+  /** [实测 2026-09-28] 创作树 `node_cover` 与视频封面的域名（`p26-sign.douyinpic.com`） */
+  'douyinpic.com',
+] as const;
+
+/**
+ * 封面 / 缩略图 CDN 的 Referer 注入（2026-09-28 第十轮）。
+ *
+ * 卡片缩略图用的是**站点自己的带水印封面图**（省流量、与站点显示一致，不抓原片帧）。
+ * 但这些图片域要求站内 Referer，而弹窗发出的请求 Referer 是扩展页（`chrome-extension://…`）
+ * → 403 → 卡片只剩灰底占位。这里按域名后缀给它们补上同一个 Referer（资源类型含 `image`）。
+ *
+ * ⚠️ 与 `CORS_INJECT_HOST_FILTERS`（媒体域）分开维护：封面不需要 CORS 响应头，只需要 Referer。
+ * ⚠️ 封面 URL 是**带时效签名**的：过期后仍会 403（回退占位），F5 重解析会换一份新的。
+ * ℹ️ 故意不含 `doubao.com`（站点自身域的请求本来就是站内 Referer，无需改写）。
+ */
+export const COVER_INJECT_HOST_FILTERS = [
+  '||douyinpic.com/',
+  '||byteimg.com/',
+  '||ibytedtos.com/',
 ] as const;
 
 /**

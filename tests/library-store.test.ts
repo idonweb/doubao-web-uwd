@@ -157,32 +157,84 @@ describe('99 条上限 FIFO', () => {
 });
 
 describe('失败标记', () => {
-  it('markFailed 把状态改为 fail', () => {
+  it('markFailed 把状态改为 fail，且不刷新 lastSeen（失败不是「资源出现」）', () => {
     const library = upsertDrafts({}, [draft()], { now: 1 }).library;
-    const next = markFailed(library, itemId(CONV, 'vid:v0abc'), 9_999);
+    const next = markFailed(library, itemId(CONV, 'vid:v0abc'));
     expect(next[itemId(CONV, 'vid:v0abc')].state).toBe('fail');
-    expect(next[itemId(CONV, 'vid:v0abc')].lastSeen).toBe(9_999);
+    expect(next[itemId(CONV, 'vid:v0abc')].lastSeen).toBe(1);
   });
 });
 
-describe('原片已超期（2026-09-27 Finding C：站点创作树有保存期限）', () => {
-  it('markExpired：state → fail + meta.expired，不存在的条目原样返回', () => {
+describe('原片已超期（2026-09-27 Finding C；2026-09-28 第十轮：改为可撤销）', () => {
+  it('markExpired：state → fail + meta.expired，不存在的条目原样返回（且不刷新 lastSeen）', () => {
     const library = upsertDrafts({}, [draft({ state: 'pending' })], { now: 1 }).library;
-    const next = markExpired(library, CONV, 'vid:v0abc', 5_000);
+    const next = markExpired(library, CONV, 'vid:v0abc');
     const item = next[itemId(CONV, 'vid:v0abc')];
     expect(item.state).toBe('fail');
     expect(item.meta.expired).toBe(true);
-    expect(item.lastSeen).toBe(5_000);
-    expect(markExpired(library, CONV, 'vid:不存在', 5_000)).toBe(library);
+    expect(item.lastSeen).toBe(1);
+    expect(markExpired(library, CONV, 'vid:不存在')).toBe(library);
   });
 
   it('超期条目不被后续 pending 草稿升回「解析中」（chain 重放每轮都会带来同一 vid）', () => {
     const library = upsertDrafts({}, [draft({ state: 'pending' })], { now: 1 }).library;
-    const expired = markExpired(library, CONV, 'vid:v0abc', 2);
+    const expired = markExpired(library, CONV, 'vid:v0abc');
     const again = upsertDrafts(expired, [draft({ state: 'pending' })], { now: 3 });
     const item = again.library[itemId(CONV, 'vid:v0abc')];
     expect(item.state).toBe('fail');
     expect(item.meta.expired).toBe(true);
+  });
+
+  it('拿到原片（raw）的草稿可以给超期条目翻案：清掉 meta.expired 并升回 raw', () => {
+    const id = itemId(CONV, 'vid:v0abc');
+    const library = upsertDrafts({}, [draft({ state: 'pending' })], { now: 1 }).library;
+    const expired = markExpired(library, CONV, 'vid:v0abc');
+
+    const revived = upsertDrafts(expired, [draft({ state: 'raw' })], { now: 3 });
+    expect(revived.library[id].state).toBe('raw');
+    expect(revived.library[id].meta.expired).toBeUndefined();
+  });
+
+  it('markExpired 不覆盖已经拿到原片的条目（迟到的失败通知不得压过正证据）', () => {
+    const library = upsertDrafts({}, [draft({ state: 'raw' })], { now: 1 }).library;
+    expect(markExpired(library, CONV, 'vid:v0abc')).toBe(library);
+  });
+});
+
+describe('排序：用站点真实生成时间 meta.createdAt（2026-09-28 第十轮）', () => {
+  const T = (iso: string) => new Date(iso).getTime();
+
+  /** 三条视频：新（9-27 22:54） / 旧（6-24） / 未知（已超期，树里没有 → 无 createdAt） */
+  function build(): Library {
+    return upsertDrafts(
+      {},
+      [
+        draft({ fingerprint: 'vid:old', meta: { ext: 'mp4', createdAt: T('2026-06-24T12:00:00+08:00') } }),
+        draft({ fingerprint: 'vid:new', meta: { ext: 'mp4', createdAt: T('2026-09-27T22:54:00+08:00') } }),
+        draft({ fingerprint: 'vid:none', meta: { ext: 'mp4' } }),
+      ],
+      { now: T('2026-09-28T08:10:00+08:00') },
+    ).library;
+  }
+
+  const ids = (sort: 'newest' | 'oldest') =>
+    queryLibrary(build(), { filter: 'all', query: '', sort, groupBy: 'conv' }).groups[0].items.map((i) => i.fingerprint);
+
+  it('最新：真实生成时间倒序；拿不到时间的排末尾（不编造）', () => {
+    expect(ids('newest')).toEqual(['vid:new', 'vid:old', 'vid:none']);
+  });
+
+  it('最早：真实生成时间正序（拿不到的同样排末尾，不会冒充「最旧」）', () => {
+    expect(ids('oldest')).toEqual(['vid:old', 'vid:new', 'vid:none']);
+  });
+
+  it('「判定超期 / 下载失败」不再把老条目顶到最前（lastSeen 不再参与主排序）', () => {
+    const lib = build();
+    const id = itemId(CONV, 'vid:old');
+    // 给「最旧」的条目打上超期 + 失败：旧实现会把它顶到第一位
+    const after = markFailed(markExpired(lib, CONV, 'vid:old'), id);
+    const order = queryLibrary(after, { filter: 'all', query: '', sort: 'newest', groupBy: 'conv' }).groups[0].items;
+    expect(order.map((i) => i.fingerprint)).toEqual(['vid:new', 'vid:old', 'vid:none']);
   });
 });
 
@@ -262,6 +314,60 @@ describe('查询', () => {
     const result = queryLibrary(library, { filter: 'all', query: '', sort: 'largest', groupBy: 'conv' });
     const items = result.groups.flatMap((group) => group.items);
     expect(items[0].meta.size).toBe(90_000_000);
+  });
+});
+
+describe('体积与主地址的一致性（2026-09-28 实机踩坑的回归锁）', () => {
+  const rawVariant = (url: string): MediaVariant => ({ url, label: '无水印原片', rank: 100, isRaw: true });
+
+  it('primary 换地址（候选流 → 真原片）→ 旧的 size 作废，等兜底重新实测', () => {
+    const id = itemId(CONV, 'vid:v0abc');
+    // 第一次入库：只有候选地址（rank 60，非原片），体积量的是**候选那个文件**
+    const candidate: MediaVariant = {
+      url: 'https://v26-vdl.doubao.com/candidate.mp4',
+      label: '原始下载地址',
+      rank: 60,
+      isRaw: false,
+    };
+    const first = upsertDrafts(
+      {},
+      [draft({ state: 'pending', variants: [candidate], meta: { ext: 'mp4', size: 1_204_451 } })],
+      { now: 1 },
+    ).library;
+    expect(first[id].primary).toBe('https://v26-vdl.doubao.com/candidate.mp4');
+    expect(first[id].meta.size).toBe(1_204_451);
+
+    // 第二次：同一个指纹，解析出了真原片（rank 100）→ 主地址换成它，而本次**没带** size
+    const second = upsertDrafts(
+      first,
+      [draft({ variants: [rawVariant('https://v.douyinvod.com/a/raw.mp4')], meta: { ext: 'mp4' } })],
+      { now: 2 },
+    ).library;
+    expect(second[id].primary).toBe('https://v.douyinvod.com/a/raw.mp4');
+    expect(second[id].meta.size).toBeUndefined(); // 旧数字不再属于新文件 → 清掉，交给 bg 实测
+  });
+
+  it('primary 换地址但本次草稿自带 size（视频解析结果同批到达）→ 保留新 size', () => {
+    const first = upsertDrafts({}, [draft({ meta: { ext: 'mp4', size: 1_000 } })], { now: 1 }).library;
+    const id = itemId(CONV, 'vid:v0abc');
+    const second = upsertDrafts(
+      first,
+      [
+        draft({
+          variants: [rawVariant('https://v.douyinvod.com/a/resolved.mp4')],
+          meta: { ext: 'mp4', size: 8_698_069 },
+        }),
+      ],
+      { now: 2 },
+    ).library;
+    expect(second[id].meta.size).toBe(8_698_069);
+  });
+
+  it('地址没变 → 已量到的 size 一直保留（兜底实测结果不会被后续合并抹掉）', () => {
+    const first = upsertDrafts({}, [draft({ meta: { ext: 'png', size: 3_996_293 } })], { now: 1 }).library;
+    const id = itemId(CONV, 'vid:v0abc');
+    const second = upsertDrafts(first, [draft({ meta: { ext: 'png' }, cover: 'https://x/c.jpeg' })], { now: 2 }).library;
+    expect(second[id].meta.size).toBe(3_996_293);
   });
 });
 

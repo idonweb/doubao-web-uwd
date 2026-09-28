@@ -79,3 +79,14 @@ export function onConfigChanged(handler: (config: Config) => void): () => void {
     if (change.config) handler(change.config);
   });
 }
+
+/**
+ * 在页面里定位这条资源并尽力唤起豆包自己的预览（2026-09-28 第十轮）。
+ *
+ * `keys` = `mediaLookupKeys()` 产出的**路径 hash**（条目的 primary / variants / 封面都能给）。
+ * 返回 `found`：页面 DOM 里是否找到了它 —— 豆包消息列表是**懒渲染**的，
+ * 没滚到的旧消息不在 DOM 里，此时如实返回 false，由弹窗提示用户先滚动加载。
+ */
+export async function locateInPage(keys: string[]): Promise<{ found: boolean; error?: string }> {
+  return sendToBg<{ found: boolean; error?: string }>(MSG.PreviewLocate, { keys });
+}

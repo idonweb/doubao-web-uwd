@@ -66,6 +66,29 @@ export function normalizeSchemaVersion(raw: unknown): number {
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : SCHEMA_VERSION;
 }
 
+/**
+ * schema v1 → v2 的一次性清理：**丢掉库里图片条目的 `meta.size`**（2026-09-28）。
+ *
+ * 缘由：图片体积原先可能来自报文里 image 子对象的 `size`，而那个数字与「真正能下载到的文件」
+ * **不是同一个字节数**（实机反例：卡片 378 KB ↔ 实际下载 3.81 MB 的 PNG）。现在图片体积
+ * 只由 background 实测 `primary` 得到；旧值必须先清掉 —— 否则后续合并（`metaMerge` 只覆盖
+ * 「有值」的字段，而新草稿不再带 size）会让错数字永远粘住。
+ *
+ * 纯函数，便于单测。视频条目**不动**（创作树节点的 `size` 已验证与落盘原片一致）。
+ */
+export function dropStaleImageSizes(library: Library): { library: Library; changed: boolean } {
+  let changed = false;
+  const next: Library = { ...library };
+  for (const [id, item] of Object.entries(next)) {
+    if (item.kind !== 'image' || item.meta.size === undefined) continue;
+    const meta = { ...item.meta };
+    delete meta.size;
+    next[id] = { ...item, meta };
+    changed = true;
+  }
+  return { library: next, changed };
+}
+
 /* --------------------------------------------------------------------------- */
 /* chrome.storage 薄壳                                                          */
 /* --------------------------------------------------------------------------- */
@@ -111,6 +134,7 @@ export async function writeLibrary(library: Library): Promise<void> {
 /**
  * 安装 / 启动时的迁移与清理。
  * - 补写 schemaVersion
+ * - **v1 → v2**：清掉库里图片条目的旧体积（见 `dropStaleImageSizes`），改由实测重新量
  * - 清掉上游遗留键（不迁移其内容，只释放配额）
  * 幂等，可被多个上下文重复调用。
  */
@@ -120,12 +144,23 @@ export async function migrate(): Promise<void> {
     unknown
   >;
 
+  // 存的是原始值（`normalizeSchemaVersion` 会把「缺失」也归成当前版本，判不出升级）
+  const storedVersion = typeof data[STORAGE.schemaVersion] === 'number' ? (data[STORAGE.schemaVersion] as number) : null;
+
   const writes: Record<string, unknown> = {};
   if (normalizeSchemaVersion(data[STORAGE.schemaVersion]) !== SCHEMA_VERSION || data[STORAGE.schemaVersion] === undefined) {
     writes[STORAGE.schemaVersion] = SCHEMA_VERSION;
   }
   if (data[STORAGE.config] === undefined) writes[STORAGE.config] = DEFAULT_CONFIG;
   if (data[STORAGE.library] === undefined) writes[STORAGE.library] = {};
+
+  if (storedVersion !== null && storedVersion < SCHEMA_VERSION) {
+    const cleaned = dropStaleImageSizes(normalizeLibrary(data[STORAGE.library]));
+    if (cleaned.changed) {
+      writes[STORAGE.library] = cleaned.library;
+      console.info('[UWD] schema v1→v2：已清掉图片条目的旧体积（改由实测重新量）');
+    }
+  }
 
   if (Object.keys(writes).length) await area().set(writes);
 

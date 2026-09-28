@@ -5,7 +5,7 @@ import type { Config } from './types';
 export const EXT_NAME = '豆包无水印下载器';
 export const EXT_SHORT_NAME = 'UWD';
 /** 扩展显示版本（与 package.json 保持同步；manifest 版本在构建期由 package.json 注入） */
-export const EXT_VERSION = '1.0.2';
+export const EXT_VERSION = '1.1.0';
 
 /**
  * GitHub 仓库地址（2026-09-27 首发时回填）。
@@ -26,7 +26,15 @@ export const AUTHOR_BILI_UID = '400911';
 export const AUTHOR_BILI_NAME = 'B站 @暮星河';
 
 /** 存储 schema 版本，用于未来迁移 */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
+/*
+ * 版本历史：
+ *   1 —— 初版。
+ *   2 —— 2026-09-28：图片体积改由 background 实测（`bg.size`），因此在 `migrate()` 里
+ *        一次性清掉库里**图片条目**可能存在的旧体积（那一批来自报文里 image 子对象的 `size`，
+ *        与真正可下载的文件不是同一个字节数：实机 378 KB ↔ 实际 3.81 MB 的 PNG）。
+ *        清掉后由兜底实测重新量一遍 —— 不清理的话，合并（`metaMerge`）会让错数字永远粘住。
+ */
 
 /** chrome.storage.local 的键（统一 uwd: 前缀，与上游命名彻底隔离） */
 export const STORAGE = {
@@ -66,6 +74,34 @@ export const LIMITS = {
    * head 校验（第 1 页首条 key 是否变化）确保树没变过。
    */
   VID_INDEX_TTL_MS: 60_000,
+  /**
+   * 「实测文件字节数」的请求超时与每轮上限（2026-09-28 第十轮补丁）。
+   *
+   * 创作树里没有的条目（超期视频 / 超过约三个月的旧图片）拿不到节点 `size`，
+   * 由 background 对条目 `primary` 发一次 `Range: bytes=0-0` 的 GET 读总长 ——
+   * 只下 1 字节，但仍然是一次真实网络请求，所以：单次 8s 超时、每轮入库最多 6 条，
+   * 且**同一条目在一个 background 生命周期内只测一次**（失败不重试，等 F5 重解析）。
+   */
+  SIZE_PROBE_TIMEOUT_MS: 8_000,
+  SIZE_PROBE_MAX_PER_ROUND: 6,
+  /**
+   * 待测条目多于一屏时的**分批续跑间隔**（一次性定时器，不是轮询）。
+   * 每轮都会把测过的 id 记进 `probedSizeIds`，所以续跑一定收敛到「没有候选」而停下。
+   */
+  SIZE_PROBE_CONTINUE_MS: 1_500,
+  /**
+   * 「原片已超期」的**二次确认窗口**（2026-09-28 第十轮）。
+   *
+   * ⚠️ 实测（`docs/03` §17）：站点创作树对**刚生成的视频存在提交延迟** —— 会话里已经能
+   * 看到视频、生成完成消息也推送到了，但此刻查「我的创作」树会「翻到底仍未见」；
+   * 实测 50 秒后同一个查询就能查到该 vid（树 148 → 149 条）。
+   *
+   * 因此「翻到底未见」**不能一次即定论**：首次未见只记录，窗口到点后**重新全量扫描**
+   * 仍未见，才判定「原片已超期」并落负缓存。
+   * 副作用（已知且接受）：真超期条目会晚一个窗口（约 30s）才显示「原片已超期」，
+   * 期间保持「解析中」——与 J3 同一条原则：宁缺勿假，不给假结论。
+   */
+  VID_EXPIRED_CONFIRM_MS: 30_000,
   /** 单次发送给 background 的草稿上限（防超大消息） */
   DRAFT_BATCH_MAX: 40,
   /** 诊断：最多保留多少条记录 */
@@ -100,6 +136,18 @@ export const MSG = {
   ReresolveVid: 'content:reresolve-vid',
   /** page → content：上一条的应答 */
   VidResolved: 'video-resolved',
+  /**
+   * bg → content → page：**在页面上定位这条资源并尽力唤起豆包自己的预览**（2026-09-28 第十轮）。
+   *
+   * 用户拍板的口径：插件不自己造播放器 —— 点资源库的「预览」就**调用豆包页面的同一功能**
+   * （弹豆包自己的预览侧栏），插件只当「和豆包网页一样的功能入口」。
+   * 做法：按 `mediaPathKey()` 的路径 hash 找到页面里的媒体元素 → 滚动到视口中央 →
+   * **尽力**派发一次完整指针序列的点击（站点若校验事件可信度就点不动，那就靠用户手点一下，
+   * 目标已经被滚到眼前）。页面侧**只读 DOM + 派发事件**，不注入任何元素/样式。
+   */
+  PreviewLocate: 'content:preview-locate',
+  /** page → content：上一条的应答 `{ found }` */
+  PreviewLocated: 'preview-located',
   /**
    * page → content → bg：vid 的原片已超期（2026-09-27 Finding C 修复）。
    *

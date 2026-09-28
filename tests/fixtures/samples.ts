@@ -72,34 +72,51 @@ const chainModelPlain = JSON.stringify({
 });
 export const CHAIN_MODEL_DOUBLE_ESCAPED = chainModelPlain.replace(/"/g, '\\"');
 
-/** chain/single 的报文文本：结构与实测一致（video_id / video_duration / video_model / fallback_api） */
+/**
+ * chain/single 的报文文本：结构与实测一致（video_id / video_duration / video_model / fallback_api）。
+ *
+ * 2026-09-28 只读探针实测的外层路径是
+ * `data.downlink_body.pull_singe_chain_downlink_body.messages[i]`（站点字段名**确实**拼成
+ * `pull_singe`，不是 `single`），且每条 message 自带 `create_time`（**秒级** Unix）——
+ * 与网页上「5月23日 20:22」那种显示完全同源。夹具按实测形状构造，
+ * 顺带覆盖「消息时间向下继承给 creation」这条行为（`extractChainRaw` 会写进 `raw.createdAt`）。
+ */
+export const CHAIN_MESSAGE_CREATE_TIME = 1790520877; // = 2026-09-27 22:54:37
 export const CHAIN_RESPONSE = JSON.stringify({
   code: 0,
   msg: '',
   data: {
-    message_list: [
-      {
-        content_block: [
+    downlink_body: {
+      pull_singe_chain_downlink_body: {
+        messages: [
           {
-            content: {
-              creation_block: {
-                creations: [
-                  {
-                    video: {
-                      video_id: CHAIN_VID,
-                      video_duration: CHAIN_DURATION,
-                      video_thumb: { url: VIDEO_THUMB },
-                      video_model: CHAIN_MODEL_DOUBLE_ESCAPED,
-                      fallback_api: CHAIN_FALLBACK_API,
-                    },
+            message_id: '56852687132556800',
+            conversation_id: '38429621189804034',
+            create_time: CHAIN_MESSAGE_CREATE_TIME,
+            update_time: CHAIN_MESSAGE_CREATE_TIME,
+            content_block: [
+              {
+                content: {
+                  creation_block: {
+                    creations: [
+                      {
+                        video: {
+                          video_id: CHAIN_VID,
+                          video_duration: CHAIN_DURATION,
+                          cover: { image_thumb: { url: VIDEO_THUMB }, image_preview: { url: VIDEO_THUMB } },
+                          video_model: CHAIN_MODEL_DOUBLE_ESCAPED,
+                          fallback_api: CHAIN_FALLBACK_API,
+                        },
+                      },
+                    ],
                   },
-                ],
+                },
               },
-            },
+            ],
           },
         ],
       },
-    ],
+    },
   },
 });
 
@@ -123,7 +140,8 @@ const videoCreation = {
   video: {
     vid: 'v0abc123def456',
     download_url: VIDEO_DOWNLOAD_URL,
-    video_thumb: { url: VIDEO_THUMB },
+    // 2026-09-28 实测：封面在 `cover.{image_thumb|image_preview}.url`（`video_thumb` 不存在）
+    cover: { image_thumb: { url: VIDEO_THUMB }, image_preview: { url: VIDEO_THUMB } },
     video_ori_raw: { url: VIDEO_ORI_RAW },
     video_model: JSON.stringify({
       video_list: [
@@ -151,7 +169,8 @@ const videoCreation = {
 const imageCreation = {
   image: {
     image_thumb: { url: IMAGE_THUMB, width: 2720, height: 1520 },
-    image_preview: { url: IMAGE_PREVIEW, width: 2720, height: 1520 },
+    // 2026-09-28 实测：预览字段叫 `preview_img`（`image_preview` 不存在）
+    preview_img: { url: IMAGE_PREVIEW, width: 2720, height: 1520 },
     image_ori_raw: { url: IMAGE_RAW, width: 2720, height: 1520 },
   },
 };
@@ -159,7 +178,8 @@ const imageCreation = {
 /** 只有封面图的「视频」——上游会把它当成一条 video 记录（成因 3），本项目必须丢弃 */
 const coverOnlyCreation = {
   video: {
-    video_thumb: { url: 'https://p3-ibyteimg.com/img/cover-only~tplv-a9rns2rl98-video_cover.jpeg' },
+    // 只有封面、没有 vid / ori_raw —— 上游会把它当成一条 video 记录，本项目必须丢弃
+    cover: { image_thumb: { url: 'https://p3-ibyteimg.com/img/cover-only~tplv-a9rns2rl98-video_cover.jpeg' } },
   },
 };
 
@@ -200,7 +220,7 @@ export const SSE_RESPONSE_REPEATED = patchEvent([videoCreation]) + patchEvent([v
 const threadVideo = {
   vid: 'v0threadabc12345',
   download_url: VIDEO_DOWNLOAD_URL,
-  video_thumb: { url: VIDEO_THUMB },
+  cover: { image_thumb: { url: VIDEO_THUMB }, image_preview: { url: VIDEO_THUMB } },
   video_model: JSON.stringify({
     video_list: [{ main_url: b64(video1080), definition: '1080p' }],
   }),
@@ -212,8 +232,11 @@ const threadImage = {
   image_ori_raw: { url: IMAGE_RAW },
 };
 
+/** 分享页消息同样自带 `create_time`（秒级）—— 用于覆盖「分享页也能拿到生成时间」 */
+export const THREAD_MESSAGE_CREATE_TIME = 1779538923; // = 2026-05-23 20:22:03
 const MESSAGE_LIST = [
   {
+    create_time: THREAD_MESSAGE_CREATE_TIME,
     content_block: [
       { content: { creation_block: { creations: [{ video: threadVideo }, { image: threadImage }] } } },
     ],
@@ -254,12 +277,33 @@ export const HOMEPAGE_RESPONSE = {
   },
 };
 
+/*
+ * node_info 第 1 页 [2026-09-28 探针实测形状]。
+ *
+ * 实测一个节点的完整字段：id / name / key / node_type / size / source / content /
+ * … / conversation_id / node_cover / parent_id / **create_time** / **update_time**。
+ * 这里只保留解析要用到的几项，但**结构与字段名与实测一致**：
+ *   · `create_time`（秒级 Unix）→ `readNodeInfoPage()` 当成「作品真实生成时间」带回，供排序；
+ *   · `size`（字节）→ 实测与下载到的原片字节数**完全一致**，供卡片显示「文件大小」。
+ */
+export const NODE_INFO_VIDEO_SIZE = 8_698_069; // 实测样例：节点 size ↔ 落盘 mp4 字节数一致
+export const NODE_INFO_VIDEO_COVER =
+  'https://p26-sign.douyinpic.com/tos-cn-p-9ecd54/cover~tplv-noop.image?x-expires=1790641295&x-signature=abc';
 export const NODE_INFO_RESPONSE = {
   code: 0,
   data: {
     children: [
-      { id: 'nid-1', key: 'v0other000000' },
-      { id: 'nid-2', key: 'v0abc123def456' },
+      { id: 'nid-1', key: 'v0other000000', node_type: 6, create_time: 1790461738, update_time: 1790461748, size: 12_698_192 },
+      {
+        id: 'nid-2',
+        key: 'v0abc123def456',
+        node_type: 6,
+        create_time: 1790520877,
+        update_time: 1790520885,
+        size: NODE_INFO_VIDEO_SIZE,
+        // 站点自己的封面图（带签名）—— 链式报文没给 video_thumb 时用它兜底
+        node_cover: { list_view: { cover_url: NODE_INFO_VIDEO_COVER, image_width: 720, image_height: 1280 } },
+      },
     ],
   },
 };

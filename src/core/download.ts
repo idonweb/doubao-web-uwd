@@ -84,6 +84,47 @@ export class FilenameAllocator {
 }
 
 /* --------------------------------------------------------------------------- */
+/* 字节数实测（纯解析部分）                                                       */
+/* --------------------------------------------------------------------------- */
+
+/**
+ * 从「Range 探测」的响应里读出**文件总字节数**（2026-09-28 第十轮补丁）。
+ *
+ * 背景：创作树里没有的条目（超期视频 / 超过约三个月的旧图片）拿不到节点 `size`，
+ * 只能在 background 里对该条目的 `primary` 发一次 `Range: bytes=0-0` 的 GET，再从响应头读总长。
+ *
+ * 实测（探针）：服务器支持 Range，回 **206** + `Content-Range: bytes 0-0/<总长>`，
+ * 并且只下 1 字节（`Content-Length: 1`）。两种情形都要认：
+ *   · **206** → 从 `Content-Range` 的 `/` 之后取总长；
+ *   · **200**（站点忽略 Range）→ `Content-Length` 就是完整长度，**调用方必须中断响应体**，
+ *     否则会把整个文件下下来（本函数只做解析，不负责中断）。
+ * 认不出来（缺头 / 单位不明 / 非 2xx / 值非法）一律返回 `undefined` —— **宁缺勿假**。
+ *
+ * @param status  HTTP 状态码
+ * @param header  取响应头的小函数（如 `(h) => res.headers.get(h)`）
+ */
+export function parseTotalBytes(
+  status: number,
+  header: (name: string) => string | null | undefined,
+): number | undefined {
+  const positive = (raw: string | null | undefined): number | undefined => {
+    if (raw == null) return undefined;
+    const value = Number(String(raw).trim());
+    return Number.isFinite(value) && value > 0 ? value : undefined;
+  };
+  if (status === 206) {
+    const range = header('content-range');
+    if (!range) return undefined;
+    const total = positive(String(range).split('/')[1]);
+    if (total === undefined) return undefined;
+    // `bytes 0-0/1234` 之外的形式（`*`、缺 total）一律不认
+    return /^bytes\s+\d+-\d+\/\d+$/i.test(String(range).trim()) ? total : undefined;
+  }
+  if (status === 200) return positive(header('content-length'));
+  return undefined;
+}
+
+/* --------------------------------------------------------------------------- */
 /* 单并发队列                                                                    */
 /* --------------------------------------------------------------------------- */
 

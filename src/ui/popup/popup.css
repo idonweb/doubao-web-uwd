@@ -65,26 +65,16 @@ body {
   color: var(--text-3);
   font-family: var(--mono);
   margin-top: 1px;
-  /* 头部始终单行：版本号 / 作者信息过长时省略，悬停 title 看全文 */
+  /* 头部始终单行：版本号过长时省略 */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 /*
- * ⚠️ 选择器必须写到 `.hd-title .hd-author`（两个类）：上面那条 `.hd-title p`
- * 是「类 + 元素」，只写 `.hd-author`（一个类）会被它压住，颜色仍是 --text-3。
+ * ⚠️ 开发者信息**不在头部**（2026-09-28 第十一轮移到底部常驻位，样式见 `.ft-author`）。
+ * 移走的原因：底部原先那句「只收录无水印原片 · 未解析到原片的条目不会入库」已不符合现况
+ * （现在会如实给出「原片已超期 / 原片不可得」这类结论），撤掉后把开发者信息放到那个位置。
  */
-.hd-title .hd-author {
-  color: var(--author);
-  font-family: inherit;
-}
-.hd-title .hd-author a {
-  color: inherit;
-  text-decoration: none;
-}
-.hd-title .hd-author a:hover {
-  text-decoration: underline;
-}
 .hd-actions {
   display: flex;
   align-items: center;
@@ -373,26 +363,30 @@ body {
   font-family: var(--mono);
   backdrop-filter: blur(3px);
 }
-.play-ic {
+
+/* ---------------------------------------------------------------------------
+ * 真实生成时间（2026-09-28 第十轮，`meta.createdAt` = 站点 `create_time`）
+ *
+ * 网格视图：缩略图**左上角**一个药丸，与左下角「时长 / 格式」药丸共用 `.pill` 视觉语言；
+ * 列表视图：缩略图只有 52px 放不下 → 药丸隐藏，时间回到卡片副信息行最前面（`.meta-when`）。
+ * 同一份文案渲染两处、按视图二选一显示，所以永远不会重复出现。
+ * ------------------------------------------------------------------------- */
+.thumb-when {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(3px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
+  top: 5px;
+  left: 5px;
 }
-.play-ic .ic {
-  width: 15px;
-  height: 15px;
-  margin-left: 1.5px;
+/* 副信息行里的时间比规格略重一档：它是「什么时候生成的」，比尺寸更该先被看到 */
+.meta-when {
+  color: var(--text-2);
 }
+.grid-2 .meta-when {
+  display: none;
+}
+.list-mode .thumb-when {
+  display: none;
+}
+
 .list-mode .card {
   display: flex;
   align-items: center;
@@ -520,21 +514,20 @@ body {
   font-size: 11.5px;
   color: var(--text-2);
 }
-.ft-note {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+/* ---------- 页脚作者信息（2026-09-28 第十一轮：从头部移到底部常驻位） ---------- */
+.ft-author {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--author);
 }
-.ft-note .ic {
-  color: var(--ok);
-  flex-shrink: 0;
+.ft-author a {
+  color: inherit;
+  text-decoration: none;
 }
-.ft-note .dim {
-  color: var(--text-3);
+.ft-author a:hover {
+  text-decoration: underline;
 }
 .ft-prog {
   display: flex;

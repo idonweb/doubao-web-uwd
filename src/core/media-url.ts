@@ -8,6 +8,7 @@
 
 import {
   CORS_INJECT_HOST_FILTERS,
+  COVER_INJECT_HOST_FILTERS,
   DOWNLOAD_REFERER,
   HOST_DOLA,
   HOST_IMAGE_CDN_SUFFIXES,
@@ -40,8 +41,49 @@ export function stripQuery(url: string): string {
   return url.slice(0, end);
 }
 
-/** 规范化：用于「同一资源」判定。协议 + 域名大小写 + 结尾斜杠一并抹平。 */
-export function normalizeUrl(url: string): string {
+/**
+ * 媒体 URL 的**路径键** —— 用于把资源库条目匹配回**页面里的 DOM 媒体元素**（2026-09-28 第十轮）。
+ *
+ * 实测依据（`docs/03` §17.10.1）：页面里 `<video src>` 与我们报文里的候选地址是
+ * **同源同路径**的，只差结尾的规格后缀与签名段：
+ *   · 报文（候选）`https://v26-vdl.doubao.com/<签名>/video/tos/cn/tos-cn-v-9ecd54/<hash>/?a=…&lr=…`
+ *   · 页面（DOM）`https://….doubao.com/…/video/tos/cn/tos-cn-v-9ecd54/<hash>/`
+ *   · 图片：`…/rc_gen_image/<hash>.jpeg~tplv-a9rns2rl98-image_raw.png` ↔ `…/<hash>.jpg~tplv-…-image.png`
+ * 所以取「去掉查询、去掉 `~tplv-` 之后的后缀、去掉扩展名」的最后一段路径当作匹配键 —— `<hash>`。
+ *
+ * 返回值：长度 ≥ 8 的最后一段路径（像真哈希才认）；否则 null（**宁缺勿假**，不用短段乱匹配）。
+ */
+export function mediaPathKey(url: string): string | null {
+  if (!url) return null;
+  const withoutQuery = stripQuery(url.replace(/\\+$/, '')).replace(/\\/g, '');
+  // 去掉站点规格后缀（`~tplv-…`）；水印/无水印各版本共用同一段哈希
+  const tplv = withoutQuery.indexOf('~tplv-');
+  const path = tplv >= 0 ? withoutQuery.slice(0, tplv) : withoutQuery;
+  const segments = path.split('/').filter(Boolean);
+  const last = segments[segments.length - 1] ?? '';
+  const key = last.replace(/\.[A-Za-z0-9]{2,5}$/, '');
+  return key.length >= 8 ? key : null;
+}
+
+/**
+ * 从一组地址里收集**页面匹配键**（去重、保序）—— 供「在页面里定位这条资源」用。
+ *
+ * 调用方把条目的所有地址（`primary` + 各 `variants` + 封面）丢进来即可；
+ * 拿不到键的地址（短路径段、非 URL、`vid:` 这类指纹）自动跳过，不会污染匹配。
+ */
+export function mediaLookupKeys(urls: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const url of urls) {
+    const key = mediaPathKey(url);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+  }
+  return out;
+}
+
+/** 规范化：用于「同一资源」判定。协议 + 域名大小写 + 结尾斜杠一并抹平。 */export function normalizeUrl(url: string): string {
   if (!url) return '';
   let out = stripQuery(url).trim();
   // 协议相对地址
@@ -213,51 +255,24 @@ export interface DnrRule {
 }
 
 /**
- * 生成 declarativeNetRequest 静态规则。
- * 与上游 rules.json 一一对应，但**唯一来源**是 site-contract.ts：
- *   id 1~5   → IMAGE_SUFFIX_REWRITES（图片水印后缀重定向）
- *   id 6     → logo_type 参数移除
- *   id 7     → lr=video_gen_watermark(_dyn)? → lr=video_gen_no_watermark
- *   id 8~10  → 视频 CDN 注入 CORS 响应头（每个 CDN 域一条）
- *   id 11~13 → 视频 CDN 注入 Referer 请求头（方案 §7.3 的取流方案 A 依赖它，待实测定案）
+ * 生成 declarativeNetRequest 静态规则。**唯一来源**是 site-contract.ts。
+ *
+ * ⚠️ 2026-09-28 第十轮：**删掉了全部「改写类」规则**（图片水印后缀重定向、`logo_type` 移除、
+ * `lr` 改写，原 id 1~7）。原因是实测到它们**把站点自己的签名图打成了 403**：
+ *   页面请求 `…~tplv-a9rns2rl98-video_dsz_watermark_1_6.png`（豆包渲染的旧视频封面）
+ *   → 被规则重定向成 `…~tplv-a9rns2rl98-video_cover.jpeg`
+ *   → 而 `p11-flow-imagex-sign.byteimg.com` 这类域是**带签名**的，路径一改签名即失效 → **403**。
+ * 而「改 URL 去水印」本身早已失效（站点把水印烧进了转码流，见 SESSION_CONTEXT 关键约束 3），
+ * 本插件下载用的是 `get_download_info` 给的原片地址，**从不依赖这些改写** ——
+ * 留着只会破坏站点自己的封面与播放，因此整体移除。
+ *
+ * 现在只剩两类「注入类」规则（都不改 URL）：
+ *   · 视频 CDN 注入 CORS 响应头（取流方案 B 的 fetch+blob 需要）
+ *   · 视频 CDN / 封面域注入 Referer 请求头（下载防盗链 + 弹窗里的封面图）
  */
 export function buildDnrRules(): DnrRule[] {
   const rules: DnrRule[] = [];
   let id = 1;
-
-  for (const rule of IMAGE_SUFFIX_REWRITES) {
-    rules.push({
-      id: id++,
-      priority: 2,
-      action: { type: 'redirect', redirect: { regexSubstitution: rule.dnrSubstitution } },
-      condition: { regexFilter: rule.dnrPattern, resourceTypes: ['image'] },
-    });
-  }
-
-  // 动态水印：移除 logo_type 参数
-  rules.push({
-    id: id++,
-    priority: 2,
-    action: {
-      type: 'redirect',
-      redirect: { transform: { queryTransform: { removeParams: [LOGO_TYPE_PARAM] } } },
-    },
-    condition: {
-      urlFilter: `${LOGO_TYPE_PARAM}=${LOGO_TYPE_VALUE}`,
-      resourceTypes: ['media'],
-    },
-  });
-
-  // 视频 lr 参数改写
-  rules.push({
-    id: id++,
-    priority: 2,
-    action: { type: 'redirect', redirect: { regexSubstitution: `\\1${LR_NO_WATERMARK}` } },
-    condition: {
-      regexFilter: '(\\?.*)lr=video_gen_watermark(?:_dyn)?',
-      resourceTypes: ['media'],
-    },
-  });
 
   for (const filter of CORS_INJECT_HOST_FILTERS) {
     // 视频 CDN 注入 CORS 响应头（上游已验证：绕过 blob 读取的跨域限制）
@@ -294,6 +309,33 @@ export function buildDnrRules(): DnrRule[] {
       condition: {
         urlFilter: filter,
         resourceTypes: ['xmlhttprequest', 'media', 'other', 'image'],
+      },
+    });
+  }
+
+  for (const filter of COVER_INJECT_HOST_FILTERS) {
+    /*
+     * 封面 / 缩略图防盗链（2026-09-28 第十轮）：弹窗是扩展页，发出的图片请求 Referer 是
+     * `chrome-extension://…`，这些图片域会 403 → 卡片只剩灰底占位。补上站点 Referer 即可。
+     * 只加 Referer / Origin，不加 CORS 响应头（封面是 `<img>`，不需要跨域读取）。
+     *
+     * ℹ️ `xmlhttprequest` 是 2026-09-28 补的：background 侧「实测文件字节数」
+     * （`Range: bytes=0-0` 读 `Content-Range`）也发到这些图片域，同样需要站内 Referer，
+     * 否则会被防盗链挡成 403 → 体积测不出来。
+     */
+    rules.push({
+      id: id++,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [
+          { header: 'Referer', operation: 'set', value: DOWNLOAD_REFERER },
+          { header: 'Origin', operation: 'set', value: 'https://www.doubao.com' },
+        ],
+      },
+      condition: {
+        urlFilter: filter,
+        resourceTypes: ['image', 'xmlhttprequest'],
       },
     });
   }

@@ -56,13 +56,23 @@ export interface MediaMeta {
   /** 清晰度标签 */
   label?: string;
   /**
-   * 原片已超期（2026-09-27 Finding C 修复）。
+   * 原片已超期（2026-09-27 Finding C 修复；2026-09-28 第十轮改为**弱结论**）。
    *
-   * `true` = 页面侧已**翻遍整棵「我的创作」树**仍未找到该 vid —— 站点对创作记录有
-   * 保存期限（2026-09-27 实测约三个月：6.23 的原片可解析、5 月的 vid 已清除），原片永远取不到了。这是确定性结论而非网络失败：
-   * 条目 state 落为 `fail`、界面显示「原片已超期」，且后续重解析不得把它升回「解析中」。
+   * `true` = 页面侧已**翻遍整棵「我的创作」树**（且走完 30s 二次确认窗口）仍未找到该 vid ——
+   * 站点对创作记录有保存期限（实测约三个月：6.23 的原片可解析、5 月的 vid 已清除）。
+   * ⚠️ 它是弱结论：一旦拿到原片（`raw` 草稿）就会被清掉 —— 站点创作树对刚生成的视频有提交延迟。
    */
   expired?: boolean;
+  /**
+   * 作品的**真实生成时间**（毫秒 epoch，2026-09-28 第十轮新增）。
+   *
+   * 来源 = 站点创作树节点的 `create_time`（**秒级** Unix，求值时 ×1000）。
+   * 它是资源库「最新 / 最早」的排序依据 —— 此前用的是 `lastSeen`（插件最后一次处理该条目的
+   * 本地时刻），会把「刚被判超期」这种本地事件误当成「资源最新」。
+   * ⚠️ 拿不到（vid 不在创作树里：已超期 / 尚未提交）时为 `undefined` —— **不编造**，
+   * 排序时一律排在有真时间的条目之后。
+   */
+  createdAt?: number;
 }
 
 export interface MediaItem {
@@ -120,6 +130,15 @@ export interface RawMedia {
   height?: number;
   duration?: number;
   size?: number;
+  /**
+   * 作品生成时间（**秒级** Unix，站点原样，2026-09-28 第十轮新增）。
+   *
+   * 来源 = 所在**消息**的 `create_time`（`MESSAGE_CREATE_TIME_KEY`，实测链：
+   * `data.downlink_body.pull_singe_chain_downlink_body.messages[i].create_time`），
+   * 与网页上每条生成结果下面显示的时间一致；旧作品即使不在创作树里也有。
+   * ⚠️ 单位与站点一致（秒）；写进 `MediaMeta` 时统一换成**毫秒**（见 `siteTimeToMs()`）。
+   */
+  createdAt?: number;
   /**
    * 来源标签，便于排查：'sse' | 'chain' | 'thread' | 'dom'。
    * ⚠️ 语义上还承担一个判定职责：**只有 sse / chain / thread 的 `raw` 才算站点给出的原片**；

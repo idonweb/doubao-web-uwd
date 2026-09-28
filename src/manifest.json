@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "豆包无水印下载器",
   "short_name": "UWD",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "自动识别豆包对话页与分享链接页，解析并下载无水印视频 / 图片。仅供个人学习研究使用。",
   "author": "doubao-web-uwd contributors",
   "minimum_chrome_version": "114",

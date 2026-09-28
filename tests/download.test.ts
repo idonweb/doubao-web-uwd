@@ -5,11 +5,37 @@ import {
   FilenameAllocator,
   baseFilename,
   formatTimestamp,
+  parseTotalBytes,
   sanitizeExt,
   sanitizeSegment,
   sequencedFilename,
 } from '../src/core/download';
 import type { DownloadProgress } from '../src/core/types';
+
+describe('字节数实测的响应解析（parseTotalBytes，2026-09-28 体积兜底）', () => {
+  const headers = (map: Record<string, string>) => (name: string) => map[name.toLowerCase()] ?? null;
+
+  it('206（服务器支持 Range）：从 content-range 的「/」之后取总长', () => {
+    // 探针实测：Range: bytes=0-0 → 206 + `content-range: bytes 0-0/2074286` + content-length: 1
+    expect(parseTotalBytes(206, headers({ 'content-range': 'bytes 0-0/2074286', 'content-length': '1' }))).toBe(2_074_286);
+    expect(parseTotalBytes(206, headers({ 'content-range': 'bytes 0-0/1861088' }))).toBe(1_861_088);
+  });
+
+  it('200（站点忽略 Range）：content-length 就是完整长度', () => {
+    expect(parseTotalBytes(200, headers({ 'content-length': '8698069' }))).toBe(8_698_069);
+  });
+
+  it('认不出来一律 undefined（宁缺勿假）：缺头 / 星号 / 非 2xx / 非法值', () => {
+    expect(parseTotalBytes(206, headers({}))).toBeUndefined();
+    expect(parseTotalBytes(206, headers({ 'content-range': 'bytes 0-0/*' }))).toBeUndefined();
+    expect(parseTotalBytes(206, headers({ 'content-range': 'bytes 0-1/0' }))).toBeUndefined();
+    expect(parseTotalBytes(200, headers({}))).toBeUndefined();
+    expect(parseTotalBytes(200, headers({ 'content-length': '0' }))).toBeUndefined();
+    expect(parseTotalBytes(200, headers({ 'content-length': 'abc' }))).toBeUndefined();
+    expect(parseTotalBytes(403, headers({ 'content-length': '9' }))).toBeUndefined();
+    expect(parseTotalBytes(302, headers({ 'content-range': 'bytes 0-0/9' }))).toBeUndefined();
+  });
+});
 
 describe('文件名规则（方案 §7.1，已冻结）', () => {
   it('时间戳格式 YYYY-M-D HH-mm-ss（年月日不补零，时分秒补零）', () => {

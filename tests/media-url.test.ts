@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  mediaPathKey,
   buildDnrRules,
   dedupeVariants,
   getHost,
@@ -160,6 +161,36 @@ describe('变体归并', () => {
   });
 });
 
+describe('mediaPathKey：把条目匹配回页面 DOM 媒体元素的「路径键」（2026-09-28 第十轮）', () => {
+  const VIDEO_HASH = 'o80CsgIeQIIkw4QQpb0EDtEouMF74KDAhw41ul';
+  const IMAGE_HASH = '7bf8db54a7ec4040ba073c804e45b121';
+
+  it('视频：报文候选地址与页面 <video src> 落在同一个 hash 上', () => {
+    const fromPayload = `https://v26-vdl.doubao.com/abc123/video/tos/cn/tos-cn-v-9ecd54/${VIDEO_HASH}/?a=482431&lr=video_gen_watermark_dyn`;
+    const fromDom = `https://v3-vdl.doubao.com/xyz/video/tos/cn/tos-cn-v-9ecd54/${VIDEO_HASH}/?sign=1`;
+    expect(mediaPathKey(fromPayload)).toBe(VIDEO_HASH);
+    expect(mediaPathKey(fromDom)).toBe(VIDEO_HASH);
+  });
+
+  it('图片：原片 URL（~tplv-…-image_raw）与页面水印缩略图（.jpg~tplv-…-image）同键', () => {
+    const oriRaw = `https://p6-flow-imagex-sign.byteimg.com/tos-cn-i-a9rns2rl98/rc_gen_image/${IMAGE_HASH}.jpeg~tplv-a9rns2rl98-image_raw.png`;
+    const domThumb = `https://p11-flow-imagex-sign.byteimg.com/tos-cn-i-a9rns2rl98/rc_gen_image/${IMAGE_HASH}.jpg~tplv-a9rns2rl98-image.png?x-expires=1&x-signature=a`;
+    expect(mediaPathKey(oriRaw)).toBe(IMAGE_HASH);
+    expect(mediaPathKey(domThumb)).toBe(IMAGE_HASH);
+  });
+
+  it('转义引号 / 结尾反斜杠 / 查询串都不影响取键', () => {
+    expect(mediaPathKey(`https://x.com/a/video/${VIDEO_HASH}/\\\\`)).toBe(VIDEO_HASH);
+    expect(mediaPathKey(`https://x.com/a/b/${IMAGE_HASH}.jpeg?x=1`)).toBe(IMAGE_HASH);
+  });
+
+  it('短路径段 / 空值 / 非 URL 一律返回 null（宁缺勿假，不用短段乱匹配）', () => {
+    expect(mediaPathKey('')).toBeNull();
+    expect(mediaPathKey('https://x.com/abc.jpg')).toBeNull(); // 只有 3 个字符
+    expect(mediaPathKey('https://www.doubao.com/chat/123')).toBeNull(); // 路径段太短
+  });
+});
+
 describe('DNR 规则生成（构建期）', () => {
   const rules = buildDnrRules();
 
@@ -168,24 +199,47 @@ describe('DNR 规则生成（构建期）', () => {
     expect(ids).toEqual(Array.from({ length: rules.length }, (_, i) => i + 1));
   });
 
-  it('覆盖图片后缀 / logo_type / lr / CORS / Referer 五类', () => {
+  it('只保留「注入类」规则：没有任何 redirect（改写类规则会打废站点的签名 URL）', () => {
     const types = rules.map((rule) => rule.action.type);
-    expect(types.filter((type) => type === 'redirect').length).toBeGreaterThanOrEqual(7);
+    // 2026-09-28 第十轮：改写过图片后缀/lr/logo_type 的 7 条规则已整体移除 ——
+    // 实测它们把 `…~tplv-…-video_dsz_watermark_1_6.png` 重定向成 `…video_cover.jpeg`，
+    // 而该域带签名，路径一改就 403（docs/03 §17.11）。这里守住「不许再加回改写规则」。
+    expect(types).not.toContain('redirect');
     expect(types).toContain('modifyHeaders');
 
     const all = JSON.stringify(rules);
-    expect(all).toContain('~tplv-a9rns2rl98-image-qvalue.jpeg');
-    expect(all).toContain('logo_type');
-    expect(all).toContain('video_gen_no_watermark');
+    expect(all).not.toContain('~tplv-a9rns2rl98-image-qvalue.jpeg');
+    expect(all).not.toContain('video_gen_no_watermark');
     expect(all).toContain('Access-Control-Allow-Origin');
     expect(all).toContain('https://www.doubao.com/');
     expect(all).toContain('douyinvod.com');
   });
 
-  it('每条 redirect 规则都有 condition，避免规则被 Chrome 拒绝', () => {
+  it('每条规则都有 condition 与优先级，避免规则被 Chrome 拒绝', () => {
     for (const rule of rules) {
       expect(rule.condition).toBeTruthy();
       expect(rule.priority).toBeGreaterThan(0);
     }
+  });
+
+  it('封面 / 缩略图域也有 Referer 注入（否则弹窗里的封面图会被防盗链挡成 403）', () => {
+    const coverRules = rules.filter((rule) => {
+      const types = (rule.condition?.resourceTypes ?? []) as unknown as string[];
+      return types.includes('image') && JSON.stringify(rule.action).includes('Referer');
+    });
+    const filters = coverRules.map((rule) => String(rule.condition?.urlFilter ?? ''));
+    expect(filters).toContain('||douyinpic.com/');
+    expect(filters).toContain('||byteimg.com/');
+    // 只加 Referer / Origin，不加 CORS 响应头（`<img>` 不需要跨域读取）
+    expect(JSON.stringify(coverRules)).not.toContain('Access-Control-Allow-Origin');
+  });
+
+  it('封面域的 Referer 也覆盖 xmlhttprequest —— bg 侧「实测文件字节数」要用（2026-09-28）', () => {
+    // 体积兜底是在 background 里对图片原片 URL 发 `Range: bytes=0-0` 读 Content-Range；
+    // 那是一次 xhr 类请求，若这些域只对 `image` 注入 Referer，就会被防盗链挡成 403。
+    const byteimg = rules.find((rule) => String(rule.condition?.urlFilter) === '||byteimg.com/');
+    const types = (byteimg?.condition?.resourceTypes ?? []) as unknown as string[];
+    expect(types).toContain('image');
+    expect(types).toContain('xmlhttprequest');
   });
 });

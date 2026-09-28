@@ -10,6 +10,7 @@
 import {
   FN_ARGS_SELECTOR,
   MESSAGE_CONTENT_BLOCK,
+  MESSAGE_CREATE_TIME_KEY,
   ROUTER_DATA_FN_ARGS_KEY,
   SHARE_DATA_PATH,
   SHARE_DESCRIBE_MAX_DEPTH,
@@ -21,7 +22,7 @@ import {
   SHARE_TITLE_PATHS,
   SHARE_TITLE_WALK_MAX_DEPTH,
 } from '../site-contract';
-import { asString, getPath, isObject, rawFromCreation } from './common';
+import { asNumber, asString, getPath, isObject, rawFromCreation } from './common';
 import type { RawMedia } from '../types';
 
 export { FN_ARGS_SELECTOR };
@@ -78,20 +79,29 @@ export function findShareInfo(parsed: unknown): Record<string, unknown> | null {
   return null;
 }
 
-/** 遍历 shareInfo 里的全部 creation（视频与图片） */
-export function eachCreation(shareInfo: unknown, visit: (creation: Record<string, unknown>) => void): void {
+/**
+ * 遍历 shareInfo 里的全部 creation（视频与图片）。
+ *
+ * `visit` 的第二个入参 = 该 creation **所在消息的生成时间**（**秒级** Unix，2026-09-28 第十轮）：
+ * 分享页的消息对象与 chain 同构（实测都带 `create_time`），读不到就是 null（不编造）。
+ */
+export function eachCreation(
+  shareInfo: unknown,
+  visit: (creation: Record<string, unknown>, createdAt: number | null) => void,
+): void {
   const messages = getPath(shareInfo, SHARE_DATA_PATH);
   if (!Array.isArray(messages)) return;
 
   for (const message of messages) {
     if (!isObject(message)) continue;
+    const createdAt = asNumber(message[MESSAGE_CREATE_TIME_KEY]) ?? null;
     const blocks = message[MESSAGE_CONTENT_BLOCK];
     if (!Array.isArray(blocks)) continue;
     for (const block of blocks) {
       const creations = getPath(block, ['content', 'creation_block', 'creations']);
       if (!Array.isArray(creations)) continue;
       for (const creation of creations) {
-        if (isObject(creation)) visit(creation);
+        if (isObject(creation)) visit(creation, createdAt);
       }
     }
   }
@@ -101,10 +111,12 @@ export function eachCreation(shareInfo: unknown, visit: (creation: Record<string
 export function extractThreadRaw(shareInfo: unknown): RawMedia[] {
   const out: RawMedia[] = [];
 
-  eachCreation(shareInfo, (creation) => {
+  eachCreation(shareInfo, (creation, createdAt) => {
     // 字段映射与 SSE / chain 同构，统一收敛到 common::rawFromCreation
     const media = rawFromCreation(creation, 'thread');
-    if (media) out.push(media);
+    if (!media) return;
+    if (media.createdAt === undefined && createdAt !== null) media.createdAt = createdAt;
+    out.push(media);
   });
 
   return out;

@@ -11,14 +11,14 @@ import {
   CHAIN_FALLBACK_API_KEY,
   CHAIN_VID_DURATION_KEY,
   IMG_DIMS_SUBOBJECTS,
-  IMG_PREVIEW_PATH,
+  IMG_PREVIEW_PATHS,
   IMG_RAW_PATH,
   IMG_THUMB_PATH,
   RESPONSE_CONV_ID_RE,
+  VID_COVER_PATHS,
   VID_DOWNLOAD_PATH,
   VID_MODEL_PATH,
   VID_RAW_PATH,
-  VID_THUMB_PATH,
   VIDEO_ID_KEYS,
   VIDEO_MODEL_DEFINITION_KEY,
   VIDEO_MODEL_LIST_KEY,
@@ -51,6 +51,30 @@ export interface DraftContext {
   convId: string;
   convKind: ConvKind;
   convTitle: string;
+}
+
+/**
+ * 站点时间字段（**秒级** Unix）→ **毫秒** epoch（2026-09-28 第十轮）。
+ *
+ * 站点所有时间字段都是秒级（消息 `create_time`、创作树节点 `create_time`），
+ * 而 `MediaMeta.createdAt` 与 `firstSeen` / `lastSeen` 统一用毫秒 —— 单位换算只在这里做一次。
+ * 非法值（缺省 / 0 / 负数 / NaN）返回 undefined：**宁缺勿假**，不编时间。
+ */
+export function siteTimeToMs(seconds: number | null | undefined): number | undefined {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return Math.round(seconds * 1000);
+}
+
+/** 依序尝试多条字段路径，返回第一个非空字符串（都没有 → undefined，宁缺勿假） */
+export function firstStringValue(
+  creation: Record<string, unknown>,
+  paths: ReadonlyArray<ReadonlyArray<string>>,
+): string | undefined {
+  for (const path of paths) {
+    const value = asString(getPath(creation, [...path]));
+    if (value) return value;
+  }
+  return undefined;
 }
 
 /* --------------------------------------------------------------------------- */
@@ -169,7 +193,11 @@ export function rawFromCreation(creation: unknown, origin: RawMedia['origin']): 
     const raw: RawMedia = {
       kind: 'video',
       origin,
-      thumb: asString(getPath(creation, VID_THUMB_PATH)),
+      /*
+       * 封面：实测在 `video.cover.{image_thumb|image_preview}.url`（2026-09-28 临时探针）。
+       * 旧路径 `video.video_thumb.url` 在当前站点不存在 —— 这就是卡片封面长期为空的根因之一。
+       */
+      thumb: firstStringValue(creation, VID_COVER_PATHS),
       raw: asString(getPath(creation, VID_RAW_PATH)),
       vid: pickVideoId(video),
       downloadUrl: asString(getPath(creation, VID_DOWNLOAD_PATH)),
@@ -200,28 +228,34 @@ export function rawFromCreation(creation: unknown, origin: RawMedia['origin']): 
      * 宽高在 `image_ori_raw / image_ori / image_preview / image_thumb` 各子对象里
      * （全部一致，如 2720×1520）。按「质量最高优先」从子对象取；
      * 顶层的 `image.width` 若站点将来给出，也保留作末位候选。
-     * `size` 整个对象树里都不存在（站点不给），读不到就让它缺省 —— 由界面显示「—」。
+     *
+     * ⛔ **图片的 `size` 一律不读**（2026-09-28 实机反例，`docs/03` §18）。
+     * 原先按「子对象逐个取第一个有值的」读 `size`，于是宽高可能来自 `image_ori_raw`、
+     * 而 `size` 来自**另一个子对象**（如 `image_preview`）——两者根本不是同一个文件。
+     * 实机现象：卡片显示 378 KB，而 `image_ori_raw.url` 下回来的原片是 **3.81 MB 的 PNG**。
+     * 图片体积现在**只由 `background` 实测 `primary` 的真实字节数**得到（`Range: bytes=0-0` → 见
+     * `core/download.ts::parseTotalBytes`、`bg/service-worker.ts::backfillSizes`）：
+     * 从定义上它就是你点下载会拿到的那个文件的字节数。
      */
     let width: number | undefined;
     let height: number | undefined;
-    let size: number | undefined;
     for (const key of IMG_DIMS_SUBOBJECTS) {
       const sub = image[key];
       if (!isObject(sub)) continue;
       width = width ?? asNumber(sub.width);
       height = height ?? asNumber(sub.height);
-      size = size ?? asNumber(sub.size);
-      if (width !== undefined && height !== undefined && size !== undefined) break;
+      if (width !== undefined && height !== undefined) break;
     }
     const raw: RawMedia = {
       kind: 'image',
       origin,
       thumb: asString(getPath(creation, IMG_THUMB_PATH)),
-      preview: asString(getPath(creation, IMG_PREVIEW_PATH)),
+      // 预览图：实测在 `image.preview_img.url`（旧路径 `image_preview` 不存在）
+      preview: firstStringValue(creation, IMG_PREVIEW_PATHS),
       raw: asString(getPath(creation, IMG_RAW_PATH)),
       width: width ?? asNumber(image.width),
       height: height ?? asNumber(image.height),
-      size: size ?? asNumber(image.size),
+      // 有意不写 size：见上面的实测反例
     };
     if (raw.thumb !== undefined || raw.preview !== undefined || raw.raw !== undefined) return raw;
   }
@@ -445,6 +479,12 @@ export function toDraft(raw: RawMedia, ctx: DraftContext): MediaDraft | null {
   if (raw.height !== undefined) meta.height = raw.height;
   if (raw.duration !== undefined) meta.duration = raw.duration;
   if (raw.size !== undefined) meta.size = raw.size;
+  /*
+   * 作品生成时间（2026-09-28 第十轮）：来自**所在消息**的 `create_time`（秒级 → 毫秒）。
+   * 它覆盖所有资源（图片 / 视频 / 已不在创作树里的旧作品），是卡片标签与「最新 / 最早」排序的依据。
+   */
+  const createdMs = siteTimeToMs(raw.createdAt);
+  if (createdMs !== undefined) meta.createdAt = createdMs;
   /*
    * 视频的 width / height 来自报文里 video 对象 —— 实测（`docs/03` §12）那是
    * **预览转码流**的规格（384×216），不是原片规格；打上来源标记，

@@ -66,6 +66,32 @@ function askPageReresolve(vid: string): Promise<string | null> {
   });
 }
 
+/** bg 请求「在页面里定位并预览」时的等待表（key = reqId） */
+let locateReqSeq = 0;
+const pendingLocates = new Map<string, (found: boolean) => void>();
+/** 定位是**同步 DOM 查询**，正常几毫秒就回来；给 5s 足够，超时按「没找到」处理 */
+const LOCATE_TIMEOUT_MS = 5_000;
+
+/**
+ * 让 MAIN world 在页面里定位这条资源并尽力唤起豆包自己的预览（2026-09-28 第十轮）。
+ * 返回是否在 DOM 里找到了它 —— 找不到多半是「消息还没滚到、未渲染」（豆包懒渲染）。
+ */
+function askPageLocate(keys: string[]): Promise<boolean> {
+  return new Promise((resolve) => {
+    const reqId = `l${++locateReqSeq}`;
+    const timer = setTimeout(() => {
+      pendingLocates.delete(reqId);
+      resolve(false);
+    }, LOCATE_TIMEOUT_MS);
+    pendingLocates.set(reqId, (found) => {
+      clearTimeout(timer);
+      pendingLocates.delete(reqId);
+      resolve(found);
+    });
+    postToWindow(envelope('content', MSG.PreviewLocate, { reqId, keys }));
+  });
+}
+
 /**
  * 页面脚本未应答时的兜底：至少能根据 URL 判断页面类型。
  *
@@ -173,6 +199,13 @@ onWindowMessage((env) => {
     return;
   }
 
+  // bg 请求「定位并预览」的应答（page → content）
+  if (env.type === MSG.PreviewLocated) {
+    const payload = env.payload as { reqId?: string; found?: boolean } | undefined;
+    if (payload?.reqId) pendingLocates.get(payload.reqId)?.(payload.found === true);
+    return;
+  }
+
   if (env.type === MSG.MediaCaptured) {
     const drafts = env.payload as MediaDraft[] | undefined;
     if (!Array.isArray(drafts) || !drafts.length) return;
@@ -211,8 +244,24 @@ onRuntimeMessage((env, _sender, sendResponse) => {
     return true;
   }
 
-  if (env.type === MSG.FetchBlob) {
-    const payload = env.payload as { url?: string; filename?: string } | undefined;
+  // bg 请求「在页面里定位这条资源并唤起豆包自己的预览」（资源库卡片的「预览」按钮）
+  if (env.type === MSG.PreviewLocate) {
+    const payload = env.payload as { keys?: string[] } | undefined;
+    const keys = Array.isArray(payload?.keys) ? payload.keys.filter((key) => typeof key === 'string') : [];
+    if (!keys.length) {
+      sendResponse({ found: false });
+      return undefined;
+    }
+    void askPageLocate(keys).then((found) => {
+      diag('content.preview', `定位 keys=${keys.length} → ${found ? 'found' : 'not-found'}`, {
+        level: found ? 'info' : 'warn',
+      });
+      sendResponse({ found });
+    });
+    return true;
+  }
+
+  if (env.type === MSG.FetchBlob) {    const payload = env.payload as { url?: string; filename?: string } | undefined;
     if (!payload?.url || !payload.filename) {
       sendResponse({ ok: false, error: '参数缺失' });
       return undefined;
