@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { LIMITS } from '../src/core/constants';
 import {
   createVidResolver,
   describeVidPayload,
@@ -320,6 +321,47 @@ describe('createVidResolver', () => {
     expect(nodeInfoCalls).toBe(3);
   });
 
+  it('30s 确认窗口的既定复查（confirmation）不受失败冷却限制（§26 补正）', async () => {
+    let clock = 1_000_000;
+    let nodeInfoFail = false;
+    let nodeInfoCalls = 0;
+    const treeWithoutVid = {
+      code: 0,
+      data: { children: [{ id: 'nid-1', key: 'v0other000000', node_type: 6, create_time: 1790520877 }] },
+    };
+    const fn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/samantha/aispace/node_info')) {
+        nodeInfoCalls++;
+        if (nodeInfoFail) {
+          return { ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } } as unknown as Response;
+        }
+        return { ok: true, status: 200, json: async () => treeWithoutVid } as unknown as Response;
+      }
+      const body = url.includes('/samantha/aispace/homepage') ? HOMEPAGE_RESPONSE : DOWNLOAD_INFO_RESPONSE;
+      return { ok: true, status: 200, json: async () => body } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const resolver = createVidResolver({ fetchFn: fn, retryCooldownMs: 180_000, now: () => clock });
+
+    // 首次解析：翻树成功但树里没有该 vid →「首次未见」（pendingConfirm，不落冷却）
+    expect(await resolver.resolve('v0missing00000')).toBeNull();
+    // ⚠️ 复刻 §26 现场：随后的解析撞上限流失败 → 冷却被记录
+    nodeInfoFail = true;
+    clock += 1_000;
+    expect(await resolver.resolve('v0missing00000')).toBeNull();
+    expect(resolver.cooldownOf('v0missing00000')).toBeGreaterThan(0);
+    const callsAfterCooldown = nodeInfoCalls;
+
+    // 冷却期内：普通重放短路（不恶化限流）
+    await resolver.resolve('v0missing00000');
+    expect(nodeInfoCalls).toBe(callsAfterCooldown);
+
+    // 但既定复查（confirmation）不受冷却限制 —— 这是 §26「新视频卡死在解析中」的关键
+    clock += 33_000; // 进入确认窗口（> 30s）
+    await resolver.resolveDetailed('v0missing00000', { confirmation: true });
+    expect(nodeInfoCalls).toBeGreaterThan(callsAfterCooldown);
+  });
+
   it('翻遍整棵树未见：首次只记录（待复查），确认窗口后重扫仍未见才判「已超期」并进负缓存', async () => {
     let clock = 0;
     const calls: string[] = [];
@@ -369,6 +411,44 @@ describe('createVidResolver', () => {
     const fifth = await resolver.resolveDetailed('v0missing');
     expect(fifth).toEqual({ url: null, expired: false, pendingConfirm: true });
     expect(calls.length).toBe(afterConfirm + 2);
+  });
+
+  it('默认结论阈值 = 20s：第 2 轮重扫（2 × 10s）就定案，不必等到 60s（2026-09-29 §31 用户拍板）', async () => {
+    let clock = 0;
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        // 永远翻到底但没有这个 vid（真超期的样子）
+        return ok({ code: 0, data: { children: [{ id: 'nid-1', key: 'v0other000000' }] } });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 10 * 60_000,
+      indexTtlMs: 60_000,
+      now: () => clock,
+      // ⚠️ 故意**不传** expiredConfirmMs —— 本用例验的就是默认值
+    });
+
+    // 口径锁：阈值是 20s（用户拍板：真超期条目别让用户等 60s）
+    expect(LIMITS.VID_EXPIRED_CONFIRM_MS).toBe(20_000);
+
+    // 首次未见 → 只记录，界面保持「解析中」
+    const r0 = await resolver.resolveDetailed('v0missing');
+    expect(r0).toEqual({ url: null, expired: false, pendingConfirm: true });
+
+    // 第 1 轮（+10s）：未到阈值 → 仍是待复查
+    clock += 10_000;
+    const r1 = await resolver.resolveDetailed('v0missing', { confirmation: true });
+    expect(r1).toEqual({ url: null, expired: false, pendingConfirm: true });
+
+    // 第 2 轮（+20s，实际还含每轮 ~2s 的翻树耗时）→ 到阈值 → 定案「原片已超期」+ 进负缓存
+    clock += 10_000;
+    const r2 = await resolver.resolveDetailed('v0missing', { confirmation: true });
+    expect(r2).toEqual({ url: null, expired: true, pendingConfirm: false });
   });
 
   it('新视频稍后出现在树里：确认窗口后的复查直接解析成功（复现第十轮的误判场景）', async () => {

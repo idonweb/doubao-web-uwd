@@ -111,9 +111,13 @@ export function isKeepEvent(event: string): boolean {
  *   ① 条数超过上限 → 丢最旧的
  *   ② 总字节超过上限 → 继续丢最旧的
  *
- * 淘汰分两轮（`docs/03` §3 缺陷 3）：
- *   - **第一轮只丢非关键记录**，保住 `hook.*` / `net.*` / `parse.*` 这条证据链；
- *   - 第一轮丢完仍超限，才从最旧的关键记录开始丢。
+ * 淘汰分三轮（`docs/03` §3 缺陷 3；2026-09-28 §26 补正「关键记录填满缓冲 → 非关键事件失明」）：
+ *   - **第〇轮：关键记录（`hook.*` / `net.*` / `parse.*`）超过配额（75%）的最旧者先让位**。
+ *     没有配额时，缓冲会被 chain 每 30~60s 一条的报文记录填满，第一轮「丢旧非关键」永远
+ *     找不到可丢对象，只好把刚进来的非关键记录自己吞掉 —— `vid.*` / `bg.*` / `draft.emit`
+ *     从此一条都进不了缓冲，诊断永久失明（§26 实测事故，两份诊断 JSON 全程零非关键记录）。
+ *   - **第一轮丢最旧的非关键记录**（不含本次刚追加的最后一条 —— 防自噬）。
+ *   - 第二轮才从最旧的关键记录开始丢（含新记录 —— 绝对兜底）。
  * 至少保留一条（无论多超限），避免刚写入的当前记录被自己挤掉。
  */
 export function pushBounded(
@@ -131,14 +135,34 @@ export function pushBounded(
   let count = next.length;
 
   const over = () => count > maxRecords || (total > maxBytes && count > 1);
+  const keepQuota = Math.max(1, Math.floor(maxRecords * 0.75));
+  const reserved = Math.max(1, maxRecords - keepQuota);
+  let keptCritical = next.filter((r) => isKeepEvent(r.event)).length;
+  let keptNonCritical = next.length - keptCritical;
+  // 只有缓冲里已有（或即将有）非关键记录时才让位 —— 全关键记录的缓冲保留满容量
+  const needRoom = keptNonCritical > 0 || !isKeepEvent(record.event);
 
-  for (let i = 0; i < next.length && over(); i++) {
-    if (isKeepEvent(next[i].event)) continue;
+  // 第〇轮：关键记录超配额 → 最旧的让位（为非关键事件留常驻空间，与是否 over 无关）
+  for (let i = 0; i < next.length && needRoom && keptCritical > keepQuota; i++) {
+    if (!isKeepEvent(next[i].event)) continue;
     dropped[i] = true;
     count--;
     total -= sizes[i];
+    keptCritical--;
   }
 
+  // 第一轮：丢最旧的非关键记录（最后一条 = 本次刚追加的，不参与 —— 防自噬），
+  // 但非关键记录在保留水位（reserved）之上才开始丢 —— 让它们能攒出完整的证据序列
+  for (let i = 0; i < next.length - 1 && over(); i++) {
+    if (isKeepEvent(next[i].event) || dropped[i]) continue;
+    if (keptNonCritical <= reserved) break;
+    dropped[i] = true;
+    count--;
+    total -= sizes[i];
+    keptNonCritical--;
+  }
+
+  // 第二轮：才允许动关键记录与最后一条（绝对兜底）
   for (let i = 0; i < next.length && over(); i++) {
     if (dropped[i]) continue;
     dropped[i] = true;

@@ -293,8 +293,7 @@ export interface VidResolverOptions {
    * 网络层失败后的重试冷却（毫秒），默认 `LIMITS.VID_RETRY_COOLDOWN_MS`。
    * 0 = 不冷却。冷却期内 `resolve()` 直接短路不发请求（`force: true` 不受限）。
    */
-  retryCooldownMs?: number;
-  /** 便于注入时钟（单测用） */
+  retryCooldownMs?: number;  /** 便于注入时钟（单测用） */
   now?: () => number;
   /**
    * 每走完一步回调一次（成功与失败都回调），供调用方写进诊断。
@@ -306,6 +305,12 @@ export interface VidResolverOptions {
 export interface VidResolveOptions {
   /** 忽略缓存，强制重新走三步 API（用于签名过期后的自愈重试） */
   force?: boolean;
+  /**
+   * 标记本次是「30s 确认窗口的**既定复查**」（2026-09-28 §26 补正）。
+   * 复查允许绕过失败冷却 —— 否则新视频会因「创作树提交延迟 + 一次性复查被冷却吞掉」
+   * 长时间停在「解析中」。chain 重放**不得**带此标记（否则冷却失效、死循环回潮）。
+   */
+  confirmation?: boolean;
 }
 
 /**
@@ -620,7 +625,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     const firstAt = misses.get(vid);
     if (firstAt === undefined) {
       misses.set(vid, now());
-      emit('node_info', false, startedAt, { detail: `${head} —— 首次未见，${waitSec}s 后复查仍未见才判定超期` });
+      emit('node_info', false, startedAt, { detail: `${head} —— 首次未见（新作品等待站点入库），将每 10s 重扫；${waitSec}s 仍未见才判定超期` });
       return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: false, pendingConfirm: true };
     }
     const elapsed = now() - firstAt;
@@ -875,11 +880,15 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
       // 「原片已超期」是二次确认后的确定性结论：TTL 内不再重试（到期后允许再确认一次）
       if (freshNegative(vid)) return { url: null, expired: true, pendingConfirm: false };
       /*
-       * 失败冷却（2026-09-28 第十二轮 §23.5）：网络层失败（软限流 / 超时 / 断连）后
+       * 失败冷却（2026-09-28 第十二轮 §24）：网络层失败（软限流 / 超时 / 断连）后
        * 冷却期内直接短路 —— chain 每 ~60s 重放都会重新触发解析，若不冷却就会
        * 「重试 → 重翻 8 页树 → 仍被限流」地死循环。冷却结束后的下一次重放自然恢复。
+       *
+       * ⚠️ 例外（2026-09-28 §26 补正）：`confirmation: true` = 30s 确认窗口的**既定复查**
+       * （由 `scheduleExpiredRecheck` 发起），不受冷却限制 —— 否则新视频会因
+       * 「创作树提交延迟 + 复查被冷却吞掉」长时间停在「解析中」。
        */
-      if (coolingDown(vid) !== null) return none;
+      if (!resolveOptions.confirmation && coolingDown(vid) !== null) return none;
     }
 
     // 已有同一 vid 的在飞请求 → 复用它（在飞结果一定是新鲜的，不必重复发）

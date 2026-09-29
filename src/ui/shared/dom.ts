@@ -124,7 +124,8 @@ const RAW_UNAVAILABLE_TITLE =
 
 /** 状态标签的悬停说明：只有「取不到原片」时有内容，其余返回空串 */
 export function stateTagTitle(item: MediaItem): string {
-  return item.meta.expired && item.state !== 'raw' ? RAW_UNAVAILABLE_TITLE : '';
+  if (item.meta.expired && item.state !== 'raw') return RAW_UNAVAILABLE_TITLE;
+  return '';
 }
 
 /* --------------------------------------------------------------------------- */

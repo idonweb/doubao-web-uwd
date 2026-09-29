@@ -148,3 +148,33 @@ describe('关键记录保留策略（docs/03 §3 缺陷 3）', () => {
     expect(list.some((r) => r.detail === 'k0')).toBe(true);
   });
 });
+
+describe('pushBounded 淘汰（§26 补正：缓冲被关键记录填满时不得吞掉新来的非关键记录）', () => {
+  const crit = (n: number): DiagRecord => makeRecord('page', 'net.xhr', `c${n}`);
+  const nonCrit = (n: number): DiagRecord => makeRecord('bg', 'bg.upsert', `n${n}`);
+
+  it('缓冲全是关键记录且已满时，新来的非关键记录必须存活（超出配额的关键记录让位）', () => {
+    // 400 = DIAG_MAX_RECORDS 条关键记录填满缓冲（配额 75% = 300）
+    let list: DiagRecord[] = Array.from({ length: 400 }, (_, i) => crit(i)); // 显式用 400 上限（非默认 500），场景更紧凑
+    const incoming = nonCrit(999);
+    const next = pushBounded(list, incoming, 400, 900_000);
+    expect(next).toContain(incoming); // ⛔ 修复前：incoming 在第一轮被自己挤掉，诊断从此失明
+    expect(next.filter((r) => isKeepEvent(r.event)).length).toBe(300); // 关键记录退到配额
+    expect(next.some((r) => r.detail === 'c0')).toBe(false); // 让位的是最旧的关键记录
+  });
+
+  it('非关键记录此后可以持续入库（最多占满 25% 余量，FIFO 淘汰最旧）', () => {
+    let list: DiagRecord[] = Array.from({ length: 400 }, (_, i) => crit(i)); // 显式用 400 上限（非默认 500），场景更紧凑
+    for (let n = 1; n <= 10; n++) list = pushBounded(list, nonCrit(n), 400, 900_000);
+    const kept = list.filter((r) => r.event === 'bg.upsert').map((r) => r.detail);
+    expect(kept).toEqual(['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n10']); // 全部存活
+    expect(list.filter((r) => isKeepEvent(r.event)).length).toBe(300); // 关键记录稳定在配额
+  });
+
+  it('非关键洪峰挤不掉配额内的关键记录', () => {
+    let list: DiagRecord[] = Array.from({ length: 300 }, (_, i) => crit(i));
+    for (let n = 1; n <= 200; n++) list = pushBounded(list, nonCrit(n), 400, 900_000);
+    expect(list.filter((r) => isKeepEvent(r.event)).length).toBe(300); // 关键记录一条不少
+    expect(list.filter((r) => r.event === 'bg.upsert').length).toBe(100); // 非关键只保留配额余量
+  });
+});

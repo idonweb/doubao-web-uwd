@@ -6,6 +6,7 @@ import { onRuntimeMessage, sendToBg } from '../../core/messaging';
 import { onStateChanged, type Library } from '../../core/storage';
 import type {
   Config,
+  DiagChangedPayload,
   DownloadProgress,
   DownloadRequest,
   LibraryResponse,
@@ -43,10 +44,10 @@ export async function clearDiag(): Promise<void> {
   await sendToBg(MSG.DiagClear);
 }
 
-export function onDiagChanged(handler: () => void): () => void {
+export function onDiagChanged(handler: (info: DiagChangedPayload) => void): () => void {
   return onRuntimeMessage((env) => {
     if (env.type !== MSG.DiagChanged) return undefined;
-    handler();
+    handler((env.payload ?? {}) as DiagChangedPayload);
     return undefined;
   });
 }

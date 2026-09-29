@@ -259,6 +259,24 @@ export interface StateRequest {
   follow?: boolean;
 }
 
+/**
+ * `diag:changed` 广播的载荷 —— 诊断页据此实时刷新环境卡片。
+ *
+ * 为什么要捎带这两样：诊断页自己去发 `state:get` / `library:list` 问，每次都会让 bg
+ * 向豆包页发 `tab:query`，从而往诊断缓冲里写 `bg.state` / `content.query` / `page.query`
+ * ——三条都是**非关键**记录（`isKeepEvent` 只认 `hook.` / `net.` / `parse.`），
+ * 每秒问一次就足以把 `vid.*` / `bg.upsert` 这些真正要看的记录挤出保留水位（`docs/03` §28.3）。
+ * 广播本来就是库变化与解析过程的副产物，顺手带上快照，观察者就不必再扰动被测对象。
+ */
+export interface DiagChangedPayload {
+  /** 当前诊断记录条数 */
+  count?: number;
+  /** 资源库条数（与 `library:list` 的 `Object.keys(library).length` 同源） */
+  lib?: number;
+  /** 当前会话作用域快照；`null` = 已无激活会话（离开会话已清库） */
+  scope?: ConvScope | null;
+}
+
 /** `download:one` / `download:many` 的入参 */
 export interface DownloadRequest {
   /** 资源库条目 id 列表（从 UI 触发） */

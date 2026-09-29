@@ -70,13 +70,14 @@ body {
 .kv dd.bad {
   color: var(--danger);
 }
-.kv dd.warn {
-  color: var(--warn);
-}
 /* dd 内的行内注记（例如「已自动跟随最近打开的豆包页」），不继承等宽字体 */
 .kv dd .bad {
   color: var(--danger);
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+/* 条数上限注记（如「/ 500」）：红色只表示硬上限，不是错误态；保持等宽与前面的数字对齐 */
+.kv dd .limit {
+  color: var(--danger);
 }
 
 .steps {

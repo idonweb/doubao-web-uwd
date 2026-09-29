@@ -192,6 +192,12 @@ function mergeVariants(base: MediaItem['variants'], incoming: MediaItem['variant
   return dedupeVariants([...base, ...incoming]);
 }
 
+/**
+ * 资源属性合并（白名单）。
+ *
+ * ⚠️ **只放「描述那个可下载文件」的字段** —— 瞬态的子状态（如 `expired`）不在这里搬：
+ * 它随 `state` 变化，由 `upsertDrafts` 显式接管（见那里的说明）。
+ */
 function metaMerge(base: MediaItem['meta'], incoming: MediaItem['meta']): MediaItem['meta'] {
   const out = { ...base };
   for (const key of [

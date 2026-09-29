@@ -46,6 +46,7 @@ import {
 import type {
   Config,
   ConvScope,
+  DiagChangedPayload,
   DownloadProgress,
   DownloadRequest,
   DownloadTarget,
@@ -89,7 +90,21 @@ async function flushDiag(): Promise<void> {
   if (!diagCache) return;
   try {
     await chrome.storage.local.set({ [STORAGE.diag]: diagCache });
-    broadcast(MSG.DiagChanged, { count: diagCache.length });
+    /*
+     * 广播顺带捎上「此刻的环境快照」，诊断页的环境卡片就能跟着日志一起活，
+     * 不必自己发 `state:get` / `library:list` 去问 —— 那两者每次都会经 `tab:query`
+     * 在缓冲里写下 3 条非关键记录（`docs/03` §28.3：观察者扰动了被测对象）。
+     * 触发时机天然正确：库的每次条数变化（`bg.upsert` / `bg.scope`）本身就带一条诊断记录，
+     * 记录 → 400ms 去抖 → 这里，所以「库变了必然广播」。
+     */
+    const library = await getLibrary();
+    const scope = await recallScope();
+    const payload: DiagChangedPayload = {
+      count: diagCache.length,
+      lib: Object.keys(library).length,
+      scope,
+    };
+    broadcast(MSG.DiagChanged, payload);
   } catch {
     /* 诊断写失败不影响业务 */
   }

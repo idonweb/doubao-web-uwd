@@ -10,12 +10,12 @@
 
 import './debug.css';
 
-import { EXT_NAME } from '../../core/constants';
+import { EXT_NAME, LIMITS } from '../../core/constants';
 import { getDiag, clearDiag, getState, listLibrary, onDiagChanged } from '../shared/api';
 import { esc, fmtClock, resolveTheme, toast } from '../shared/dom';
 import { icon } from '../shared/icons';
 import type { DiagRecord } from '../../core/diagnostics';
-import type { LibraryResponse, StateResponse } from '../../core/types';
+import type { DiagChangedPayload, StateResponse } from '../../core/types';
 
 const rootEl = document.getElementById('app');
 if (!rootEl) throw new Error('#app 不存在');
@@ -23,12 +23,27 @@ const root: HTMLElement = rootEl;
 
 let records: DiagRecord[] = [];
 let state: StateResponse | null = null;
-let lib: LibraryResponse | null = null;
+/** 资源库条数：打开页面时取一次打底，之后由 `diag:changed` 广播持续更新 */
+let libCount = 0;
+/** 最近一次广播带来的环境快照；`null` = 还没收到过（卡片退回打开页面时那份 `state`） */
+let liveEnv: DiagChangedPayload | null = null;
+
+/**
+ * 环境卡片的「页面类型 / 会话 ID / 会话标题」——以广播里的会话作用域为准
+ * （那是 bg 此刻的视图，用户在豆包页切会话时会跟着变），还没收到广播才用 `state`。
+ */
+function liveScopeFields(page: StateResponse['page'] | undefined): { kind: string; convId: string; title: string } {
+  if (liveEnv) {
+    const scope = liveEnv.scope ?? null;
+    return { kind: scope?.kind ?? 'none', convId: scope?.convId ?? '', title: scope?.title ?? '' };
+  }
+  return { kind: page?.kind ?? '-', convId: page?.convId ?? '', title: page?.title ?? '' };
+}
 
 function environmentCard(): string {
   const page = state?.page;
-  const injected = page?.injected === true && page.kind !== 'none';
-  const libraryCount = lib ? Object.keys(lib.library).length : 0;
+  const live = liveScopeFields(page);
+  const injected = page?.injected === true && live.kind !== 'none';
 
   return `<div class="card">
     <h2>当前环境</h2>
@@ -36,15 +51,15 @@ function environmentCard(): string {
       <dt>扩展</dt><dd>${esc(EXT_NAME)} v${esc(state?.version ?? '-')}</dd>
       <dt>目标标签页</dt><dd>${esc(page?.url || '（未取到）')}</dd>
       <dt>页面类型</dt>
-      <dd class="${page?.kind === 'none' ? 'bad' : 'ok'}">${esc(page?.kind ?? '-')}${
+      <dd class="${live.kind === 'none' ? 'bad' : 'ok'}">${esc(live.kind)}${
         state?.stale ? ' · 内容脚本未注入（需刷新页面）' : ''
       }</dd>
-      <dt>会话 ID</dt><dd>${esc(page?.convId || '-')}</dd>
-      <dt>会话标题</dt><dd>${esc(page?.title || '-')}</dd>
+      <dt>会话 ID</dt><dd>${esc(live.convId || '-')}</dd>
+      <dt>会话标题</dt><dd>${esc(live.title || '-')}</dd>
       <dt>内容脚本</dt><dd class="${injected ? 'ok' : 'bad'}">${injected ? '已注入' : '未应答'}</dd>
       <dt>过滤纯缩略图开关</dt><dd>${state?.config.skipThumbOnly ? '开启' : '关闭'}</dd>
-      <dt>资源库条数</dt><dd class="${libraryCount ? 'ok' : 'warn'}">${libraryCount}</dd>
-      <dt>诊断记录</dt><dd>${records.length}</dd>
+      <dt>资源库条数</dt><dd class="ok">${libCount}</dd>
+      <dt>诊断记录</dt><dd>${records.length}<span class="limit"> / ${LIMITS.DIAG_MAX_RECORDS}</span></dd>
     </dl>
   </div>`;
 }
@@ -103,7 +118,7 @@ function logCard(): string {
     .join('');
 
   return `<div class="card">
-    <h2>诊断记录（${records.length} 条，最新在上）</h2>
+    <h2>诊断记录（${records.length} 条，最新在上，最大限制条数${LIMITS.DIAG_MAX_RECORDS}）</h2>
     <div class="log">${rows}</div>
   </div>`;
 }
@@ -127,28 +142,32 @@ function render(): void {
 }
 
 /** 组装可复制的报告：环境摘要在最前，方便一眼判断属于哪一类问题 */
-function report(): string {
+async function buildReport(): Promise<string> {
+  /*
+   * 导出是用户主动动作，这里的库**现取一次**：保证 summary 的「条数」与「条目」一致，且都是此刻的值。
+   * 环境卡片为了不扰动诊断缓冲走的是广播快照；导出这一次多一次 `tab:query` 可以接受。
+   */
+  const library = await listLibrary();
   const page = state?.page;
+  const live = liveScopeFields(page);
   const summary = {
     生成时间: new Date().toLocaleString('zh-CN'),
     扩展版本: state?.version,
-    页面类型: page?.kind,
-    内容脚本已注入: page?.injected === true && page?.kind !== 'none',
+    页面类型: live.kind,
+    内容脚本已注入: page?.injected === true && live.kind !== 'none',
     页面需刷新: state?.stale ?? null,
-    会话ID: page?.convId || null,
-    会话标题: page?.title || null,
+    会话ID: live.convId || null,
+    会话标题: live.title || null,
     页面URL: page?.url || null,
     配置: state?.config,
-    资源库条数: lib ? Object.keys(lib.library).length : null,
-    资源库条目: lib
-      ? Object.values(lib.library).map((item) => ({
-          id: item.id,
-          kind: item.kind,
-          state: item.state,
-          variants: item.variants.length,
-          primary: item.primary.slice(0, 120),
-        }))
-      : null,
+    资源库条数: Object.keys(library.library).length,
+    资源库条目: Object.values(library.library).map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      state: item.state,
+      variants: item.variants.length,
+      primary: item.primary.slice(0, 120),
+    })),
     诊断记录数: records.length,
   };
   return JSON.stringify({ summary, records }, null, 2);
@@ -159,7 +178,8 @@ async function reload(): Promise<void> {
   const [diag, st, library] = await Promise.all([getDiag(), getState({ follow: true }), listLibrary()]);
   records = diag;
   state = st;
-  lib = library;
+  // 打底值：此后由 `diag:changed` 广播持续更新 —— 本页不再轮询（见 core/types.ts::DiagChangedPayload）
+  libCount = Object.keys(library.library).length;
   render();
 }
 
@@ -173,21 +193,23 @@ root.addEventListener('click', (event) => {
   }
 
   if (act === 'copy') {
-    void navigator.clipboard
-      .writeText(report())
+    void buildReport()
+      .then((text) => navigator.clipboard.writeText(text))
       .then(() => toast('已复制，粘贴给我即可'))
       .catch(() => toast('复制失败，请用「导出 JSON」', true));
     return;
   }
 
   if (act === 'download') {
-    const blob = new Blob([report()], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `uwd-diag-${Date.now()}.json`;
-    anchor.click();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    void buildReport().then((text) => {
+      const blob = new Blob([text], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `uwd-diag-${Date.now()}.json`;
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    });
     return;
   }
 
@@ -196,7 +218,9 @@ root.addEventListener('click', (event) => {
   }
 });
 
-onDiagChanged(() => {
+onDiagChanged((info) => {
+  liveEnv = info;
+  if (typeof info.lib === 'number') libCount = info.lib;
   void getDiag().then((next) => {
     records = next;
     render();

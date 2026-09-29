@@ -67,11 +67,20 @@ declare global {
   /**
    * vid → 「原片已超期」二次确认的复查定时器（2026-09-28 第十轮）。
    *
-   * 首次「创作树里未见」不下结论，只在这里排一次**有界的一次性复查**（窗口 + 余量）：
-   * 到点后重新解析该 vid，由 resolver 用一棵新鲜的树做二次确认。
+   * 首次「创作树里未见」不下结论，此后**每 10s 一轮重扫**（§27）：每轮由 resolver 用一棵新鲜的树
+   * 判定；找到 → raw，到结论阈值仍未见 → 超期（阈值现为 **20s**，= 第 2 轮，§31）。
    * 每个 vid 至多一个在飞定时器；切换会话 / 页面卸载时统一清掉（守则 4：低频、可停止）。
    */
   const recheckTimers = new Map<string, number>();
+  /**
+   * 重扫轮次上限：8 轮 × 10s = 80s。
+   *
+   * ⚠️ 阈值改为 20s 后（§31），**「待复查」这条路径最多只会用到 2 轮**（第 2 轮即到阈值定案）；
+   * 这个 8 轮上限现在只对另一条路径有意义 —— **不下结论的失败**（确认轮次本身撞上站点软限流，
+   * `docs/03` §26）：轮次未用尽就继续排下一轮（仍带 `confirmation` 绕过冷却），
+   * 用尽后交回失败冷却 + chain 重放的自然节奏。保留 8 是为了给这条路径留够重试余量。
+   */
+  const RECHECK_MAX_ROUNDS = 8;
 
   const vidResolver = createVidResolver({
     concurrency: 2,
@@ -106,13 +115,19 @@ declare global {
    * `expired=true` 是**走完二次确认窗口后**的确定性结论：翻遍整棵创作树仍未见到该 vid
    * （原片已超期），重试无意义；`pendingConfirm=true` 是「首次未见、待复查」，不下结论。
    */
-  async function resolveVidWithDiag(vid: string, force = false): Promise<VidResolveOutcome> {
+  async function resolveVidWithDiag(
+    vid: string,
+    opts: { force?: boolean; confirmation?: boolean } = {},
+  ): Promise<VidResolveOutcome> {
     vidSteps.delete(vid);
-    const outcome = await vidResolver.resolveDetailed(vid, force ? { force: true } : undefined);
+    const outcome = await vidResolver.resolveDetailed(vid, {
+      ...(opts.force ? { force: true } : {}),
+      ...(opts.confirmation ? { confirmation: true } : {}),
+    });
     const steps = vidSteps.get(vid) ?? [];
     vidSteps.delete(vid);
     const failed = steps.find((step) => !step.ok);
-    const suffix = force ? '（重解析）' : '';
+    const suffix = opts.force ? '（重解析）' : '';
     let detail: string;
     if (outcome.url) {
       detail = `vid=${vid} → ok${suffix}（${steps.length} 步）`;
@@ -457,24 +472,28 @@ declare global {
   }
 
   /**
-   * 排一次「原片已超期」二次确认的复查（一次性、低频、可停止，守则 4）。
+   * 「树里首次未见」后的**轮次式重扫**（2026-09-28 §27，用户拍板）。
    *
    * 成因见 `LIMITS.VID_EXPIRED_CONFIRM_MS`：站点创作树对**刚生成的视频有提交延迟**
-   * （实测：生成完成消息到达后 0.5s 查树未见，50s 后同一个查询即可见）——
-   * 「首次未见」不足以判定超期。到点后重新解析该 vid，由 resolver 用**一棵新鲜的树**做二次确认：
-   * 找到 → 正常入库（raw）；仍未见 → 才落「原片已超期」。
-   *
-   * 余量 3s：避开「定时器比确认窗口早几毫秒触发」这种边界。
+   * （观测上界样本：10.19s / 11.7s / 34s / 50s，分布未知）——「首次未见」不足以判定超期。
+   * 每 `VID_RECHECK_INTERVAL_MS`（10s）一轮重扫：
+   * 每轮携带 `confirmation: true` 绕过失败冷却（§26），由 resolver 用**一棵新鲜的树**判定 ——
+   * 找到 → 正常入库（raw）；到结论阈值（**20s = 第 2 轮**，§31）仍未见 → 落「原片已超期」。
+   * 轮次本身也是延迟区间的测量仪器（每次未中收窄下界、命中给出上界，全程留痕诊断）。
+   * 切会话 / 切上下文统一清掉（守则 4：低频、可停止）。
    */
-  function scheduleExpiredRecheck(vid: string, draft: MediaDraft): void {
+  function scheduleTreeRecheck(vid: string, draft: MediaDraft, round: number): void {
     if (recheckTimers.has(vid)) return;
-    const delay = LIMITS.VID_EXPIRED_CONFIRM_MS + 3000;
-    diag('vid.recheck', `vid=${vid} → ${Math.round(delay / 1000)}s 后复查（首次未见，暂不定论）`);
+    const delay = LIMITS.VID_RECHECK_INTERVAL_MS;
+    diag(
+      'vid.recheck',
+      `vid=${vid} → ${Math.round(delay / 1000)}s 后第 ${round}/${RECHECK_MAX_ROUNDS} 轮重扫（新作品等待站点登记进创作树）`,
+    );
     const timer = window.setTimeout(() => {
       recheckTimers.delete(vid);
       // 用户已经切走 → 这次复查没有意义（切回时会重新走 chain 解析）
       if (draft.convId !== (convId || 'unknown')) return;
-      void enrichWithResolvedVid(draft);
+      void enrichWithResolvedVid(draft, { confirmation: true, round });
     }, delay);
     recheckTimers.set(vid, timer);
   }
@@ -485,13 +504,19 @@ declare global {
   }
 
   /** 用 vid 三步 API 的结果补一条高清原片变体，再次上报（同指纹 → 走 upsert 合并） */
-  async function enrichWithResolvedVid(draft: MediaDraft): Promise<void> {
+  async function enrichWithResolvedVid(
+    draft: MediaDraft,
+    recheck: { confirmation: boolean; round: number } = { confirmation: false, round: 0 },
+  ): Promise<void> {
     const vid = draft.vid;
     if (!vid) return;
-    const { url, expired, pendingConfirm } = await resolveVidWithDiag(vid);
+    const { url, expired, pendingConfirm } = await resolveVidWithDiag(
+      vid,
+      recheck.confirmation ? { confirmation: true } : undefined,
+    );
     if (!url) {
       /*
-       * 确定性失败（2026-09-27 Finding C）：翻遍整棵「我的创作」树**且走完二次确认窗口**
+       * 确定性失败（2026-09-27 Finding C）：翻遍整棵「我的创作」树**且走过结论阈值**
        * 仍未见到该 vid —— 站点对创作记录有保存期限，原片永远取不到了。通知 bg 把条目落成
        * 「原片已超期」，取代过去「永远解析中」的挂死状态（网络失败不走这里，仍是可重试的 pending）。
        */
@@ -501,8 +526,28 @@ declare global {
         );
         return;
       }
-      // 树里首次未见（2026-09-28 第十轮）：给站点创作树的提交延迟留余地，排一次复查再定论
-      if (pendingConfirm) scheduleExpiredRecheck(vid, draft);
+      /*
+       * 树里首次未见（2026-09-28 第十轮）= 这是刚生成的作品，站点还没把它登记进创作树：
+       * 条目保持 `pending`（界面就是保底的「解析中」），进入 10s 轮次式重扫（§27），
+       * 直到站点登记进创作树（→ raw）或结论阈值到点（→ 超期）。
+       *
+       * ⚠️ 不再为这条路径发任何额外草稿（原 `emitAwaitCommit` 已删，2026-09-29 §30）：
+       * 它当时只为打 `meta.awaitingCommit` 让卡片显示「新作品入库中」，而那个标签**无法按需
+       * 验证**（触发条件是与站点提交速度的竞态）且会被误读成故障 —— 用户拍板去掉，
+       * 此期间统一用保底的「解析中」。
+       */
+      if (pendingConfirm) {
+        const next = recheck.confirmation ? recheck.round + 1 : 1;
+        if (next <= RECHECK_MAX_ROUNDS) scheduleTreeRecheck(vid, draft, next);
+        return;
+      }
+      /*
+       * 不下结论的失败（2026-09-28 §26）：确认轮次本身也可能撞上软限流 —— 轮次未用尽就排下一轮
+       * （仍带 `confirmation` 绕过冷却）；用尽后交回冷却 + chain 重放的自然恢复节奏。
+       */
+      if (recheck.confirmation && recheck.round < RECHECK_MAX_ROUNDS) {
+        scheduleTreeRecheck(vid, draft, recheck.round + 1);
+      }
       return;
     }
     // 解析是异步的：回来时用户可能已经切走 —— 异会话的增强结果一律丢弃
@@ -1109,7 +1154,7 @@ declare global {
         return;
       }
       // force：必须绕过缓存，否则拿回来的还是那份过期地址
-      void resolveVidWithDiag(vid, true).then((outcome) => {
+      void resolveVidWithDiag(vid, { force: true }).then((outcome) => {
         postToWindow(envelope('page', MSG.VidResolved, { reqId, vid, url: outcome.url }));
       });
     }
