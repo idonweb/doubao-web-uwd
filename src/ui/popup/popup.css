@@ -377,6 +377,38 @@ body {
   background: var(--info-soft);
   backdrop-filter: none;
 }
+/*
+ * 模型药丸（2026-09-30 第十五轮，用户要求）：一眼看出这条视频由哪个模型生成
+ * （`SD-2.5` / `2.0-Fast`…）。紫色系（--model / --model-soft）：与「视频=橙 / 图片=蓝」
+ * 并列的第三个语义色，三者互不混淆。
+ * 两处位置按视图**二选一**：
+ *   · 网格视图 —— 缩略图**左下角**，排在「时长」与「格式」之间（`.pill-model`）；
+ *   · 列表视图 —— 缩略图仅 52px 放不下三个药丸，改放**卡片行内、动作按钮左边**（`.list-model`，用户指定）。
+ */
+.pill-model {
+  color: var(--model);
+  background: var(--model-soft);
+  backdrop-filter: none;
+}
+.list-mode .pill-model {
+  display: none;
+}
+/* 列表视图那一份：卡片行里的浅底紫字小药丸（与状态标签同排高度） */
+.list-model {
+  display: none;
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--model);
+  background: var(--model-soft);
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.list-mode .list-model {
+  display: inline-block;
+}
 
 /* ---------------------------------------------------------------------------
  * 真实生成时间（2026-09-28 第十轮，`meta.createdAt` = 站点 `create_time`）

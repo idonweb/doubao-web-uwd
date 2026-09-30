@@ -8,13 +8,23 @@
  */
 
 import {
+  ABILITY_MODEL_KEY,
+  ABILITY_PARAM_KEY,
+  AI_CREATION_TOOL_LIST_KEY,
   CHAIN_FALLBACK_API_KEY,
   CHAIN_VID_DURATION_KEY,
+  CREATION_WALK_MAX_DEPTH,
   IMG_DIMS_SUBOBJECTS,
   IMG_PREVIEW_PATHS,
   IMG_RAW_PATH,
   IMG_THUMB_PATH,
+  MESSAGE_CREATE_TIME_KEY,
+  MODEL_LABEL_TEXT_RE,
+  MSG_CHAT_ABILITY_KEY,
   RESPONSE_CONV_ID_RE,
+  TOOL_NAME_KEY,
+  TOOL_NAME_TEXT_TO_VIDEO,
+  TOOL_REQ_KEY,
   VID_COVER_PATHS,
   VID_DOWNLOAD_PATH,
   VID_MODEL_PATH,
@@ -486,6 +496,12 @@ export function toDraft(raw: RawMedia, ctx: DraftContext): MediaDraft | null {
   const createdMs = siteTimeToMs(raw.createdAt);
   if (createdMs !== undefined) meta.createdAt = createdMs;
   /*
+   * 模型药丸（2026-09-30 第十五轮 / §35.10）：只给**视频**，且由页面侧在解析后按
+   * 「本条资源自己的生成时刻」从模型提示时间线里就近取值（`page/hook.ts::badgeForRaw`），
+   * 写进 `raw.modelBadge` —— 这里只负责搬运。取不到时字段缺省，界面就不显示药丸。
+   */
+  if (raw.kind === 'video' && raw.modelBadge) meta.modelBadge = raw.modelBadge;
+  /*
    * 视频的 width / height 来自报文里 video 对象 —— 实测（`docs/03` §12）那是
    * **预览转码流**的规格（384×216），不是原片规格；打上来源标记，
    * 界面显示成「预览 384×216」，避免与「720p」清晰度标签互相矛盾。
@@ -562,4 +578,204 @@ export function classifyResponseConv(text: string, currentConvId: string): Respo
   const ids = collectConversationIds(text);
   if (!ids.length) return 'unknown';
   return ids.includes(currentConvId) ? 'match' : 'foreign';
+}
+
+/* --------------------------------------------------------------------------- */
+/* 模型提示（2026-09-29 第十四轮 §34）—— **纯诊断**，不参与任何业务判定           */
+/* --------------------------------------------------------------------------- */
+
+/** 报文里读到的「本次生成用的模型」提示（都读不到就都是 undefined） */
+export interface ModelHints {
+  /** 站点文案里的档位名，实测 `Seedance 2.0 Mini`（**最可信**，见 §2.6） */
+  label?: string;
+  /** `chat_ability.ability_param.model`，实测 `seedance_v2.0` / `seedance_v2.0_std`（用户在输入框选的模型） */
+  model?: string;
+  /** `ext.ai_creation_tool_list[].req_key`，实测 `seedance_v20_fast_flow`（实际跑的流程，**不参与档位判定**） */
+  tool?: string;
+}
+
+/** 提示扫描的节点预算（与 creation 遍历同一量级，防止异常报文上打转） */
+const HINT_WALK_BUDGET = 20_000;
+
+/**
+ * 一条模型提示**事件**（2026-09-30 §35.10）。
+ *
+ * `at` = 提示所在**消息**的 `create_time`（**秒级**，与 `RawMedia.createdAt` 同源、可直接比较）；
+ * 读不到就是 `null` —— 那种事件只能当兜底，不能精确对齐到某条资源。
+ */
+export interface ModelEvent {
+  at: number | null;
+  /** 站点文案里的档位名，如 `Seedance 2.0 Mini`（**最可信的来源**，§35.11） */
+  label?: string;
+  model?: string;
+  tool?: string;
+}
+
+/**
+ * 从一段文本里读站点自报的模型档位名（「本次使用 **Seedance 2.0 Mini** 生成」）。
+ *
+ * 这是**最可信**的一路（站点自己说这次用的是什么），实测四种档位都能这样读到；
+ * 而 `tool`（req_key）已被证伪（Fast 与 Mini 共用 `seedance_v20_fast_flow`，见 §2.6）。
+ * 纯函数、导出给探针复用（`docs/probe-model-fields.js`）。
+ */
+export function readModelLabelText(text: string): string | undefined {
+  if (!text || text.length < 10 || !text.includes('本次使用')) return undefined;
+  const match = MODEL_LABEL_TEXT_RE.exec(text);
+  return match ? match[1].trim() : undefined;
+}
+
+/**
+ * 在解析树上收集**带时间**的模型提示。
+ *
+ * 与 `walkChainCreations` 同一套「消息时间继承」思路：对象自带 `create_time` 就更新当前时间，
+ * 其下的子节点都继承它 —— 这样每条提示都能落回**产生它的那条消息**的时刻。
+ * 字符串字段顺手解一层转义再递归（实测这两处都是**被转义的 JSON 字符串**，见 `site-contract` §2.5）。
+ */
+function collectModelEvents(root: unknown, out: ModelEvent[]): void {
+  const seen = new Set<unknown>();
+  let budget = HINT_WALK_BUDGET;
+
+  const visit = (value: unknown, depth: number, inheritedTime: number | null): void => {
+    if (budget <= 0 || depth > CREATION_WALK_MAX_DEPTH) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1, inheritedTime);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    budget -= 1;
+
+    const obj = value as Record<string, unknown>;
+    const ownTime = asNumber(obj[MESSAGE_CREATE_TIME_KEY]);
+    const time = ownTime ?? inheritedTime;
+
+    const event: ModelEvent = { at: time };
+
+    // ① chat_ability（转义 JSON 字符串）→ ability_param（又一层转义）→ model
+    const ability = parseLooseJson(obj[MSG_CHAT_ABILITY_KEY]);
+    if (isObject(ability)) {
+      const param = parseLooseJson(ability[ABILITY_PARAM_KEY]);
+      if (isObject(param)) {
+        const model = asString(param[ABILITY_MODEL_KEY]);
+        if (model) event.model = model;
+      }
+    }
+
+    // ② ext.ai_creation_tool_list（转义 JSON 数组）→ **只要** video 那条任务的 req_key
+    const list = parseLooseJson(obj[AI_CREATION_TOOL_LIST_KEY]);
+    if (Array.isArray(list)) {
+      const videoEntry = list
+        .filter(isObject)
+        .find((entry) => asString(entry[TOOL_NAME_KEY]) === TOOL_NAME_TEXT_TO_VIDEO);
+      /*
+       * ⚠️ **不得**退到 `entries[0]`（2026-09-30 §35.8 实测修正）：
+       * 一条 `ai_creation_tool_list` 里可能全是**非视频**任务（图片生成 `seedream_v50s_flow`）——
+       * 旧实现 `(videoEntry ?? entries[0])` 会把图片流程当成「视频模型」记下来，
+       * 混进视频条目的药丸推导（实测症状：图文混合会话里药丸直接消失）。
+       * 挑不出 `text_to_video` 就**不取**（宁缺勿假）。
+       */
+      const reqKey = asString(videoEntry?.[TOOL_REQ_KEY]);
+      if (reqKey) event.tool = reqKey;
+    }
+
+    if (event.model || event.tool) out.push(event);
+
+    for (const child of Object.values(obj)) {
+      if (typeof child === 'string') {
+        // 多层转义的 JSON 字符串再往里看一层
+        if (child.length > 2 && (child[0] === '{' || child[0] === '[')) {
+          visit(parseLooseJson(child), depth + 1, time);
+          continue;
+        }
+        /*
+         * 站点文案里的档位名（「本次使用 **Seedance 2.0 Mini** 生成」）—— **最可信的一路**
+         * （§35.11：`tool` 的变体已被证伪，Fast 与 Mini 共用同一个 req_key）。
+         * 文案属于**同一条消息**，所以它天然带对了时间（`time` = 该消息的 create_time）。
+         */
+        const label = readModelLabelText(child);
+        if (label) out.push({ at: time, label });
+        continue;
+      }
+      visit(child, depth + 1, time);
+    }
+  };
+
+  visit(root, 0, null);
+}
+
+/** 去重 + 按时间升序（没有时间的排最后，只能作兜底） */
+function sortModelEvents(events: ModelEvent[]): ModelEvent[] {
+  const uniq: ModelEvent[] = [];
+  const seen = new Set<string>();
+  for (const event of events) {
+    const key = `${event.at ?? '-'}|${event.label ?? ''}|${event.model ?? ''}|${event.tool ?? ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push(event);
+  }
+  return uniq.sort((a, b) => (a.at ?? Number.POSITIVE_INFINITY) - (b.at ?? Number.POSITIVE_INFINITY));
+}
+
+/**
+ * 读一整批报文里的**模型提示时间线**（2026-09-30 §35.10；chain 与 SSE 两种形态都吃）。
+ *
+ * 为什么必须是「时间线」而不是「一个值」：**一个会话里可以换模型** ——
+ * 实测同一个会话的两条视频分别出自 `Seedance 2.0`（21:38）与 `Seedance 2.0 Fast`（11:00）。
+ * 旧实现每批只返回一个值，再靠「记住最近一次」粘给会话里所有条目 → 后一条的模型被安到
+ * 前一条上（用户实测报错）。改成时间线后，每条资源按**自己的 `createdAt`** 就近取用。
+ */
+export function readModelTimeline(text: string): ModelEvent[] {
+  if (!text) return [];
+  /*
+   * 早退闸门：这些特征在报文里都是明文（含转义形态也会带名字），
+   * 一个都没有就**不必解析整份报文** —— 绝大多数批次（包括成片那批）在这里就返回。
+   * `本次使用` 是站点文案里的档位名（§35.11 起的主力来源）。
+   */
+  const hasHint =
+    text.includes(MSG_CHAT_ABILITY_KEY) ||
+    text.includes(AI_CREATION_TOOL_LIST_KEY) ||
+    text.includes('本次使用');
+  if (!hasHint) return [];
+
+  const out: ModelEvent[] = [];
+  const direct = parseLooseJson(text);
+  if (direct !== undefined) collectModelEvents(direct, out);
+
+  // SSE：按 `\n\n` 切事件，取 `data:` 载荷（不依赖 sse.ts，避免模块环）
+  if (!out.some((event) => event.label) || !out.some((event) => event.model) || !out.some((event) => event.tool)) {
+    for (const event of text.split('\n\n')) {
+      const chunks: string[] = [];
+      for (const line of event.split('\n')) {
+        const trimmed = line.trimStart();
+        if (trimmed.startsWith('data:')) chunks.push(trimmed.slice(5).trimStart());
+      }
+      if (!chunks.length) continue;
+      const payload = chunks.join('\n').trim();
+      if (!payload || payload === '[DONE]') continue;
+      const parsed = parseLooseJson(payload);
+      if (parsed === undefined) continue;
+      collectModelEvents(parsed, out);
+    }
+  }
+
+  return sortModelEvents(out);
+}
+
+/**
+ * 从一条响应报文里读「模型提示」的**末值**（chain 与 SSE 两种形态都吃）。
+ *
+ * ⚠️ 语义 = 「这批报文里**最后**一条提示」，只供页面侧做**跨批记忆兜底**
+ * （`page/hook.ts::modelHint`：成片那批报文里没有模型信息）。
+ * **要精确到某一条资源，必须用 `readModelTimeline()` + `pickModelHintAt()`**（§35.10）——
+ * 一个会话里换过模型时，只靠这个末值必然串味（用户实机报错就是这个）。
+ */
+export function readModelHints(text: string): ModelHints {
+  const hints: ModelHints = {};
+  for (const event of readModelTimeline(text)) {
+    if (event.label) hints.label = event.label;
+    if (event.model) hints.model = event.model;
+    if (event.tool) hints.tool = event.tool;
+  }
+  return hints;
 }

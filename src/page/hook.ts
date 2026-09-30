@@ -17,11 +17,12 @@ import { DEFAULT_CONFIG, LIMITS, MSG } from '../core/constants';
 import { makeRecord, sample } from '../core/diagnostics';
 import { envelope, onWindowMessage, postToWindow } from '../core/messaging';
 import { normalizeConfig } from '../core/storage';
-import { RANK, toDrafts, classifyResponseConv, collectConversationIds, type DraftContext } from '../core/extract';
+import { RANK, toDrafts, classifyResponseConv, collectConversationIds, readModelHints, readModelTimeline, type DraftContext, type ModelEvent } from '../core/extract';
 import { extractChainRaw } from '../core/extract/chain';
 import { extractSseRaw } from '../core/extract/sse';
 import { extractThreadRaw, describeTitleFields, findShareInfo, parseFnArgs, shareTitle, FN_ARGS_SELECTOR } from '../core/extract/thread';
 import { dedupeVariants, isUsableCover, mediaLookupKeys, mediaPathKey } from '../core/media-url';
+import { modelBadgeOf, pickModelHintAt } from '../core/model-badge';
 import { qualityFromDims } from '../core/quality';
 import {
   CHAIN_ENDPOINT,
@@ -68,19 +69,31 @@ declare global {
    * vid → 「原片已超期」二次确认的复查定时器（2026-09-28 第十轮）。
    *
    * 首次「创作树里未见」不下结论，此后**每 10s 一轮重扫**（§27）：每轮由 resolver 用一棵新鲜的树
-   * 判定；找到 → raw，到结论阈值仍未见 → 超期（阈值现为 **20s**，= 第 2 轮，§31）。
+   * 判定；找到 → raw；资源还新（入库窗口内）→ 继续等；资源已不新且仍未见 → 超期。
    * 每个 vid 至多一个在飞定时器；切换会话 / 页面卸载时统一清掉（守则 4：低频、可停止）。
    */
   const recheckTimers = new Map<string, number>();
   /**
-   * 重扫轮次上限：8 轮 × 10s = 80s。
+   * 重扫轮次上限：**30 轮 × 10s = 5min**（2026-09-29 第十四轮 §34，用户拍板：间隔固定 10s）。
    *
-   * ⚠️ 阈值改为 20s 后（§31），**「待复查」这条路径最多只会用到 2 轮**（第 2 轮即到阈值定案）；
-   * 这个 8 轮上限现在只对另一条路径有意义 —— **不下结论的失败**（确认轮次本身撞上站点软限流，
-   * `docs/03` §26）：轮次未用尽就继续排下一轮（仍带 `confirmation` 绕过冷却），
-   * 用尽后交回失败冷却 + chain 重放的自然节奏。保留 8 是为了给这条路径留够重试余量。
+   * 之前的 8 轮是「逐轮退避到 60s」的形态（共覆盖 ~4.5min）—— 用户实测后要求**间隔固定在 10s、
+   * 一直保持到 5 分钟**：粒度均匀，便于把「站点登记延迟」测准（轮次就是这个延迟的量尺）。
+   * ⚠️ 成本可控的原因：整个等待期走的是**廉价路径**（吃 5min 索引 + 1 次 head 校验，
+   * 见 `vidResolver` 的 `confirming` 判断），所以 30 轮 ≈ 30 个轻请求，而不是 30 次全量翻树。
+   * ⚠️ 对**老资源**这条路径最多只用到 2 轮：第 2 轮（+20s）即到 20s 结论阈值 → 定案超期。
+   * ⚠️ 30 轮用尽（5min）后不再有定时重扫，之后靠 chain 重放（正常约 60s 一次）与 F5 兜底。
    */
-  const RECHECK_MAX_ROUNDS = 8;
+  const RECHECK_MAX_ROUNDS = 30;
+  /**
+   * 「最近一次在报文里读到的模型提示」（2026-09-29 第十四轮 §34）—— 诊断 + 兜底。
+   *
+   * 用于两处：① 写进 `draft.emit` 便于排查；② 给**没有报文文本**的路径兜底
+   * （分享页 / DOM 扫描：拿不到时间线，只能退回这个记忆值）。
+   * ⚠️ 实测模型信息**不在成片报文里**（在更早的输入消息 / 任务 ack 里），所以要记住；
+   * 切会话时清空（避免把上一个会话的模型名安到新会话上）。
+   * ⚠️ **逐条资源的药丸不走这里**，走时间线就近取用（`attachModelBadges`，§35.10）。
+   */
+  let modelHint: { label?: string; model?: string; tool?: string; at: number } | null = null;
 
   const vidResolver = createVidResolver({
     concurrency: 2,
@@ -113,16 +126,20 @@ declare global {
    * 跑一次 vid 解析，并把「哪一步失败、什么原因」收成一行诊断。
    * 命中缓存不会产生步骤事件，那行会如实写成「未产生步骤事件」而不是编一个原因。
    * `expired=true` 是**走完二次确认窗口后**的确定性结论：翻遍整棵创作树仍未见到该 vid
-   * （原片已超期），重试无意义；`pendingConfirm=true` 是「首次未见、待复查」，不下结论。
+   * （原片已超期），重试无意义；`pendingConfirm=true` 是「首次未见、待复查」，不下结论
+   * —— 也包括「资源刚生成、还等在站点入库窗口内」这一种（§33）。
+   * `resourceAt` = 该资源自身的生成时刻（消息 `create_time`）：有了它，resolver 才能
+   * 区分「刚生成还没入库」与「早已过期」（见 `LIMITS.VID_FRESH_RESOURCE_MS`）。
    */
   async function resolveVidWithDiag(
     vid: string,
-    opts: { force?: boolean; confirmation?: boolean } = {},
+    opts: { force?: boolean; confirmation?: boolean; resourceAt?: number } = {},
   ): Promise<VidResolveOutcome> {
     vidSteps.delete(vid);
     const outcome = await vidResolver.resolveDetailed(vid, {
       ...(opts.force ? { force: true } : {}),
       ...(opts.confirmation ? { confirmation: true } : {}),
+      ...(opts.resourceAt === undefined ? {} : { resourceAt: opts.resourceAt }),
     });
     const steps = vidSteps.get(vid) ?? [];
     vidSteps.delete(vid);
@@ -134,7 +151,7 @@ declare global {
     } else if (outcome.expired) {
       detail = `vid=${vid} → 原片已超期${suffix}：${failed ? formatVidStep(failed) : '未产生步骤事件'}`;
     } else if (outcome.pendingConfirm) {
-      detail = `vid=${vid} → 待复查${suffix}（树里首次未见）：${failed ? formatVidStep(failed) : '未产生步骤事件'}`;
+      detail = `vid=${vid} → 待复查${suffix}（树里未见、未到超期结论）：${failed ? formatVidStep(failed) : '未产生步骤事件'}`;
     } else {
       const cooldown = vidResolver.cooldownOf(vid);
       if (failed) {
@@ -265,6 +282,32 @@ declare global {
       convKind: pageKind === 'thread' ? 'thread' : 'chat',
       convTitle,
     };
+  }
+
+  /**
+   * 给本批 raws **逐条**附上模型药丸文案（2026-09-30 §35.10 / §35.11）。
+   *
+   * 为什么必须逐条：**一个会话里可以换模型** —— 实测同一会话的两条视频分别出自
+   * `Seedance 2.0`（21:38）与 `Seedance 2.0 Fast`（11:00），而模型提示**不在成片那批报文里**。
+   * 旧实现把「最近一次读到的提示」整批粘上去 → 两条视频拿到同一个模型（用户实测报错）。
+   *
+   * 现在的做法：用本批报文里的**模型提示时间线**（每条提示都带自己所在消息的 `create_time`），
+   * 按**本条资源自己的 `createdAt`**（同源的秒级时间）就近取用 —— 模型因此绑到了具体资源上。
+   * 药丸文案的派生以**站点文案**为准（`label`），`tool` 不参与（见 `core/model-badge.ts`）。
+   * `text` 缺失（thread / DOM 兜底路径没有报文）或时间线为空时，退回跨批记忆 `modelHint` 兜底。
+   */
+  function attachModelBadges(raws: RawMedia[], text?: string): void {
+    const timeline: ModelEvent[] = text ? readModelTimeline(text) : [];
+    for (const raw of raws) {
+      if (raw.kind !== 'video') continue; // 模型提示来自视频生成任务，图片不适用
+      const picked = timeline.length ? pickModelHintAt(timeline, raw.createdAt ?? null) : {};
+      const badge = modelBadgeOf({
+        label: picked.label ?? modelHint?.label,
+        model: picked.model ?? modelHint?.model,
+        tool: picked.tool ?? modelHint?.tool,
+      })?.short;
+      if (badge) raw.modelBadge = badge;
+    }
   }
 
   /**
@@ -439,6 +482,49 @@ declare global {
     }
   }
 
+  /**
+   * 拼 `draft.emit` 的模型诊断尾巴。读不到就返回空串 —— **不编造**。
+   *
+   * 两类信息要分清（2026-09-30 §35.10）：
+   *   · `model=` / `tool=` = **跨批记忆里的最近一次提示**（原始值，排查用，带着它的批次时刻）；
+   *   · `badges=` = **本批各条资源实际写入的药丸文案**（逐条计算，同一批里可能各不相同 ——
+   *     这正是「一个会话里换过模型」的可观测证据）。
+   */
+  function modelTag(badges: string[]): string {
+    const parts: string[] = [];
+    if (modelHint?.label) parts.push(`text=${modelHint.label}`);
+    if (modelHint?.model) parts.push(`model=${modelHint.model}`);
+    if (modelHint?.tool) parts.push(`tool=${modelHint.tool}`);
+    if (badges.length) {
+      const counts = new Map<string, number>();
+      for (const badge of badges) counts.set(badge, (counts.get(badge) ?? 0) + 1);
+      parts.push(`badges=${[...counts].map(([badge, n]) => (n > 1 ? `${badge}×${n}` : badge)).join(',')}`);
+    }
+    if (!parts.length) return '';
+    const hhmmss = modelHint ? new Date(modelHint.at).toTimeString().slice(0, 8) : '';
+    return ` ${parts.join(' ')}${hhmmss ? `（最近一次提示取自 ${hhmmss} 的报文）` : ''}`;
+  }
+
+  /**
+   * 读本批报文的模型提示并记住（§34）。
+   *
+   * ⚠️ 实测「模型」信息**不在成片那一批报文里** —— `chat_ability.ability_param.model`
+   * 在**用户输入消息**那批、`ext.ai_creation_tool_list[].req_key` 在**生成任务 ack** 那批，
+   * 所以这里必须记住最近一次读到的值（按字段合并，别用后一批把前一批冲掉），
+   * 由 `modelTag()` 在 `draft.emit` 里标注来源时刻。
+   * 纯诊断：读写都不影响解析与入库；切会话时清空（见 `syncContext`）。
+   */
+  function noteModelHints(text: string): void {
+    const hints = readModelHints(text);
+    if (!hints.label && !hints.model && !hints.tool) return;
+    modelHint = {
+      label: hints.label ?? modelHint?.label,
+      model: hints.model ?? modelHint?.model,
+      tool: hints.tool ?? modelHint?.tool,
+      at: Date.now(),
+    };
+  }
+
   function emitDrafts(drafts: MediaDraft[]): void {
     if (!drafts.length || pageKind === 'none') return;
     const filtered = config.skipThumbOnly ? drafts.filter((draft) => draft.state !== 'thumb') : drafts;
@@ -454,12 +540,17 @@ declare global {
     /*
      * `cover=` 是 2026-09-28 加的诊断：卡片缩略图显示不出来时，一眼就能区分
      * 「站点没给缩略图、页面里也回读不到」与「有 URL 但加载 403（签名/防盗链）」。
+     * 行尾的模型信息见 `modelTag()`：`badges=` 是本批**逐条**算出来的药丸文案（§35.10）。
      */
     diag(
       'draft.emit',
       `in=${drafts.length} out=${filtered.length} skipThumbOnly=${config.skipThumbOnly} cover=${
         filtered.filter((draft) => draft.cover).length
-      }/${filtered.length} kinds=${filtered.map((draft) => `${draft.kind}:${draft.state}`).join(',')}`,
+      }/${filtered.length} kinds=${filtered.map((draft) => `${draft.kind}:${draft.state}`).join(',')}${modelTag(
+        filtered
+          .map((draft) => draft.meta.modelBadge)
+          .filter((badge): badge is string => Boolean(badge)),
+      )}`,
       { level: filtered.length ? 'info' : 'warn' },
     );
     if (!filtered.length) return;
@@ -472,13 +563,15 @@ declare global {
   }
 
   /**
-   * 「树里首次未见」后的**轮次式重扫**（2026-09-28 §27，用户拍板）。
+   * 「树里首次未见」后的**轮次式重扫**（2026-09-28 §27；2026-09-29 §34 定为**固定 10s × 30 轮**）。
    *
-   * 成因见 `LIMITS.VID_EXPIRED_CONFIRM_MS`：站点创作树对**刚生成的视频有提交延迟**
-   * （观测上界样本：10.19s / 11.7s / 34s / 50s，分布未知）——「首次未见」不足以判定超期。
-   * 每 `VID_RECHECK_INTERVAL_MS`（10s）一轮重扫：
-   * 每轮携带 `confirmation: true` 绕过失败冷却（§26），由 resolver 用**一棵新鲜的树**判定 ——
-   * 找到 → 正常入库（raw）；到结论阈值（**20s = 第 2 轮**，§31）仍未见 → 落「原片已超期」。
+   * 成因见 `LIMITS.VID_EXPIRED_CONFIRM_MS` / `VID_FRESH_RESOURCE_MS`：站点创作树对**刚生成的
+   * 视频有提交延迟**（观测上界样本：10.19s / 11.7s / 34s / 50s，§33 实测 >100s，分布未知）
+   * ——「首次未见」不足以判定超期。
+   * 每轮间隔固定 `VID_RECHECK_INTERVAL_MS`（10s），至多 `RECHECK_MAX_ROUNDS`（30 轮 = 5min）；
+   * 每轮带 `confirmation` 绕过失败冷却（§26），由 resolver 判定：
+   * 找到 → 正常入库（raw）；资源仍新（入库窗口内）→ 继续「解析中」不下结论；
+   * 资源已不新且仍未见 → 落「原片已超期」。
    * 轮次本身也是延迟区间的测量仪器（每次未中收窄下界、命中给出上界，全程留痕诊断）。
    * 切会话 / 切上下文统一清掉（守则 4：低频、可停止）。
    */
@@ -510,10 +603,15 @@ declare global {
   ): Promise<void> {
     const vid = draft.vid;
     if (!vid) return;
-    const { url, expired, pendingConfirm } = await resolveVidWithDiag(
-      vid,
-      recheck.confirmation ? { confirmation: true } : undefined,
-    );
+    const { url, expired, pendingConfirm } = await resolveVidWithDiag(vid, {
+      ...(recheck.confirmation ? { confirmation: true } : {}),
+      /*
+       * 资源自身的生成时刻（消息 `create_time`，见踩坑 19）—— 让 resolver 能区分
+       * 「刚生成、站点还没入库」与「早已过期」：前者不下超期结论（§33）。
+       * 拿不到就照旧（年龄未知 → 只看确认阈值）。
+       */
+      ...(draft.meta?.createdAt === undefined ? {} : { resourceAt: draft.meta.createdAt }),
+    });
     if (!url) {
       /*
        * 确定性失败（2026-09-27 Finding C）：翻遍整棵「我的创作」树**且走过结论阈值**
@@ -528,8 +626,11 @@ declare global {
       }
       /*
        * 树里首次未见（2026-09-28 第十轮）= 这是刚生成的作品，站点还没把它登记进创作树：
-       * 条目保持 `pending`（界面就是保底的「解析中」），进入 10s 轮次式重扫（§27），
-       * 直到站点登记进创作树（→ raw）或结论阈值到点（→ 超期）。
+       * 条目保持 `pending`（界面就是保底的「解析中」），进入轮次式重扫（§27），
+       * 直到站点登记进创作树（→ raw）或资源「不再新」后仍未见（→ 超期）。
+       *
+       * ⚠️ 2026-09-29 §33：**只要资源还在入库窗口内，就没有「超期」这个结局** ——
+       * 站在这一支就说明 resolver 已判过年龄（`resourceAt`），我们只需继续排轮次等它入库。
        *
        * ⚠️ 不再为这条路径发任何额外草稿（原 `emitAwaitCommit` 已删，2026-09-29 §30）：
        * 它当时只为打 `meta.awaitingCommit` 让卡片显示「新作品入库中」，而那个标签**无法按需
@@ -649,12 +750,16 @@ declare global {
     }
     const hasCreationBlock = text.includes('creation_block');
     const raws = extractSseRaw(text);
+    // 模型提示（§34）：**必须在 `raws` 为空时也读** —— 实测模型信息正是在没有 creation 的那几批里
+    noteModelHints(text);
     diag(
       'parse.sse',
       `len=${text.length} hasCreationBlock=${hasCreationBlock} raws=${raws.length}`,
       raws.length ? {} : { level: 'warn', text: sample(text, 'creation_block') },
     );
     if (!raws.length) return;
+    // 模型药丸（§35.10）：按**本条资源自己的生成时刻**从本批时间线里就近取值
+    attachModelBadges(raws, text);
     emitDrafts(toDrafts(raws, draftContext()));
   }
 
@@ -674,12 +779,16 @@ declare global {
     const raws = extractChainRaw(text);
     const vidHit = raws.filter((raw) => raw.vid).length;
     const fallbackOnly = raws.filter((raw) => !raw.vid && raw.downloadUrl).length;
+    // 模型提示（§34）：必须在 `raws` 为空时也读（见 handleSse 同处注释）
+    noteModelHints(text);
     diag(
       'parse.chain',
       `len=${text.length} hasMainUrl=${hasMainUrl} raws=${raws.length} vidHit=${vidHit} fallbackOnly=${fallbackOnly}`,
       raws.length ? {} : { level: 'warn', text: sample(text, 'main_url') },
     );
     if (!raws.length) return;
+    // 模型药丸（§35.10）：按**本条资源自己的生成时刻**从本批时间线里就近取值
+    attachModelBadges(raws, text);
     emitDrafts(toDrafts(raws, draftContext()));
   }
 
@@ -883,6 +992,8 @@ declare global {
     }
 
     if (!raws.length) return false;
+    // 模型药丸（§35.10）：分享页这条路径没有报文文本 → 走跨批记忆兜底（读不到就不显示）
+    attachModelBadges(raws);
     emitDrafts(toDrafts(raws, draftContext()));
     return true;
   }
@@ -1026,7 +1137,11 @@ declare global {
       raws.length ? {} : { level: 'warn' },
     );
 
-    if (raws.length) emitDrafts(toDrafts(raws, draftContext()));
+    if (raws.length) {
+      // 模型药丸（§35.10）：DOM 兜底路径只有记忆可用（读不到就不显示）
+      attachModelBadges(raws);
+      emitDrafts(toDrafts(raws, draftContext()));
+    }
   }
 
   function watchVideos(): void {
@@ -1088,6 +1203,8 @@ declare global {
       resetVideoScanMarks();
       // ③ 「原片已超期」二次确认的复查定时器一并作废（它们的目标 vid 属于上一个会话）
       cancelRechecks();
+      // ④ 模型提示也要清（§34）：它是「上一个会话里那个模型」的，安到新会话上就是假数据
+      modelHint = null;
     }
 
     if (pageKind !== 'none') refreshTitle();

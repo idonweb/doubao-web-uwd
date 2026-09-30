@@ -328,3 +328,114 @@ export const DOWNLOAD_INFO_RESPONSE = {
     ],
   },
 };
+
+/* --------------------------------------------------------------------------- */
+/* 「模型提示」样本（2026-09-29 第十四轮 §34）                                     */
+/*                                                                             */
+/* 结构等价样本，形态取自实测报文 `uwd-diag-1790690882278.json`：                  */
+/*   ① 用户输入消息那批 → `chat_ability`（转义 JSON）→ `ability_param`（**又一层** */
+/*      转义 JSON）→ `model`；                                                    */
+/*   ② 生成任务 ack 那批 → `ext.ai_creation_tool_list`（转义 JSON 数组）→          */
+/*      `tool_name === 'text_to_video'` 那条的 `req_key`。                        */
+/* 两层转义直接用嵌套 JSON.stringify 复现（与线上一致，便以验反转义）。            */
+/* --------------------------------------------------------------------------- */
+
+/** 实测值：模型名与流程名 */
+export const MODEL_HINT_MODEL = 'seedance_v2.0';
+export const MODEL_HINT_TOOL = 'seedance_v20_fast_flow';
+
+export const MODEL_HINT_CHAT_ABILITY = {
+  cmd: 3100,
+  downlink_body: {
+    pull_singe_chain_downlink_body: {
+      messages: [
+        {
+          message_id: '1790690096',
+          message_from: 'InputBox',
+          create_time: 1790690259,
+          chat_ability: JSON.stringify({
+            ability_type: 17,
+            ability_param: JSON.stringify({ ratio: '16:9', model: MODEL_HINT_MODEL, duration: 10 }),
+          }),
+        },
+      ],
+    },
+  },
+};
+
+export const MODEL_HINT_TASK_ACK = {
+  cmd: 3100,
+  downlink_body: {
+    pull_singe_chain_downlink_body: {
+      messages: [
+        {
+          message_id: '57060782466202370',
+          create_time: 1790690260,
+          ext: {
+            // 同批还可能有别的任务：视频那条要靠 tool_name 挑出来
+            ai_creation_tool_list: JSON.stringify([
+              { task_id: 57049578737520386, tool_name: 'text_to_video', req_key: MODEL_HINT_TOOL, task_type: 6, status: 5 },
+              { task_id: 57049578737520999, tool_name: 'image_gen', req_key: 'img_v2_flow', task_type: 4, status: 5 },
+            ]),
+          },
+        },
+      ],
+    },
+  },
+};
+
+/**
+ * **纯图片任务**的 ack（实测 2026-09-30 §35.8，`uwd-diag-1790732601526.json`）。
+ *
+ * `ai_creation_tool_list` 里只有图片生成、**没有 `text_to_video`** —— 此时 `tool` 必须「不取」。
+ * 旧实现 `(videoEntry ?? entries[0])` 会退到 `entries[0]`，把图片流程当成视频模型记下来
+ * （实测症状：图文混合会话里视频卡片的模型药丸直接算不出来）。
+ */
+export const MODEL_HINT_IMAGE_ONLY_ACK = {
+  cmd: 3100,
+  downlink_body: {
+    pull_singe_chain_downlink_body: {
+      messages: [
+        {
+          message_id: '57064428028053762',
+          create_time: 1790732000,
+          ext: {
+            ai_creation_tool_list: JSON.stringify([
+              { task_id: 57064428028053763, tool_name: 'image_gen', req_key: 'seedream_v50s_flow', task_type: 4, status: 5 },
+            ]),
+          },
+        },
+      ],
+    },
+  },
+};
+
+/**
+ * **站点文案**里的档位名（2026-09-30 §35.11）—— 模型药丸**最可信**的来源。
+ *
+ * 实测形态（用户截图）：任务 ack 消息的文本块里写着
+ * 「本次使用 **Seedance 2.0 Mini** 生成，大约需要 1-3 分钟。」（4 种档位都能这样读到）。
+ * 之所以以它为准：`tool` 的变体已被证伪 —— Mini 档位跑的也是 `seedance_v20_fast_flow`。
+ */
+export const MODEL_LABEL_TEXT = '本次使用 **Seedance 2.0 Mini** 生成，大约需要 1-3 分钟。';
+export const MODEL_LABEL_NAME = 'Seedance 2.0 Mini';
+/**
+ * **老版文案**（2026-09-30 §35.13）：站点把 **2.0 Fast** 档位写成「全能视频模型」——
+ * 实测原文见下，用户确认它不是标准版（认不出就会把 Fast 标成 `SD-2.0`）。
+ */
+export const MODEL_LABEL_LEGACY_TEXT = '本次使用 **Seedance 2.0 全能视频模型** 生成，将消耗 2 个视频生成额度，预计等待 5 分钟。';
+export const MODEL_LABEL_LEGACY_NAME = 'Seedance 2.0 全能视频模型';
+export const MODEL_LABEL_MESSAGE = {
+  cmd: 3100,
+  downlink_body: {
+    pull_singe_chain_downlink_body: {
+      messages: [
+        {
+          message_id: '57064428028053764',
+          create_time: 1790731700,
+          content: JSON.stringify({ blocks: [{ type: 1, text: MODEL_LABEL_TEXT }] }),
+        },
+      ],
+    },
+  },
+};

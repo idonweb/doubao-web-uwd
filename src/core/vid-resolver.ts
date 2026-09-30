@@ -290,6 +290,14 @@ export interface VidResolverOptions {
    */
   expiredConfirmMs?: number;
   /**
+   * 「新作品入库窗口」（毫秒），默认 `LIMITS.VID_FRESH_RESOURCE_MS`。
+   *
+   * 资源**自身的生成时间**（调用方通过 `resourceAt` 传入）距今不足这个时长时，
+   * 「树里翻到底没有它」**不下超期结论** —— 刚生成的作品缺树只可能是站点入库延迟（§33）。
+   * `0` = 关掉闸门（旧行为：只看 `expiredConfirmMs`）。
+   */
+  freshResourceMs?: number;
+  /**
    * 网络层失败后的重试冷却（毫秒），默认 `LIMITS.VID_RETRY_COOLDOWN_MS`。
    * 0 = 不冷却。冷却期内 `resolve()` 直接短路不发请求（`force: true` 不受限）。
    */
@@ -306,11 +314,19 @@ export interface VidResolveOptions {
   /** 忽略缓存，强制重新走三步 API（用于签名过期后的自愈重试） */
   force?: boolean;
   /**
-   * 标记本次是「30s 确认窗口的**既定复查**」（2026-09-28 §26 补正）。
+   * 标记本次是「确认窗口的**既定复查**」（2026-09-28 §26 补正）。
    * 复查允许绕过失败冷却 —— 否则新视频会因「创作树提交延迟 + 一次性复查被冷却吞掉」
    * 长时间停在「解析中」。chain 重放**不得**带此标记（否则冷却失效、死循环回潮）。
    */
   confirmation?: boolean;
+  /**
+   * 该资源**自身的生成时刻**（毫秒 epoch），来自所在消息的 `create_time`（见踩坑 19）。
+   *
+   * 用来判「这还是一部刚生成的作品吗」：刚生成的作品缺树是**站点入库延迟**，
+   * 不下任何结论（§33）；不新了才可能是「超出约三个月保存期」。
+   * 不传 = 年龄未知 → 保持旧行为（只看 `expiredConfirmMs`）。
+   */
+  resourceAt?: number;
 }
 
 /**
@@ -320,9 +336,10 @@ export interface VidResolveOptions {
  * 该 vid —— 站点对创作记录有保存期限，原片永远取不到，重试无意义。
  * `expired = false` 的失败只是「这次没成」（网络 / 超时 / 达翻页上限），仍然可重试。
  *
- * `pendingConfirm = true`：树里未见，但**还没走完二次确认窗口** —— 不下任何结论，
- * 调用方应在窗口后**再确认一次**。成因见 `LIMITS.VID_EXPIRED_CONFIRM_MS`：
- * 站点创作树对刚生成的视频有提交延迟，「一次未见」不等于「已超期」（实测 50 秒后即可见）。
+ * `pendingConfirm = true`：树里未见，但**还没走完二次确认窗口**（或资源仍是「新作品」，见
+ * `LIMITS.VID_FRESH_RESOURCE_MS`）—— 不下任何结论，调用方应稍后**再确认一次**。
+ * 成因见 `LIMITS.VID_EXPIRED_CONFIRM_MS`：站点创作树对刚生成的视频有提交延迟，
+ * 「一次未见」不等于「已超期」（实测 50 秒后即可见，§33 样本 >100 秒）。
  */
 export interface VidResolveOutcome {
   url: string | null;
@@ -361,9 +378,20 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   const ttlMs = options.ttlMs ?? LIMITS.VID_RESOLVE_TTL_MS;
   const indexTtlMs = options.indexTtlMs ?? LIMITS.VID_INDEX_TTL_MS;
   const expiredConfirmMs = options.expiredConfirmMs ?? LIMITS.VID_EXPIRED_CONFIRM_MS;
+  const freshResourceMs = options.freshResourceMs ?? LIMITS.VID_FRESH_RESOURCE_MS;
   const retryCooldownMs = options.retryCooldownMs ?? LIMITS.VID_RETRY_COOLDOWN_MS;
   const now = options.now ?? (() => Date.now());
   const onStep = options.onStep;
+
+  /*
+   * 资源是否仍在「新作品入库窗口」内（§33）—— 见 `LIMITS.VID_FRESH_RESOURCE_MS`：
+   * 刚生成的作品缺树 = 站点入库延迟，既不下超期结论，也不做昂贵的轮次翻树。
+   * 生成时间未知（`resourceAt` 缺省 / 站点没给消息 `create_time`）→ 闸门不生效，保持旧行为。
+   */
+  function isFreshResource(resourceAt?: number): boolean {
+    if (freshResourceMs <= 0 || resourceAt === undefined) return false;
+    return now() - resourceAt < freshResourceMs;
+  }
 
   /** vid → { url, meta, cover, at }；`at` 用于 TTL 判定 */
   const cache = new Map<string, { url: string; meta: VidMeta; cover: string | null; at: number }>();
@@ -568,11 +596,13 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     vid: string,
     startedAt: number,
     info: { total: number; pages: number; lastPage: unknown },
+    ageMs?: number,
   ): void {
     emit('node_info', false, startedAt, {
       detail:
         `没有 key=${vid} 的条目（${describeVidPayload(info.lastPage, 'children')}；` +
-        `全树 ${info.total} 条/${info.pages} 页已到底，二次确认仍未见 → 原片已超期）`,
+        `全树 ${info.total} 条/${info.pages} 页已到底，二次确认仍未见 → 原片已超期` +
+        `${ageMs === undefined ? '；作品生成时间未知' : `；该作品生成于 ${(ageMs / 60_000).toFixed(1)}min 前，已过入库窗口`}）`,
     });
   }
 
@@ -607,25 +637,31 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   };
 
   /**
-   * 「树里未见」的统一处置（2026-09-28 第十轮：二次确认窗口）。
+   * 「树里未见」的统一处置（2026-09-28 第十轮：二次确认窗口；2026-09-29 §33：年龄闸门）。
    *
    * 站点创作树对**刚生成的视频有提交延迟**：实测生成完成消息到达后 0.5s 查树「翻到底未见」，
-   * 50s 后同一个查询就能查到（树 148 → 149 条）。所以「一次未见」不足以判定超期：
-   *   · 窗口内的首次未见 → 只记录，返回 `pendingConfirm`（界面保持「解析中」，稍后复查）；
-   *   · 窗口到点后（调用方会重新扫一棵新鲜的树）仍未见 → 才落负缓存 +「原片已超期」。
+   * 50s 后同一个查询就能查到（树 148 → 149 条）；§33 的实机样本更极端 —— 21:38:27 生成、
+   * 21:38:51 就「翻到底未见」满两次，而到 21:40:07 树条目数仍纹丝不动（还是 152 条）。
+   * 所以「一次未见」不足以判定超期，「等够时间再未见」也不够 —— 延迟本身没有上界，
+   * 唯一可靠的区分信号是**这部作品还新不新**：
+   *   · 窗口（`expiredConfirmMs`）内的首次未见 → 只记录，返回 `pendingConfirm`（界面保持「解析中」）；
+   *   · 窗口到点后仍未见，但**资源本身还在「新作品入库窗口」内**（`VID_FRESH_RESOURCE_MS`，
+   *     依据消息 `create_time`）→ 仍不下结论：刚生成的作品缺树 = 站点入库延迟，返回 `pendingConfirm`；
+   *   · 窗口到点后仍未见**且资源已经不新** → 才落负缓存 +「原片已超期」。
    */
   function concludeMiss(
     vid: string,
     startedAt: number,
     emit: StepEmit,
     info: { total: number; pages: number; lastPage: unknown },
+    resourceAt?: number,
   ): NodeLookup {
     const waitSec = Math.round(expiredConfirmMs / 1000);
     const head = `没有 key=${vid} 的条目（${describeVidPayload(info.lastPage, 'children')}；全树 ${info.total} 条/${info.pages} 页已到底）`;
     const firstAt = misses.get(vid);
     if (firstAt === undefined) {
       misses.set(vid, now());
-      emit('node_info', false, startedAt, { detail: `${head} —— 首次未见（新作品等待站点入库），将每 10s 重扫；${waitSec}s 仍未见才判定超期` });
+      emit('node_info', false, startedAt, { detail: `${head} —— 首次未见（新作品等待站点入库），将轮次式重扫；${waitSec}s 仍未见才判定超期` });
       return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: false, pendingConfirm: true };
     }
     const elapsed = now() - firstAt;
@@ -635,9 +671,24 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
       });
       return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: false, pendingConfirm: true };
     }
+    /*
+     * 年龄闸门（2026-09-29 §33）：窗口到了，但这部作品**刚生成**（消息 create_time 在
+     * `VID_FRESH_RESOURCE_MS` 内）—— 此刻缺树只说明站点还没把它登记进「我的创作」，
+     * 不是「超出保存期」。此时既不下超期结论、也不落负缓存，继续保持「解析中」等待，
+     * 由调用方的轮次重扫 / chain 重放自然接续（树一长出来立刻转 raw）。
+     */
+    const ageMs = resourceAt === undefined ? undefined : now() - resourceAt;
+    if (ageMs !== undefined && freshResourceMs > 0 && ageMs < freshResourceMs) {
+      emit('node_info', false, startedAt, {
+        detail:
+          `${head} —— 距首次未见 ${(elapsed / 1000).toFixed(1)}s，但该作品生成于 ${(ageMs / 60_000).toFixed(1)}min 前` +
+          `（< ${(freshResourceMs / 60_000).toFixed(0)}min 入库窗口）→ 判定为**站点登记延迟**，不下超期结论`,
+      });
+      return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: false, pendingConfirm: true };
+    }
     misses.delete(vid);
     negatives.set(vid, now());
-    emitDefinitiveMiss(emit, vid, startedAt, info);
+    emitDefinitiveMiss(emit, vid, startedAt, info, ageMs);
     return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: true, pendingConfirm: false };
   }
 
@@ -651,13 +702,21 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     force: boolean,
     startedAt: number,
     emit: StepEmit,
+    resourceAt?: number,
   ): Promise<NodeLookup> {
     /*
      * 本次是不是「窗口到点后的复查」？复查一律重新扫一棵新鲜的树（不吃索引缓存）——
      * 因为要确认的正是「树长出来了吗」，拿旧索引回答等于没复查。
+     *
+     * ⚠️ 例外（2026-09-29 §33）：资源本身还在「新作品入库窗口」内时**不**做这件事 ——
+     * 那种情况下我们已经知道结论必然是「继续等」（见 `concludeMiss` 的年龄闸门），
+     * 若还每轮完整翻树，就会把等待期（可达分钟级）变成持续的翻页请求。
+     * 此时退回**廉价路径**：吃索引 + 一次 head 校验（1 个请求）；head 变了（树长高了）
+     * 才会落到下面的全量扫描 —— 而索引本身 5min 过期，兜底也不会漏掉中间插入的新条目。
      */
     const firstAt = misses.get(vid);
-    const confirming = firstAt !== undefined && now() - firstAt >= expiredConfirmMs;
+    const confirming =
+      firstAt !== undefined && now() - firstAt >= expiredConfirmMs && !isFreshResource(resourceAt);
 
     // 命中新鲜索引 → 直接查（一次扫描服务多个 vid，不重复翻树）
     const cached = force || confirming ? null : freshIndex(cid);
@@ -691,7 +750,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
             total: cached.total,
             pages: cached.pages,
             lastPage: headRaw,
-          });
+          }, resourceAt);
         }
         // head 变了 → 树有更新，走下面的全量扫描
       } else {
@@ -748,7 +807,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
         total: walk.index.total,
         pages: walk.index.pages,
         lastPage: walk.lastPage,
-      });
+      }, resourceAt);
     }
     emit('node_info', false, startedAt, {
       detail: `没有 key=${vid} 的条目（${walk.index.total} 条/${walk.index.pages} 页达翻页上限，暂不定论）`,
@@ -781,6 +840,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   async function runThreeSteps(
     vid: string,
     force: boolean,
+    resourceAt?: number,
   ): Promise<VidResolveOutcome & { meta: VidMeta; cover?: string | null }> {
     const emit: StepEmit = (step, ok, startedAt, extra = {}) => {
       onStep?.({ vid, step, ok, ms: Math.max(0, now() - startedAt), ...extra });
@@ -804,7 +864,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
 
     // ---- 第 2 步：按 vid 找该视频的 node id（有界翻页 + 索引缓存 + 二次确认，2026-09-27/28） ----
     startedAt = now();
-    const lookup = await findNodeForVid(cid, vid, force, startedAt, emit);
+    const lookup = await findNodeForVid(cid, vid, force, startedAt, emit, resourceAt);
     if (!lookup.nodeId) {
       return {
         url: null,
@@ -899,7 +959,7 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
     const task = (async (): Promise<VidResolveOutcome> => {
       await acquire();
       try {
-        const outcome = await runThreeSteps(vid, force);
+        const outcome = await runThreeSteps(vid, force, resolveOptions.resourceAt);
         if (outcome.url) {
           cache.set(vid, { url: outcome.url, meta: outcome.meta, cover: outcome.cover ?? null, at: now() });
           forgetMiss(vid);

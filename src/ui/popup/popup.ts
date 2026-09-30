@@ -204,6 +204,31 @@ function viewData(): ViewData {
   return { items: group?.items ?? [], deduped: group?.deduped ?? 0, counts: result.counts };
 }
 
+/**
+ * 模型药丸（2026-09-30 第十五轮）—— **视频卡片缩略图左下角**，位置在「时长」与「格式」之间。
+ *
+ * 文案是简称（`SD-2.5` / `2.0-Fast`…），由报文里的模型提示折算（`core/model-badge.ts`）；
+ * 只有读出提示的条目才有这个药丸，读不到就不显示 —— **不编造模型名**。
+ * 悬停给出该简称的含义。模型提示来自更早批次的报文，具体原始值见诊断页。
+ */
+function modelPill(item: MediaItem): string {
+  const badge = item.meta.modelBadge;
+  if (!badge) return '';
+  return `<span class="pill pill-model" title="本次生成使用的模型：${esc(badge)}">${esc(badge)}</span>`;
+}
+
+/**
+ * 模型药丸 · **列表视图**（2026-09-30 用户要求补）—— 列表行内、动作按钮**左边**。
+ *
+ * 与网格视图同一个值（`meta.modelBadge`），只是位置不同：网格视图在缩略图左下角（放得下三个药丸），
+ * 列表视图缩略图仅 52px，故挪到卡片行里、按钮组之前。两处按视图二选一显示，不会重复出现。
+ */
+function listModelPill(item: MediaItem): string {
+  const badge = item.meta.modelBadge;
+  if (!badge) return '';
+  return `<span class="list-model" title="本次生成使用的模型：${esc(badge)}">${esc(badge)}</span>`;
+}
+
 function cardHtml(item: MediaItem): string {
   const tag = STATE_TAG[item.state];
   const isSel = selected.has(item.id);
@@ -234,6 +259,7 @@ function cardHtml(item: MediaItem): string {
       ${whenPill}
       <div class="thumb-ov">
         ${item.meta.duration ? `<span class="pill">${esc(fmtDuration(item.meta.duration))}</span>` : ''}
+        ${modelPill(item)}
         <span class="pill ${item.kind === 'video' ? 'pill-fmt' : 'pill-fmt-img'}">${esc((item.meta.ext || 'bin').toUpperCase())}</span>
       </div>
       <div class="ck">${icon('check')}</div>
@@ -241,6 +267,7 @@ function cardHtml(item: MediaItem): string {
     <div class="card-body">
       <div class="card-tags"><span class="tag ${tag.cls}"${tagTitle ? ` title="${esc(tagTitle)}"` : ''}>${icon(tag.icon)}${esc(stateTagLabel(item))}</span></div>
       <div class="card-meta" title="${esc(item.primary)}">${whenMeta}${esc(itemMetaLine(item))}</div>
+      ${listModelPill(item)}
       <div class="card-actions">
         <button class="act" data-act="dl" data-id="${esc(item.id)}" title="下载无水印原片">${icon('dl')}下载</button>
         <button class="act" data-act="cp" data-id="${esc(item.id)}" title="复制无水印原片地址">${icon('copy')}复制</button>

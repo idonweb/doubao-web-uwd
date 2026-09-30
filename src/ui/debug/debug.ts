@@ -81,7 +81,10 @@ function stepsCard(): string {
             <li><code>vid.step</code> / <code>vid.resolve</code> / <code>vid.recheck</code> → 无水印原片三步 API：
               <code>vid.step</code> 会写清<b>哪一步失败、HTTP 状态、耗时与原因</b>（卡片长期停在
               「解析中」时看这三行）；<code>vid.recheck</code> 是「树里首次未见、暂不定论」后
-              排的那次复查（约 33s 后），复查仍未见才会出现「原片已超期」</li>
+              排的轮次式重扫（10s 起步、退避到 60s，共 8 轮）。<b>「原片已超期」只在作品已经
+              不新（生成时间距今 &gt; 30min）时才可能给出</b>；刚生成的作品缺树只会一路保持
+              「解析中」等站点登记进创作树（<code>vid.step</code> 会写明「该作品生成于 N min 前 → 判定为
+              站点登记延迟」）</li>
             <li><code>bg.upsert</code> → 入库结果（<code>skipped</code> 多说明被「过滤纯缩略图」挡了）</li>
           </ul>
         </li>

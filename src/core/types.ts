@@ -56,6 +56,17 @@ export interface MediaMeta {
   /** 清晰度标签 */
   label?: string;
   /**
+   * 模型标识（2026-09-30 第十五轮）：卡片缩略图左下角的「模型药丸」，如 `SD-2.5` / `2.0-Fast`。
+   *
+   * 来源 = 报文里的模型提示（`site-contract` §2.5）经 `core/model-badge.ts` 折算。
+   * ⚠️ 该提示**不在成片那批报文里**（在更早的输入消息 / 任务 ack 里），页面侧是按
+   * 「emit 时刻记住的值」快照的（`page/hook.ts::modelHint`）—— 同一会话里换过模型时，
+   * 相邻资源的标签理论上可能串味（极窄窗口，代价换「不为此多拉报文」）。
+   * 读不到 / 认不出时为 `undefined`：**界面不显示药丸，也不编造模型名**。
+   * ⚠️ 与 `RawMedia.videoModel`（`video_model` 内嵌 JSON，指转码规格）无关，别混。
+   */
+  modelBadge?: string;
+  /**
    * 原片已超期（2026-09-27 Finding C 修复；2026-09-28 第十轮改为**弱结论**）。
    *
    * `true` = 页面侧已**翻遍整棵「我的创作」树**（且走完 30s 二次确认窗口）仍未找到该 vid ——
@@ -145,6 +156,14 @@ export interface RawMedia {
    * `dom` 的 `raw` 是本地改写猜测（实测已不能去水印），会被 `toDraft` 丢弃（J3：宁缺勿假）。
    */
   origin?: 'sse' | 'chain' | 'thread' | 'dom';
+  /**
+   * 模型药丸文案（2026-09-30 §35.10）—— **由页面侧在解析后写入**：
+   * 拿本条资源自己的 `createdAt` 去模型提示时间线里就近取提示，再折算成药丸文案
+   * （`core/model-badge.ts::pickModelHintAt / modelBadgeOf`）。
+   * `toDraft` 只负责把它搬进 `meta.modelBadge`；取不到时缺省（界面不显示药丸，不编造）。
+   * 只对视频有意义（模型提示来自视频生成任务）。
+   */
+  modelBadge?: string;
 }
 
 export interface Config {

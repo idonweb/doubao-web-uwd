@@ -197,6 +197,10 @@ function mergeVariants(base: MediaItem['variants'], incoming: MediaItem['variant
  *
  * ⚠️ **只放「描述那个可下载文件」的字段** —— 瞬态的子状态（如 `expired`）不在这里搬：
  * 它随 `state` 变化，由 `upsertDrafts` 显式接管（见那里的说明）。
+ *
+ * `modelBadge`（2026-09-30 §35.11 起）**在白名单里**：它描述「这个文件是哪个模型生成的」，
+ * 且取值已按**每条资源自己的生成时刻**从模型时间线就近取（§35.10），重放同一批报文结果稳定；
+ * 进白名单才能让历史条目上早先算错的值被修正（否则 F5 / 切会话后错误标记永远粘着）。
  */
 function metaMerge(base: MediaItem['meta'], incoming: MediaItem['meta']): MediaItem['meta'] {
   const out = { ...base };
@@ -210,6 +214,7 @@ function metaMerge(base: MediaItem['meta'], incoming: MediaItem['meta']): MediaI
     'size',
     'label',
     'createdAt',
+    'modelBadge',
   ] as const) {
     const value = incoming[key];
     if (value !== undefined && value !== null && value !== '') {

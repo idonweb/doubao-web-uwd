@@ -451,6 +451,150 @@ describe('createVidResolver', () => {
     expect(r2).toEqual({ url: null, expired: true, pendingConfirm: false });
   });
 
+  it('§33 年龄闸门：刚生成的作品缺树时，走过 20s 确认阈值也**不**判「原片已超期」（复现 21:38 的误判）', async () => {
+    let clock = 1_790_700_000_000;
+    const calls: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        // 站点创作树的条目数纹丝不动（§33 现场：一直 152 条），里边没有这个新 vid
+        return ok({ code: 0, data: { children: [{ id: 'nid-1', key: 'v0old00000001' }] } });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 10 * 60_000,
+      indexTtlMs: 60_000,
+      now: () => clock,
+    });
+
+    // 口径锁：入库窗口 30min、确认阈值仍是 20s（用户拍板，§31 不改）
+    expect(LIMITS.VID_FRESH_RESOURCE_MS).toBe(30 * 60_000);
+    expect(LIMITS.VID_EXPIRED_CONFIRM_MS).toBe(20_000);
+
+    // 消息时间 = 27s 前（对应「21:38:27 生成 → 21:38:54 判定」那一刻）
+    const fresh = clock - 27_000;
+    const r0 = await resolver.resolveDetailed('v0new0000001', { resourceAt: fresh });
+    expect(r0).toEqual({ url: null, expired: false, pendingConfirm: true });
+
+    // 第 1 轮（+10s）：未到阈值，仍是待复查
+    clock += 10_000;
+    expect(await resolver.resolveDetailed('v0new0000001', { resourceAt: fresh, confirmation: true })).toEqual({
+      url: null,
+      expired: false,
+      pendingConfirm: true,
+    });
+
+    // 第 2 轮（+30s，早已越过 20s 确认阈值）→ **不判超期**：作品才生成 ~57s
+    clock += 20_000;
+    expect(await resolver.resolveDetailed('v0new0000001', { resourceAt: fresh, confirmation: true })).toEqual({
+      url: null,
+      expired: false,
+      pendingConfirm: true,
+    });
+
+    // 且**没有**落负缓存：接着问仍然真的去查树（不是短路复用否定结论）
+    const before = calls.length;
+    await resolver.resolveDetailed('v0new0000001', { resourceAt: fresh });
+    expect(calls.length).toBeGreaterThan(before);
+
+    // 等到作品「不再新」（生成已 31min）仍未见 → 这时才允许落回超期结论
+    clock = fresh + 31 * 60_000;
+    expect(await resolver.resolveDetailed('v0new0000001', { resourceAt: fresh })).toEqual({
+      url: null,
+      expired: true,
+      pendingConfirm: false,
+    });
+  });
+
+  it('§33 年龄闸门不误伤老资源：生成于 2 小时前的作品缺树 → 阈值到点照旧判超期并进负缓存', async () => {
+    let clock = 1_790_700_000_000;
+    const calls: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        return ok({ code: 0, data: { children: [{ id: 'nid-1', key: 'v0other000000' }] } });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 10 * 60_000,
+      indexTtlMs: 1_000,
+      expiredConfirmMs: 20_000,
+      now: () => clock,
+    });
+    const old = clock - 2 * 60 * 60_000;
+
+    expect(await resolver.resolveDetailed('v0missing', { resourceAt: old })).toEqual({
+      url: null,
+      expired: false,
+      pendingConfirm: true,
+    });
+
+    clock += 30_000;
+    expect(await resolver.resolveDetailed('v0missing', { resourceAt: old, confirmation: true })).toEqual({
+      url: null,
+      expired: true,
+      pendingConfirm: false,
+    });
+
+    // 负缓存：TTL 内再问一次不再发请求
+    const after = calls.length;
+    await resolver.resolveDetailed('v0missing', { resourceAt: old });
+    expect(calls.length).toBe(after);
+  });
+
+  it('§33：新作品等待期内只做廉价 head 校验（1 个请求），不会每轮全量翻树', async () => {
+    let clock = 1_790_700_000_000;
+    let nodeInfoCalls = 0;
+    // 两页的树：全量翻一次 = 2 个 node_info 请求，而 head 校验只要 1 个 —— 这样才数得出来
+    const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        nodeInfoCalls++;
+        const cursor = JSON.parse(String(init?.body) || '{}')?.cursor;
+        return cursor
+          ? ok({ code: 0, data: { children: [{ id: 'nid-2', key: 'v0old00000002' }], has_more: false } })
+          : ok({
+              code: 0,
+              data: { children: [{ id: 'nid-1', key: 'v0old00000001' }], has_more: true, next_cursor: 'cursor-2' },
+            });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 10 * 60_000,
+      // ⚠️ 故意不传 indexTtlMs —— 用默认 5min，验证「索引新鲜期 + 新资源」这条廉价路径
+      now: () => clock,
+    });
+    const fresh = clock - 10_000;
+
+    await resolver.resolveDetailed('v0new0000001', { resourceAt: fresh });
+    expect(nodeInfoCalls).toBe(2); // 首次未见：全量翻 2 页
+
+    // 之后 5 轮（等过 20s 确认阈值也照旧）：树没变 → 每轮只 1 次 head 校验，不再全量翻树
+    for (let i = 0; i < 5; i++) {
+      clock += 25_000;
+      expect(await resolver.resolveDetailed('v0new0000001', { resourceAt: fresh, confirmation: true })).toEqual({
+        url: null,
+        expired: false,
+        pendingConfirm: true,
+      });
+    }
+    expect(nodeInfoCalls).toBe(2 + 5);
+  });
+
   it('新视频稍后出现在树里：确认窗口后的复查直接解析成功（复现第十轮的误判场景）', async () => {
     let clock = 0;
     let headKey = 'v0old00000001';

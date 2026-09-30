@@ -319,6 +319,104 @@ export const CHAIN_VID_DURATION_KEY = 'video_duration';
 /** 备选播放源，实测带 `logo_type=video_gen_watermark_dyn`，**不是**原片 */
 export const CHAIN_FALLBACK_API_KEY = 'fallback_api';
 
+/* ============================================================================
+ * §2.5 「本次生成用的模型」字段（2026-09-29 第十四轮 §34，**纯诊断用途**）
+ *
+ * 为什么记它：用户要研究「不同模型 → 创作树登记延迟不同」这个假设（§33 的误判就是被延迟坑的）。
+ * 只有把模型名记进诊断，这类样本才能事后对齐比较。**不参与任何业务判定、不进资源库。**
+ *
+ * 实测（`uwd-diag-1790690882278.json`，真实报文样本）：
+ *   ① 消息对象上的 `chat_ability` 是**被转义的 JSON 字符串**，里层 `ability_param` **又是一层**转义：
+ *      `"chat_ability":"{\"ability_type\":17,\"ability_param\":\"{\\\"ratio\\\":\\\"16:9\\\",\\\"model\\\":\\\"seedance_v2.0\\\",\\\"duration\\\":10,...}\"}"`
+ *      → `...ability_param.model = "seedance_v2.0"`（用户在输入框里选的那个模型）
+ *      它出现在**用户输入消息**那一批报文里（`message_from: "InputBox"`）。
+ *   ② 消息 `ext.ai_creation_tool_list` 是转义 JSON 数组，元素形如
+ *      `{"task_id":57049578737520386,"tool_name":"text_to_video","req_key":"seedance_v20_fast_flow","status":5,...}`
+ *      → 取 `tool_name === "text_to_video"` 那条的 `req_key`（实际跑的那个「流程」）
+ *      它出现在**生成任务 ack** 那一批报文里（文案：「本次使用 Seedance 2.0 Fast 生成」）。
+ *   ⚠️ **视频成片那一批报文里这两处都没有** —— 模型信息在更早的消息里，所以页面侧必须
+ *      「记住最近一次读到的值」并按批次时刻标注来源（见 `page/hook.ts::noteModelHints`）。
+ * ========================================================================== */
+
+/** 消息自带：模型选择（转义 JSON 字符串） */
+export const MSG_CHAT_ABILITY_KEY = 'chat_ability';
+/** 上者内层：生成参数（**又是一层**转义 JSON 字符串） */
+export const ABILITY_PARAM_KEY = 'ability_param';
+/** 上者内层：模型名，实测 `seedance_v2.0` */
+export const ABILITY_MODEL_KEY = 'model';
+/** 消息 `ext` 内：生成任务列表（转义 JSON 数组） */
+export const AI_CREATION_TOOL_LIST_KEY = 'ai_creation_tool_list';
+/** 任务元素里的工具名，实测 `text_to_video` */
+export const TOOL_NAME_KEY = 'tool_name';
+/** 任务元素里的流程名，实测 `seedance_v20_fast_flow` */
+export const TOOL_REQ_KEY = 'req_key';
+/** 视频生成任务的 `tool_name` 取值（同批可能有别的任务，用它挑出视频那条） */
+export const TOOL_NAME_TEXT_TO_VIDEO = 'text_to_video';
+
+/* ============================================================================
+ * §2.6 模型标识（2026-09-30 第十五轮；**§35.11 起以「站点文案」为主来源**）
+ *
+ * 用途：把「这条视频是哪个模型生成的」直接标在卡片上（用户要求）。
+ * 站点当前提供四个模型（用户截图）：**Seedance 2.5 / Seedance 2.0 / Seedance 2.0 Fast /
+ * Seedance 2.0 Mini**；卡片上显示简称 **SD-2.5 / SD-2.0 / 2.0-Fast / 2.0-Mini**。
+ *
+ * ── 三个来源的**可信度排序**（都是实测结论，别按直觉排）────────────────────────
+ *   ① **站点文案**（最可信）：任务 ack 消息里的
+ *      「本次使用 **Seedance 2.0 Mini** 生成，大约需要 1-3 分钟。」—— 站点自己报的档位名，
+ *      一次给出「版本 + 变体」，四种档位实测都能这样读到。
+ *   ② `model` = `chat_ability.ability_param.model`（**用户输入框里选的**）：
+ *      `seedance_v2.5` / `seedance_v2.0_std`（标准版）/ `seedance_v2.0_mini`（Mini）可用；
+ *      ⚠️ **裸 `seedance_v2.0`（无后缀）不可用** —— 实测它既出现在标准版会话
+ *      （`0929#动作戏练手`）也出现在 Fast / Mini 会话里，是**有歧义**的值。
+ *   ③ `tool` = `ext.ai_creation_tool_list[].req_key`（**只信版本号，不信变体**）：
+ *      实测 `seedance_v20_fast_flow` **同时**出现在 Fast 与 **Mini** 档位的会话里
+ *      （`uwd-diag-1790734985577.json`：`0704#mini实验` 12 条全是 Mini，tool 却是 `fast_flow`）
+ *      ⇒ 它是「视频生成**流程**」不是「档位」，**变体一律丢弃**，只从中取版本（`v25` → `2.5`）。
+ *
+ * ⚠️ 成片那一批报文里三处都没有 —— 模型信息在更早的消息里，所以页面侧按
+ *    「每条提示所在消息的 `create_time`」排成时间线，再按资源自己的 `createdAt` 就近取用
+ *    （`readModelTimeline` + `pickModelHintAt`，见 `docs/03` §35.10）。
+ * ⚠️ 变体词走白名单 `MODEL_VARIANT_LABELS`；白名单外（站点将来加档位）**不给药丸**，不猜。
+ * ⚠️ `readModelHints` 里**不得**用 `entries[0]` 兜底挑任务（§35.8：图片流程 `seedream_v50s_flow`
+ *    曾把 `tool` 污染成非 seedance 形态，导致图文混合会话药丸整片消失）。
+ * ========================================================================== */
+
+/** 「本次使用 **Seedance 2.0 Mini** 生成」—— 抓站点文案里的档位名 [实测 4 种档位] */
+export const MODEL_LABEL_TEXT_RE = /本次使用\s*\*{0,2}\s*([^*\n]{1,24}?)\s*\*{0,2}\s*生成/;
+/** 文案里的档位名形态：`Seedance <版本>` + 可选 ` <变体>`（大小写不敏感） */
+export const MODEL_LABEL_RE = /seedance\s*v?(\d+(?:\.\d+)?)(?:\s+([a-z]{2,8}))?/i;
+/** `model` 字段形态：`seedance_v<版本>` + 可选 `_<后缀>`（`std` = 标准版） */
+export const MODEL_NAME_RE = /^seedance_v(\d+(?:\.\d+)?)(?:_([a-z]+))?$/;
+/** `model` 后缀里表示「标准版」的字面（其余后缀走 `MODEL_VARIANT_LABELS` 白名单） */
+export const MODEL_STD_SUFFIX = 'std';
+/** 流程名形态：`seedance_v<两位版本>` + 可选 `_<变体>` + `_flow` [实测 2 例]；**变体不采用** */
+export const MODEL_TOOL_RE = /^seedance_v(\d{2})(?:_([a-z0-9]+))?_flow$/;
+/**
+ * 变体字面 → 显示后缀（**白名单**：不在此表内的变体一律不给药丸）。
+ * ⚠️ 用数组而不是 `Record` —— 变体词取自报文，`Record` 下标会命中
+ * `constructor` / `toString` 这类原型成员（把函数当后缀拼进文案）。
+ */
+export const MODEL_VARIANT_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ['fast', 'Fast'],
+  ['mini', 'Mini'],
+];
+/**
+ * 站点文案里的**档位别名**（老版写法）—— 字面 → 变体词。
+ *
+ * 实测（2026-09-30 §35.13，用户确认）：**老版把 2.0 Fast 档位写成**
+ * 「本次使用 **Seedance 2.0 全能视频模型** 生成，将消耗 2 个视频生成额度，预计等待 5 分钟。」
+ * —— 「全能视频模型」**不是**标准版，它就是 **2.0 Fast**（豆包老版的语义双标）。
+ * 不认这条会把 Fast 标成 `SD-2.0`（用户实机报错）。
+ * ⚠️ 别名匹配用前两字「全能」以覆盖简写；将来若出现新别名，一律**按实测**追加，不推测。
+ */
+export const MODEL_LABEL_ALIASES: ReadonlyArray<readonly [string, string]> = [['全能', 'fast']];
+/**
+ * 「站点**未提供变体**」的版本 —— 只有这些版本的 `model` 值即使**没有后缀**也可安全使用。
+ * 实测：`seedance_v2.5` 只有 Seedance 2.5 一个档位（没有 2.5 Fast / Mini）；
+ * 而 `seedance_v2.0`（无后缀）同时对应标准版 / Fast / Mini → 有歧义，不采用。
+ */
+export const MODEL_SINGLE_VARIANT_VERSIONS: readonly string[] = ['2.5'];
+
 /** 判定「一个对象是不是 creation」：含 `video` 或 `image` 子对象 [上游] */
 export const CREATION_MEDIA_KEYS = ['video', 'image'] as const;
 
