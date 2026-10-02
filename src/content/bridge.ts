@@ -12,10 +12,10 @@
  */
 
 import { MSG } from '../core/constants';
-import { makeRecord, type DiagRecord } from '../core/diagnostics';
+import { createRepeatSuppressor, makeRecord, type DiagRecord } from '../core/diagnostics';
 import { envelope, onRuntimeMessage, onWindowMessage, postToWindow, sendToBg } from '../core/messaging';
 import { onStateChanged, readConfig } from '../core/storage';
-import { CHAT_PATH_PATTERN, CONV_ID_PATTERN, THREAD_PATH_PATTERN } from '../core/site-contract';
+import { CHAT_PATH_PATTERN, CONV_ID_PATTERN, THREAD_PATH_PATTERN, VIDEO_SHARE_PATH_PATTERN, videoShareConvId } from '../core/site-contract';
 import type { ConvScope, MediaDraft, PageInfo, PageKind } from '../core/types';
 
 const QUERY_TIMEOUT_MS = 600;
@@ -24,8 +24,12 @@ const QUERY_TIMEOUT_MS = 600;
 /* 诊断                                                                          */
 /* --------------------------------------------------------------------------- */
 
+/** 纯查询回执的重复抑制（§40）：内容不变就不再刷同一条记录 */
+const shouldLogDiag = createRepeatSuppressor();
+
 function diag(event: string, detail?: string, options: { level?: 'info' | 'warn' | 'error'; text?: string } = {}): void {
   try {
+    if (!shouldLogDiag(event, detail ?? '')) return;
     void sendToBg(MSG.DiagAppend, makeRecord('content', event, detail, options), 'content').catch(() => undefined);
   } catch {
     /* 诊断永远不能影响主流程 */
@@ -102,9 +106,13 @@ function askPageLocate(keys: string[]): Promise<boolean> {
 function fallbackPageInfo(): PageInfo {
   let kind: PageKind = 'none';
   if (CHAT_PATH_PATTERN.test(location.pathname)) kind = 'chat';
-  else if (THREAD_PATH_PATTERN.test(location.pathname)) kind = 'thread';
+  // `/thread/` 与 `/video-sharing`（单条视频分享，2026-10-02 第十六轮）都是分享页
+  else if (THREAD_PATH_PATTERN.test(location.pathname) || VIDEO_SHARE_PATH_PATTERN.test(location.pathname)) {
+    kind = 'thread';
+  }
   const match = location.href.match(CONV_ID_PATTERN);
-  const convId = match ? match[1] : '';
+  // 视频分享页的 id 在查询参数里（路径里没有）→ 交给契约里的同一个函数推导
+  const convId = match ? match[1] : videoShareConvId(location.href);
   return {
     kind,
     convId,

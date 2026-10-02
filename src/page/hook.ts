@@ -14,12 +14,13 @@
  */
 
 import { DEFAULT_CONFIG, LIMITS, MSG } from '../core/constants';
-import { makeRecord, sample } from '../core/diagnostics';
+import { createRepeatSuppressor, makeRecord, sample } from '../core/diagnostics';
 import { envelope, onWindowMessage, postToWindow } from '../core/messaging';
 import { normalizeConfig } from '../core/storage';
-import { RANK, toDrafts, classifyResponseConv, collectConversationIds, readModelHints, readModelTimeline, type DraftContext, type ModelEvent } from '../core/extract';
+import { RANK, toDrafts, classifyResponseConv, collectConversationIds, parseLooseJson, readModelHints, readModelTimeline, type DraftContext, type ModelEvent } from '../core/extract';
 import { extractChainRaw } from '../core/extract/chain';
 import { extractSseRaw } from '../core/extract/sse';
+import { extractVideoShareRaw } from '../core/extract/share';
 import { extractThreadRaw, describeTitleFields, findShareInfo, parseFnArgs, shareTitle, FN_ARGS_SELECTOR } from '../core/extract/thread';
 import { dedupeVariants, isUsableCover, mediaLookupKeys, mediaPathKey } from '../core/media-url';
 import { modelBadgeOf, pickModelHintAt } from '../core/model-badge';
@@ -31,8 +32,12 @@ import {
   CONV_ID_PATTERN,
   DOM_CONTRACT,
   isLocalConvId,
+  parseVideoShareQuery,
   SSE_ENDPOINT,
   THREAD_PATH_PATTERN,
+  VIDEO_SHARE_INFO_ENDPOINT,
+  VIDEO_SHARE_PATH_PATTERN,
+  videoShareConvId,
 } from '../core/site-contract';
 import { createVidResolver, formatVidStep, type VidResolveOutcome, type VidStepEvent } from '../core/vid-resolver';
 import { cleanDocTitle, isStaleTitle, normalizeTitleSnapshot, pickFreshTitle } from '../core/title';
@@ -114,8 +119,12 @@ declare global {
   /* 诊断（真机联调用；与业务逻辑完全解耦）                                        */
   /* ------------------------------------------------------------------------- */
 
+  /** 纯查询回执的重复抑制（§40）：内容不变就不再刷同一条记录，把缓冲留给真证据 */
+  const shouldLogDiag = createRepeatSuppressor();
+
   function diag(event: string, detail?: string, options: { level?: 'info' | 'warn' | 'error'; text?: string } = {}): void {
     try {
+      if (!shouldLogDiag(event, detail ?? '')) return;
       postToWindow(envelope('page', MSG.PageDiag, makeRecord('page', event, detail, options)));
     } catch {
       /* 诊断永远不能影响主流程 */
@@ -183,13 +192,34 @@ declare global {
      */
     if (!id) return 'none';
     if (CHAT_PATH_PATTERN.test(pathname)) return 'chat';
-    if (THREAD_PATH_PATTERN.test(pathname)) return 'thread';
+    /*
+     * `/thread/`（整段对话分享）与 `/video-sharing`（单条视频分享，2026-10-02 第十六轮）
+     * **都判成 `thread`**：它们同属「分享页」，资源库作用域、页面徽标、「原片不可得」措辞
+     * 完全共用；区别只在数据来源（前者走 chain/SSE，后者走 §2.7 那个接口）。
+     *
+     * ⚠️ `/video-sharing` 的 ID 不在路径里（在 `?share_id=…`），由 `detectConvId()` 的
+     * 第二段负责取；取不到就是 `kind=none`（界面照旧提示「未检测到…」）。
+     */
+    if (THREAD_PATH_PATTERN.test(pathname) || VIDEO_SHARE_PATH_PATTERN.test(pathname)) return 'thread';
     return 'none';
   }
 
   function detectConvId(href: string = location.href): string {
     const match = href.match(CONV_ID_PATTERN);
-    return match ? match[1] : '';
+    if (match) return match[1];
+    // `/video-sharing?share_id=…&video_id=…`：路径里没有 id，从查询参数拼一个人造作用域键
+    return videoShareConvId(href);
+  }
+
+  /**
+   * 本页是不是 `/video-sharing`（单条视频分享页）。
+   *
+   * 它虽然被判成 `thread`，但页面里**没有** `script[data-fn-args]`、也没有 chain/SSE 报文
+   * （数据来自 §2.7 的接口），所以要把 `/thread/` 那套「内联脚本解析」跳过 ——
+   * 否则每次都会白跑一遍并往诊断里写 `parse.thread scripts=0 raws=0` 的噪声。
+   */
+  function isVideoSharePage(pathname: string = location.pathname): boolean {
+    return VIDEO_SHARE_PATH_PATTERN.test(pathname);
   }
 
   function pickText(candidates: string[]): string {
@@ -672,7 +702,15 @@ declare global {
       const quality = qualityFromDims(resolvedMeta.width, resolvedMeta.height);
       if (quality) meta.label = quality;
     }
-    if (resolvedMeta?.size !== undefined) meta.size = resolvedMeta.size;
+    if (resolvedMeta?.size !== undefined) {
+      meta.size = resolvedMeta.size;
+      /*
+       * `download_infos` / 创作树节点给出的字节数**就是原片的**（§17.9 实测与落盘原片一致），
+       * 所以必须同时打上归属标记（2026-10-02 §39）—— 否则 bg 实测到的「候选流体积」会被
+       * 误认为原片体积（实机：卡片 `3.0 MB` 而真原片 `7.1 MB`）。
+       */
+      meta.sizeFor = 'raw';
+    }
     /*
      * 作品生成时间（2026-09-28 第十轮）：**消息时间优先，创作树时间兜底**。
      *
@@ -723,7 +761,7 @@ declare global {
 
   /** 拼一条「丢弃异会话响应」的诊断（把判定依据写清楚，便于以后翻记录） */
   function dropForeignResponse(
-    event: 'parse.sse' | 'parse.chain',
+    event: 'parse.sse' | 'parse.chain' | 'parse.share',
     requestConvId: string,
     verdict: 'foreign' | 'unknown',
     text: string,
@@ -763,6 +801,46 @@ declare global {
     emitDrafts(toDrafts(raws, draftContext()));
   }
 
+  /**
+   * **视频分享页**（`/video-sharing`）的解析（2026-10-02 第十六轮）。
+   *
+   * 与 `handleSse` / `handleChain` 的关系：那两条吃的是**页面自身的聊天报文**，
+   * 而这条吃的是 `POST /creativity/share/get_video_share_info` 的应答
+   * （契约与实测形状见 `site-contract` §2.7）—— 单条视频的分享页不产生聊天气泡，
+   * 也没有 chain/SSE 报文，这是它唯一的数据来源。
+   *
+   * 归属判定沿用同一套两级口径（响应自报 session → 退回「请求时刻快照」）：
+   * 该响应**不带** `conversation_id`，所以实际走的是第二级 —— 请求发出时的 convId
+   * 就是本页的 `share_<id>`，正常必然命中；用户若中途切走，快照与新值不等则丢弃
+   * （避免把这条视频盖到别的会话作用域下）。
+   *
+   * ⚠️ `vid` 只能从**本页 URL 的 `video_id`** 取（响应里没有这个字段）；
+   * 拿不到 vid 时 `extractVideoShareRaw` 仍会产出草稿，但那种草稿在 `toDraft` 里
+   * 过不了 J3（没有 vid、也没有站点声明的 `raw`）→ 不入库。这是**有意的**：
+   * 没有 vid 就无法保证指纹稳定，也无法在「这其实是我自己的作品」时换到真原片。
+   */
+  function handleShareInfo(text: string, requestConvId: string): void {
+    const verdict = classifyResponseConv(text, convId || 'unknown');
+    if (verdict === 'foreign' || (verdict === 'unknown' && !isCurrentConvResponse(requestConvId))) {
+      dropForeignResponse('parse.share', requestConvId, verdict, text);
+      return;
+    }
+    const query = parseVideoShareQuery(location.href);
+    const raws = extractVideoShareRaw(parseLooseJson(text), query.videoId);
+    diag(
+      'parse.share',
+      `len=${text.length} raws=${raws.length} vid=${query.videoId || '-'} shareId=${query.shareId || '-'}`,
+      raws.length ? {} : { level: 'warn', text: sample(text, 'play_info') },
+    );
+    if (!raws.length) return;
+    /*
+     * 模型药丸**不适用于这条路径**：分享接口的报文里没有模型提示，而且这是**别人的**作品，
+     * 本会话的模型记忆也不该往它身上套（`attachModelBadges` 无文本时用的是跨批记忆）。
+     * 故此处刻意不调用 —— 宁可不显示药丸，也不把「我看过的上一条视频的模型」安到它头上。
+     */
+    emitDrafts(toDrafts(raws, draftContext()));
+  }
+
   function handleChain(text: string, requestConvId: string): void {
     /*
      * 与 handleSse 同一套两级判定（2026-09-27 第七轮）。
@@ -797,7 +875,13 @@ declare global {
   /* ------------------------------------------------------------------------- */
 
   function isInteresting(url: string): boolean {
-    return url.includes(SSE_ENDPOINT) || url.includes(CHAIN_ENDPOINT);
+    /*
+     * 三条感兴趣的通路（**只读**，从不修改请求）：
+     *   · `/chat/completion`（SSE）与 `/im/chain/single`（chain）—— 对话页 / `/thread/` 分享页；
+     *   · `/creativity/share/get_video_share_info`（2026-10-02 第十六轮）——
+     *     `/video-sharing` 单条视频分享页，它没有聊天气泡，数据只从这个接口来。
+     */
+    return url.includes(SSE_ENDPOINT) || url.includes(CHAIN_ENDPOINT) || url.includes(VIDEO_SHARE_INFO_ENDPOINT);
   }
 
   function resolveRequestUrl(input: unknown): string {
@@ -837,14 +921,17 @@ declare global {
       const contentType = response.headers?.get('content-type') ?? '?';
       const clone = response.clone();
       const isChain = url.includes(CHAIN_ENDPOINT);
-      const timeout = isChain ? 30_000 : LIMITS.SSE_READ_TIMEOUT_MS;
+      const isShare = url.includes(VIDEO_SHARE_INFO_ENDPOINT);
+      // 分享接口是一次普通 POST（响应 ~10KB），给 30s 就够；SSE 要留足生成时间
+      const timeout = isChain || isShare ? 30_000 : LIMITS.SSE_READ_TIMEOUT_MS;
       void readTextWithTimeout(clone, timeout).then((text) => {
         if (text === null) {
           diag('net.response', `${url.slice(0, 120)} 读取超时或失败（timeout=${timeout}ms）`, { level: 'error' });
           return;
         }
         diag('net.response', `${url.slice(0, 120)} status=200 ctype=${contentType} len=${text.length}`);
-        if (isChain) handleChain(text, requestConvId);
+        if (isShare) handleShareInfo(text, requestConvId);
+        else if (isChain) handleChain(text, requestConvId);
         else handleSse(text, requestConvId);
       });
     } catch {
@@ -924,7 +1011,8 @@ declare global {
             const text = this.responseText;
             diag('net.xhr', `${url.split('?')[0]} len=${text?.length ?? 0}`);
             if (!text) return;
-            if (url.includes(CHAIN_ENDPOINT)) handleChain(text, requestConvId);
+            if (url.includes(VIDEO_SHARE_INFO_ENDPOINT)) handleShareInfo(text, requestConvId);
+            else if (url.includes(CHAIN_ENDPOINT)) handleChain(text, requestConvId);
             else handleSse(text, requestConvId);
           } catch {
             /* 忽略 */
@@ -945,6 +1033,12 @@ declare global {
 
   function parseThreadOnce(): boolean {
     if (pageKind !== 'thread') return false;
+    /*
+     * `/video-sharing` 虽然也是 `thread`，但页面里**没有** `script[data-fn-args]`、
+     * 也没有 chain/SSE 报文（数据来自 §2.7 的分享接口）—— 对它跑这条链纯属白跑，
+     * 还会往诊断里写 `parse.thread scripts=0 raws=0` 的噪声。直接返回。
+     */
+    if (isVideoSharePage()) return false;
     const raws: RawMedia[] = [];
     const scripts = document.querySelectorAll(FN_ARGS_SELECTOR);
     let firstSample = '';
@@ -1001,6 +1095,11 @@ declare global {
   function scheduleThreadParse(): void {
     threadRetryTimers.forEach((timer) => clearTimeout(timer));
     threadRetryTimers = [];
+    /*
+     * 视频分享页提前收工：它的数据是**一次性接口响应**（由 fetch/XHR hook 捕获），
+     * 没有「稍后才注入的内联脚本」这回事，所以不排任何重试（守则 4：低频、可停止）。
+     */
+    if (isVideoSharePage()) return;
     if (parseThreadOnce()) return;
     // 有界的几次兜底重试：内联脚本可能晚于路由变化注入（低频、可停止）
     for (const delay of [300, 1200, 3000]) {

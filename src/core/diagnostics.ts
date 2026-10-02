@@ -106,6 +106,39 @@ export function isKeepEvent(event: string): boolean {
   return KEEP_EVENT_PREFIXES.some((prefix) => event.startsWith(prefix));
 }
 
+/* --------------------------------------------------------------------------- */
+/* 重复记录抑制（2026-10-02 §40）                                                 */
+/* --------------------------------------------------------------------------- */
+
+/**
+ * **纯查询回执**类事件：内容不变时是纯噪声，应抑制重复。
+ *
+ * 实测（用户两份诊断 JSON）：一次 500 条的导出里约**四成**是 `page.query` /
+ * `content.query` / `bg.state` —— 每次开弹窗、每次诊断页取状态都会留下两三条；
+ * 它们既不是证据、又会把 `vid.*` / `bg.size` / `draft.emit` 这些真证据冲淡
+ * （§26 那次是「关键记录挤满缓冲」，这次是「噪声稀释缓冲」，同一个病根的另一面）。
+ *
+ * ⚠️ **只允许**给这三类用。`vid.recheck` / `bg.size` / `net.*` 等事件**重复本身就是证据**
+ * （重试轮次、失败重试、站点重复推送），抑制它们等于隐藏问题。
+ */
+export const REPEAT_SUPPRESS_EVENTS: readonly string[] = ['page.query', 'content.query', 'bg.state'];
+
+/**
+ * 造一个「同一事件 + 同一 detail 只记一次」的抑制器（每个上下文各持一个）。
+ *
+ * 语义：**只与前一条同事件记录比较** —— 内容变了就记（会话切换 / 槽条数变化都能看到），
+ * 没变就丢。因此「同一条信息重复出现」仍会被完整保留（它前面必然夹着别的事件）。
+ */
+export function createRepeatSuppressor(): (event: string, detail: string) => boolean {
+  const last = new Map<string, string>();
+  return (event, detail) => {
+    if (!REPEAT_SUPPRESS_EVENTS.includes(event)) return true;
+    if (last.get(event) === detail) return false;
+    last.set(event, detail);
+    return true;
+  };
+}
+
 /**
  * 追加一条记录并保持有界：
  *   ① 条数超过上限 → 丢最旧的

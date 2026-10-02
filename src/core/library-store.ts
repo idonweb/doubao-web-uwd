@@ -74,9 +74,15 @@ function pickConvTitle(base: string, incoming: string): string {
 }
 
 /**
- * 只保留指定会话的条目。切换会话时调用 → **资源库 == 当前会话**。
+ * 只保留指定会话的条目 → **资源库（一个标签页的槽）== 该标签页当前会话**。
  * 无变化时原样返回（便于调用方用 `next !== library` 判断是否需要落盘）。
  * 会话 ID 为空时不做裁剪（拿不到会话时不该销毁既有数据）。
+ *
+ * ⚠️ 2026-10-02 §38 多标签页修复后，本函数的作用范围从「全局资源库」缩小到
+ * **一个标签页的槽**（见 `types.ts::LibrarySlots`）：语义一字未改，
+ * 只是「切走即清」从此只清**这一个标签页**，不再波及别的标签页（那是实机 bug 的根因）。
+ * 跨标签页的删除只发生在：关标签页（`tabs.onRemoved`）、该标签页离开会话
+ * （`tabs.onUpdated` / `kind=none` 自报）、以及浏览器重启后的对账。
  */
 export function retainConv(library: Library, convId: string): Library {
   if (!convId) return library;
@@ -117,8 +123,7 @@ export function isLeaveScope(scope: { convId?: string; kind?: string }): boolean
  * 指纹冲突（同一素材在两个会话 ID 下各有一条）时合并 variants / meta，保留更完整的。
  * 无占位条目时原样返回（便于调用方用 `next !== library` 判断是否需要落盘）。
  */
-export function rekeyConv(library: Library, fromConvId: string, toConvId: string): Library {
-  if (!fromConvId || !toConvId || fromConvId === toConvId) return library;
+export function rekeyConv(library: Library, fromConvId: string, toConvId: string): Library {  if (!fromConvId || !toConvId || fromConvId === toConvId) return library;
   const next: Library = { ...library };
   let changed = false;
   for (const item of Object.values(library)) {
@@ -201,6 +206,9 @@ function mergeVariants(base: MediaItem['variants'], incoming: MediaItem['variant
  * `modelBadge`（2026-09-30 §35.11 起）**在白名单里**：它描述「这个文件是哪个模型生成的」，
  * 且取值已按**每条资源自己的生成时刻**从模型时间线就近取（§35.10），重放同一批报文结果稳定；
  * 进白名单才能让历史条目上早先算错的值被修正（否则 F5 / 切会话后错误标记永远粘着）。
+ *
+ * `sizeFor`（2026-10-02 §39）**必须和 `size` 同进白名单**：两者是同一个数字的两个部分
+ * （数字 + 它属于哪个文件），只搬一半就会出现「3.0 MB 被当成原片体积」那种错标。
  */
 function metaMerge(base: MediaItem['meta'], incoming: MediaItem['meta']): MediaItem['meta'] {
   const out = { ...base };
@@ -212,6 +220,7 @@ function metaMerge(base: MediaItem['meta'], incoming: MediaItem['meta']): MediaI
     'dimsPreview',
     'duration',
     'size',
+    'sizeFor',
     'label',
     'createdAt',
     'modelBadge',
@@ -304,10 +313,17 @@ export function upsertDrafts(library: Library, drafts: MediaDraft[], options: Up
      * 每次重放签名段都会变 —— 那是「同一个文件的又一份签名」，不是换了文件
      * （早先按原始字符串比较，会把刚量到的体积一次次删掉，图片体积就再也留不住）。
      * ⚠️ 本次草稿自己带了 `size`（视频的创作树 `size` 与解析出的原片地址同批到达）则保留。
+     * ⚠️ 2026-10-02 §37：删掉之后**不必等 F5** —— `bg` 的体积实测按「条目 + 归一化地址」
+     * 记账（`core/size-probe.ts`），下一次入库就会对新地址重测（实机「体积过一会儿没了」
+     * 的根因就是旧实现删了之后永不再测）。
      */
     const primaryChanged =
       existing.primary !== primary.url && normalizeUrl(existing.primary) !== normalizeUrl(primary.url);
-    if (primaryChanged && draft.meta.size === undefined) delete nextMeta.size;
+    if (primaryChanged && draft.meta.size === undefined) {
+      // 数字与它的归属标记**成对**作废（§39），否则会留下「有归属、没数字」的残影
+      delete nextMeta.size;
+      delete nextMeta.sizeFor;
+    }
 
     next[id] = {
       ...existing,
@@ -379,6 +395,66 @@ export function patchItem(library: Library, id: string, patch: Partial<MediaItem
   const item = library[id];
   if (!item) return library;
   return { ...library, [id]: { ...item, ...patch } };
+}
+
+/**
+ * 当前下载地址（`primary`）是不是**无水印原片**变体（2026-10-02 §37）。
+ *
+ * 用途：界面据此判断「卡片上的体积描述的是原片，还是带水印的候选流」——
+ * 非原片时显示成「预览 3.1 MB」（用户 2026-10-02 拍板：先给预览体积，
+ * 原片解析成功再切换成正确的原片体积）。
+ *
+ * ⚠️ 判定必须**按变体的 `isRaw`**，不能按 `state === 'raw'`：
+ *   · 下载失败会把一个**原片**条目打成 `state='fail'`（`markFailed`），
+ *     那它的体积仍然是原片的体积，不该被标成「预览」；
+ *   · `state='thumb'` 的图片同理（体积量的是缩略图那个文件 → 标「预览」是对的）。
+ * ⚠️ 比地址要**归一化**（`normalizeUrl`）：带时效签名的地址换一份签名仍是同一个文件。
+ *   `primary` 本来就取自 `pickPrimaryVariant()`，所以正常情况下必能命中。
+ */
+export function primaryIsRaw(item: MediaItem): boolean {
+  const key = normalizeUrl(item.primary);
+  if (!key) return false;
+  return item.variants.some((variant) => variant.isRaw && normalizeUrl(variant.url) === key);
+}
+
+/**
+ * 「**原片已经就绪**」——体积归属与升级测量唯一的事实来源（2026-10-02 §39 追加）。
+ *
+ * 两个证据**任一成立**即算原片就绪：
+ *   ① `state === 'raw'` —— 草稿层声明的「这条资源有原片」（`toDraft` 只在拿到 `isRaw` 变体时才给 raw，
+ *      合并时 `STATE_RANK` 也保证它不会被降级）；
+ *   ② `primaryIsRaw(item)` —— 当前下载地址确实是某个 `isRaw` 变体。
+ *
+ * ⚠️ 为什么必须两条合起来（实机 bug）：只用 ② 时，条目在「原片已解析、但 `variants`/`primary`
+ * 的关系还没稳定」的窗口里会被判成「未就绪」→ **升级测量被跳过**，卡片就一直停在
+ * 「预览 1.7 MB」（诊断 `bg.size` 可见 `原片 1 / 预览体积 2`，之后再无测量记录）。
+ * 只用 ① 又会漏掉「下载失败（`markFailed` 把 state 打成 fail）」但其实手里是原片的情况。
+ */
+export function rawReady(item: MediaItem): boolean {
+  return item.state === 'raw' || primaryIsRaw(item);
+}
+
+/**
+ * 这个条目的体积「**属于谁**」（2026-10-02 §39）—— UI 据此决定要不要标「预览」。
+ *
+ * 判据：**显式标记优先**（`meta.sizeFor`，由写入方随数字一起落库），缺省一律当 `'preview'`
+ * （保守：宁可多标「预览」，也不把候选流的体积谎称成原片）。
+ *
+ * ⚠️ 为什么不直接用 `primaryIsRaw()` 现场推断（§39 的实机 bug 正是这么来的）：
+ * `primary` 切到原片是异步的，而体积实测要 ~0.7s —— 二者赛跑时，**候选流的数字**会被写进
+ * 「已经是原片」的条目里，现场推断就会把那个数字当成原片体积显示（实机：`3.0 MB` 对 `7.1 MB`）。
+ * 标记随数字走之后，这种错标在结构上不可能再出现。
+ */
+export function sizeForOf(item: MediaItem): 'raw' | 'preview' {
+  return item.meta.sizeFor === 'raw' ? 'raw' : 'preview';
+}
+
+/**
+ * 给体积定归属：**原片已就绪 → `'raw'`，否则 → `'preview'`**（写库方唯一入口，§39 追加）。
+ * 抽成函数是为了让「写标记」与「要不要升级测量」永远用同一把尺子（两处用不同判据正是本轮 bug 的成因）。
+ */
+export function sizeForNow(item: MediaItem): 'raw' | 'preview' {
+  return rawReady(item) ? 'raw' : 'preview';
 }
 
 /* --------------------------------------------------------------------------- */

@@ -6,3 +6,4 @@ export * from './common';
 export * from './sse';
 export * from './chain';
 export * from './thread';
+export * from './share';

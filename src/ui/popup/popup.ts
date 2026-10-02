@@ -49,7 +49,7 @@ import {
   listLibrary,
   locateInPage,
   onConfigChanged,
-  onLibraryChanged,
+  onLibrarySync,
   onProgress,
   openDebugPage,
   patchConfig,
@@ -668,8 +668,17 @@ function openRepo(): void {
 /* 订阅                                                                          */
 /* --------------------------------------------------------------------------- */
 
-onLibraryChanged((next) => {
-  library = next;
+/**
+ * 库的实时刷新：bg 写槽后会广播「**当前标签页的槽**」（§38）。
+ *
+ * ⚠️ 为什么不再订阅 `storage.onChanged`：库已经是**按标签页分槽**的结构
+ * （`tabId → 槽`），而扩展页没有 tabId；bg 主动推「这个标签页的槽」才是唯一正确的来源。
+ * `convId` 只用于校验这条广播与当前显示的会话是否一致（不一致就忽略，避免闪一下别人的库）。
+ */
+onLibrarySync((payload) => {
+  const expected = scope?.convId ?? state?.page.convId ?? '';
+  if (expected && payload.convId && expected !== payload.convId) return;
+  library = payload.library;
   pruneSelection();
   render();
 });

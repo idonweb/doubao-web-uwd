@@ -51,8 +51,24 @@ export interface MediaMeta {
   dimsPreview?: boolean;
   /** 秒 */
   duration?: number;
-  /** 字节 */
+  /**
+   * 字节 —— **描述的是当前 `primary` 那个文件**。
+   *
+   * ⚠️ 2026-10-02 §39：它「属于谁」由 `sizeFor` 决定，两者必须成对读。
+   */
   size?: number;
+  /**
+   * **体积归属标记**（2026-10-02 §39，修实机「`3.0 MB` 少了『预览』二字」）：
+   * `'raw'` = 这个数字是**无水印原片**的字节数；`'preview'` = 带水印候选流（点下载此刻拿到的那个文件）。
+   * 缺省**一律按 `'preview'` 处理**（保守：宁可多标「预览」，也不把候选流的体积谎称成原片）。
+   *
+   * 为什么需要它：`primary` 从候选流切到原片是**异步**的（vid 三步 API ~1s），而体积实测要 ~0.7s ——
+   * 实测结果可能在切换**之后**才写回，于是「候选流的数字」被记在「已经是原片」的条目上；
+   * 旧实现只能靠 `primaryIsRaw()` 现场推断，正好把这种数字**误判成原片体积**
+   * （实机：卡片写 `3.0 MB` + 「无水印原片」，而真原片是 `7.1 MB`，见 `docs/03` §39）。
+   * 有了本标记，标签随数字走，任何写入路径都不可能再错标。
+   */
+  sizeFor?: 'raw' | 'preview';
   /** 清晰度标签 */
   label?: string;
   /**
@@ -133,8 +149,10 @@ export interface RawMedia {
   /** 内嵌 JSON 字符串，内含 video_list[].main_url(base64) */
   videoModel?: string;
   /**
-   * 备选播放源（chain 响应里的 `fallback_api`）。
-   * 实测带 `logo_type=video_gen_watermark_dyn`，因此**永远不是原片**，只作末位候选。
+   * 备选播放源。两个来源，语义一致（都是「带水印的第二条播放地址」）：
+   *   · chain 响应的 `fallback_api`（实测带 `logo_type=video_gen_watermark_dyn`）；
+   *   · `/video-sharing` 分享接口的 `play_info.backup`（2026-10-02 第十六轮，`site-contract` §2.7）。
+   * 实测两者都**永远不是原片**，只作末位候选。
    */
   fallbackApi?: string;
   width?: number;
@@ -154,6 +172,8 @@ export interface RawMedia {
    * 来源标签，便于排查：'sse' | 'chain' | 'thread' | 'dom'。
    * ⚠️ 语义上还承担一个判定职责：**只有 sse / chain / thread 的 `raw` 才算站点给出的原片**；
    * `dom` 的 `raw` 是本地改写猜测（实测已不能去水印），会被 `toDraft` 丢弃（J3：宁缺勿假）。
+   * 📌 2026-10-02：`/video-sharing` 分享页（`site-contract` §2.7）也记 `'thread'` ——
+   * 它同样是**站点给出的**分享数据，且页面类型本来就判成 `thread`。
    */
   origin?: 'sse' | 'chain' | 'thread' | 'dom';
   /**
@@ -234,6 +254,11 @@ export interface DownloadTarget {
   createdAtMs?: number;
   /** 资源所属对话页标题（= `convTitle`）；弱标题 / 缺失 → 文件名标题位回退会话 ID */
   convTitle?: string;
+  /**
+   * 该条目所在的**标签页槽**（2026-10-02 §38）。自愈重解析要把新地址写回这个槽 ——
+   * 库是多槽的，光有 `itemId`（槽内键）定位不到。内联下载（只有 url）时缺省。
+   */
+  slotTabId?: number;
 }
 
 export interface DownloadProgress {
@@ -259,7 +284,7 @@ export interface StateResponse {
   stale: boolean;
   /** 当前会话的资源统计 */
   stats: Stats;
-  /** 资源库总条数（不受当前会话限制） */
+  /** 资源库条数 —— §38 起 = **当前标签页槽**的条数（不再含别的标签页） */
   libraryTotal: number;
   version: string;
   /** 当前下载队列进度 */
@@ -308,9 +333,35 @@ export interface DownloadRequest {
 
 /** `library:list` 的应答 */
 export interface LibraryResponse {
-  /** ⚠️ 第四轮起：**已经按当前会话裁剪过**（资源库只针对当前激活的对话） */
+  /**
+   * ⚠️ 第四轮起就**已经裁剪过**，2026-10-02 §38 起裁剪范围 = **请求方标签页的槽**：
+   * 槽内只留该标签页的当前会话（`retainConv` 语义不变），别的标签页的槽互不干扰。
+   */
   library: Record<string, MediaItem>;
   config: Config;
-  /** 当前激活会话；拿不到（非豆包页 / 内容脚本未注入）时为 null */
+  /** 当前激活会话（该标签页的）；拿不到（非豆包页 / 内容脚本未注入）时为 null */
   scope: ConvScope | null;
+}
+
+/**
+ * `library:list` 的入参（2026-10-02 §38）。
+ *
+ * 与 `state:get` 同一套「报告目标」语义：弹窗（活动标签页就是用户在看的那页）不传即可；
+ * **诊断页必须传 `follow: true`** —— 它自己就是 active tab，不跟随的话拿到的是「诊断页那个
+ * 不存在的槽」（永远是空库）。
+ */
+export interface LibraryRequest {
+  tabId?: number;
+  follow?: boolean;
+}
+
+/**
+ * `library:sync`（bg → UI）：**当前标签页槽**的资源库快照（2026-10-02 §38）。
+ *
+ * UI 没有 tabId（扩展页不在标签页里），所以库的实时刷新由 bg 主动推；
+ * `convId` 用于让 UI 自行校验这条广播与它当前显示的会话是否一致。
+ */
+export interface LibrarySyncPayload {
+  convId: string;
+  library: Record<string, MediaItem>;
 }

@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_CONFIG, LIMITS, SCHEMA_VERSION, STORAGE } from '../src/core/constants';
-import { dropStaleImageSizes, normalizeConfig, normalizeLibrary, normalizeSchemaVersion, type Library } from '../src/core/storage';
+import {
+  dropStaleImageSizes,
+  normalizeConfig,
+  normalizeLibrary,
+  normalizeLibrarySlots,
+  normalizeSchemaVersion,
+  slotsFromLegacyLibrary,
+  type Library,
+} from '../src/core/storage';
 import { LEGACY_STORAGE_KEYS } from '../src/core/site-contract';
 
 describe('配置归一化（纯函数）', () => {
@@ -66,6 +74,106 @@ describe('资源库归一化（纯函数）', () => {
 
   it('kind 取值必须合法', () => {
     expect(normalizeLibrary({ bad: { ...validItem, kind: 'audio' } })).toEqual({});
+  });
+});
+
+/**
+ * 分槽资源库（2026-10-02 §38 多标签页修复）。
+ *
+ * 背景：库从「全局单槽」改为「`tabId → 槽`」—— 否则三个豆包标签页来回切会互相删库
+ * （诊断 `uwd-diag-1790925989845`：14 次作用域翻转、20 条草稿被丢、三边全空）。
+ */
+describe('normalizeLibrarySlots（分槽归一化，纯函数）', () => {
+  const item = (convId: string, id = `${convId}::f`) => ({
+    id,
+    convId,
+    convKind: 'chat',
+    convTitle: 't',
+    fingerprint: 'f',
+    kind: 'video',
+    state: 'raw',
+    variants: [],
+    primary: 'https://a.com/x.mp4',
+    cover: null,
+    meta: { ext: 'mp4' },
+    firstSeen: 1,
+    lastSeen: 2,
+  });
+
+  it('每个槽内部照旧过一遍条目校验，空槽直接丢掉', () => {
+    const raw = {
+      101: { [item('a').id]: item('a') },
+      102: { broken: { id: 'x' } },
+      103: {},
+    };
+    const slots = normalizeLibrarySlots(raw);
+    expect(Object.keys(slots)).toEqual(['101']);
+    expect(Object.keys(slots['101'])).toEqual(['a::f']);
+  });
+
+  it('非对象 / 脏值 → 空对象（不崩、不编造）', () => {
+    expect(normalizeLibrarySlots(undefined)).toEqual({});
+    expect(normalizeLibrarySlots(null)).toEqual({});
+    expect(normalizeLibrarySlots('x')).toEqual({});
+    expect(normalizeLibrarySlots([])).toEqual({});
+  });
+});
+
+describe('slotsFromLegacyLibrary（v2→v3 迁移归位，纯函数）', () => {
+  const item = (convId: string) => ({
+    id: `${convId}::f`,
+    convId,
+    convKind: 'chat' as const,
+    convTitle: 't',
+    fingerprint: 'f',
+    kind: 'video' as const,
+    state: 'raw' as const,
+    variants: [],
+    primary: 'https://a.com/x.mp4',
+    cover: null,
+    meta: { ext: 'mp4' },
+    firstSeen: 1,
+    lastSeen: 2,
+  });
+
+  it('★按「仍开着的标签页 URL」把旧条目归位到对应槽', () => {
+    const legacy = { '3844::f': item('3844'), 'xkmLJCEtfJndqzlD4::f': item('xkmLJCEtfJndqzlD4') };
+    const slots = slotsFromLegacyLibrary(legacy, [
+      { tabId: 79567325, url: 'https://www.doubao.com/chat/3844?channel=itab2' },
+      { tabId: 79567328, url: 'https://www.doubao.com/thread/xkmLJCEtfJndqzlD4' },
+    ]);
+    expect(Object.keys(slots).sort()).toEqual(['79567325', '79567328']);
+    expect(Object.keys(slots['79567325'])).toEqual(['3844::f']);
+    expect(Object.keys(slots['79567328'])).toEqual(['xkmLJCEtfJndqzlD4::f']);
+  });
+
+  it('★分享页也能归位（会话键来自查询参数 `share_<share_id>`）', () => {
+    const legacy = { 'share_5713::vid:v0': item('share_5713') };
+    const slots = slotsFromLegacyLibrary(legacy, [
+      { tabId: 79567283, url: 'https://www.doubao.com/video-sharing?share_id=5713&video_id=v0' },
+    ]);
+    expect(Object.keys(slots['79567283'])).toEqual(['share_5713::vid:v0']);
+  });
+
+  it('没有标签页承载的条目 → 丢弃（会由页面重新解析恢复；分享页需 F5）', () => {
+    const slots = slotsFromLegacyLibrary({ 'gone::f': item('gone') }, [
+      { tabId: 1, url: 'https://www.doubao.com/chat/3844' },
+    ]);
+    expect(slots).toEqual({});
+  });
+
+  it('同一会话开在两个标签页 → 只归给第一个（避免迁移期重复）', () => {
+    const slots = slotsFromLegacyLibrary({ '3844::f': item('3844') }, [
+      { tabId: 11, url: 'https://www.doubao.com/chat/3844' },
+      { tabId: 22, url: 'https://www.doubao.com/chat/3844' },
+    ]);
+    expect(Object.keys(slots)).toEqual(['11']);
+  });
+
+  it('非会话页（首页）不承载任何槽', () => {
+    expect(slotsFromLegacyLibrary({ '3844::f': item('3844') }, [{ tabId: 9, url: 'https://www.doubao.com/chat' }])).toEqual(
+      {},
+    );
   });
 });
 

@@ -17,7 +17,7 @@
  */
 
 import { DOWNLOAD_STRATEGY, EXT_VERSION, LIMITS, MSG, STORAGE } from '../core/constants';
-import { makeRecord, pushBounded, type DiagRecord } from '../core/diagnostics';
+import { createRepeatSuppressor, makeRecord, pushBounded, type DiagRecord } from '../core/diagnostics';
 import { DownloadQueue, FilenameAllocator, parseTotalBytes } from '../core/download';
 import {
   type Library,
@@ -30,16 +30,19 @@ import {
   rekeyConv,
   retainConv,
   retitleConv,
+  sizeForNow,
   statsOf,
   upsertDrafts,
 } from '../core/library-store';
 import { broadcast, onRuntimeMessage, trySendToTab } from '../core/messaging';
-import { migrate, onStateChanged, patchConfig, readConfig, readLibrary, readState, writeLibrary } from '../core/storage';
+import { canRetryProbe, needsRawSizeUpgrade, needsSizeProbe, probeWriteBlocked, recordProbeAttempt } from '../core/size-probe';
+import { migrate, onStateChanged, patchConfig, readConfig, readLibrarySlots, readState, writeLibrarySlots } from '../core/storage';
 import {
   CHAT_PATH_PATTERN,
-  CONV_ID_PATTERN,
   SIZE_PROBE_RANGE,
   THREAD_PATH_PATTERN,
+  VIDEO_SHARE_PATH_PATTERN,
+  convIdFromUrl,
   isDoubaoHostUrl,
   isLocalConvId,
 } from '../core/site-contract';
@@ -50,12 +53,16 @@ import type {
   DownloadProgress,
   DownloadRequest,
   DownloadTarget,
+  LibraryRequest,
+  LibrarySyncPayload,
   MediaDraft,
   MediaItem,
   PageInfo,
   StateRequest,
   StateResponse,
 } from '../core/types';
+import type { LibrarySlots } from '../core/storage';
+
 
 /* --------------------------------------------------------------------------- */
 /* 诊断（真机联调用；有界环形缓冲，不影响业务）                                    */
@@ -97,11 +104,11 @@ async function flushDiag(): Promise<void> {
      * 触发时机天然正确：库的每次条数变化（`bg.upsert` / `bg.scope`）本身就带一条诊断记录，
      * 记录 → 400ms 去抖 → 这里，所以「库变了必然广播」。
      */
-    const library = await getLibrary();
+    const slot = slotOf(await getSlots(), lastContentTabId);
     const scope = await recallScope();
     const payload: DiagChangedPayload = {
       count: diagCache.length,
-      lib: Object.keys(library).length,
+      lib: Object.keys(slot).length,
       scope,
     };
     broadcast(MSG.DiagChanged, payload);
@@ -140,38 +147,88 @@ async function resetDiag(): Promise<void> {
   await flushDiag();
 }
 
+/** 纯查询回执的重复抑制（§40）—— 只作用于 `page.query` / `content.query` / `bg.state` */
+const shouldLogDiag = createRepeatSuppressor();
+
 function diag(event: string, detail?: string, options: { level?: 'info' | 'warn' | 'error'; text?: string } = {}): void {
+  if (!shouldLogDiag(event, detail ?? '')) return;
   appendDiag([makeRecord('bg', event, detail, options)]);
 }
 
 
 /* --------------------------------------------------------------------------- */
-/* 资源库缓存（background 是唯一写入方）                                          */
-/* --------------------------------------------------------------------------- */
-
-let libraryCache: Library | null = null;
-
-async function getLibrary(): Promise<Library> {
-  if (!libraryCache) libraryCache = await readLibrary();
-  return libraryCache;
-}
-
-async function persistLibrary(next: Library): Promise<void> {
-  libraryCache = next;
-  await writeLibrary(next);
-}
-
-/* --------------------------------------------------------------------------- */
-/* 会话作用域（2026-09-26 第四轮）                                                */
+/* 资源库缓存（background 是唯一写入方）—— **按标签页分槽**（2026-10-02 §38）          */
 /*                                                                             */
-/* 用户口径：**资源库只针对「当前激活的对话本身」**。                              */
-/* 页面脚本在会话切换 / 标题解析完成时上报 `conv:scope`，这里据此：                 */
-/*   ① 会话变了 → 裁剪资源库（切走即清空其它会话，宁可从简也不留错乱的历史）          */
-/*   ② 拿到真实标题 → 刷新该会话下已有条目的会话名（解除「兜底标题粘住」）            */
+/* 结构：`tabId → 槽`；槽内部与第四轮完全一致（只管该标签页的当前会话）。              */
+/* 这样一来「切走即清」只清自己那个槽，不再把别的标签页刚解析出来的条目删掉 ——        */
+/* 旧的全局单槽在多标签页下就是「互相删库」（实测 3 个标签页来回切 → 三边全空）。        */
+/* --------------------------------------------------------------------------- */
+
+let slotsCache: LibrarySlots | null = null;
+
+async function getSlots(): Promise<LibrarySlots> {
+  if (!slotsCache) slotsCache = await readLibrarySlots();
+  return slotsCache;
+}
+
+/** 取某个标签页的槽（没有 / 拿不到 tabId → 空槽） */
+function slotOf(slots: LibrarySlots, tabId: number | null | undefined): Library {
+  if (typeof tabId !== 'number') return {};
+  return slots[String(tabId)] ?? {};
+}
+
+async function persistSlots(next: LibrarySlots): Promise<void> {
+  slotsCache = next;
+  await writeLibrarySlots(next);
+}
+
+/**
+ * 写一个标签页的槽，并**主动广播**给 UI（`library:sync`）。
+ *
+ * 为什么要广播：UI（扩展页）没有 tabId，无法从 `storage.onChanged` 里挑出自己的槽；
+ * 而弹窗是单例，所以「推当前槽」永远是对的（诊断页仍走 `diag:changed` 快照）。
+ */
+async function writeSlot(tabId: number, slot: Library): Promise<void> {
+  const slots = { ...(await getSlots()) };
+  const key = String(tabId);
+  if (Object.keys(slot).length) slots[key] = slot;
+  else delete slots[key];
+  await persistSlots(slots);
+  broadcast(MSG.LibrarySync, { convId: tabScopeOf(tabId)?.convId ?? '', library: slot });
+}
+
+/** 丢掉一个标签页的槽（关标签页 / 离开会话 / 启动对账） */
+async function dropSlot(tabId: number, reason: string): Promise<void> {
+  const slots = await getSlots();
+  if (!slots[String(tabId)]) return;
+  const counts = Object.keys(slots[String(tabId)]).length;
+  const next = { ...slots };
+  delete next[String(tabId)];
+  await persistSlots(next);
+  diag('bg.slot', `tab #${tabId} 槽已删除（${reason}，原 ${counts} 条）`);
+}
+
+/* --------------------------------------------------------------------------- */
+/* 会话作用域（2026-09-26 第四轮；2026-10-02 §38 改为**按标签页**）                   */
+/*                                                                             */
+/* 用户口径不变：**资源库只针对「当前激活的对话本身」**。                            */
+/* 页面脚本在会话切换 / 标题解析完成时上报 `conv:scope`，这里据此：                   */
+/*   ① 会话变了 → 裁剪**该标签页的槽**（切走即清空，但只清自己）                      */
+/*   ② 拿到真实标题 → 刷新该标签页槽内条目的会话名（解除「兜底标题粘住」）              */
+/*                                                                             */
+/* ⚠️ 槽的生命周期（§38 新增，实机 bug 的修复点）：                                  */
+/*   · 关标签页（`tabs.onRemoved`）→ 删槽；                                        */
+/*   · 该标签页离开会话（`tabs.onUpdated` 导航到非会话页，或页面自报 `kind=none`）→ 清该槽；*/
+/*   · 浏览器重启后 tabId 重新分配 → 启动时对账，删掉不再存在的槽。                     */
 /* --------------------------------------------------------------------------- */
 
 const SESSION_SCOPE = 'uwd:activeScope';
+const SESSION_TAB_SCOPES = 'uwd:tabScopes';
+
+/** 全局「最近一次会话」快照 —— §38 起**只用于诊断**（真正的判定都走按标签页的 `tabScopes`） */
 let activeScope: ConvScope | null = null;
+/** `tabId → 该标签页当前会话`（内存 + session 存储） */
+let tabScopes: Map<number, ConvScope> | null = null;
 
 async function rememberScope(scope: ConvScope): Promise<void> {
   activeScope = scope;
@@ -196,13 +253,60 @@ async function recallScope(): Promise<ConvScope | null> {
   return activeScope;
 }
 
+async function getTabScopes(): Promise<Map<number, ConvScope>> {
+  if (tabScopes) return tabScopes;
+  tabScopes = new Map();
+  try {
+    const data = (await chrome.storage.session.get(SESSION_TAB_SCOPES)) as Record<string, unknown>;
+    const raw = data[SESSION_TAB_SCOPES];
+    if (raw && typeof raw === 'object') {
+      for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+        const tabId = Number(key);
+        if (Number.isInteger(tabId) && value && typeof (value as ConvScope).convId === 'string') {
+          tabScopes.set(tabId, value as ConvScope);
+        }
+      }
+    }
+  } catch {
+    /* 忽略 */
+  }
+  return tabScopes;
+}
+
+/** 同步读取某个标签页的会话（读缓存；没加载过就先返回 null，调用方在 async 上下文里先 `getTabScopes()`） */
+function tabScopeOf(tabId: number | null | undefined): ConvScope | null {
+  if (typeof tabId !== 'number') return null;
+  return tabScopes?.get(tabId) ?? null;
+}
+
+async function persistTabScopes(): Promise<void> {
+  try {
+    const record: Record<string, ConvScope> = {};
+    for (const [tabId, scope] of (await getTabScopes()).entries()) record[String(tabId)] = scope;
+    await chrome.storage.session.set({ [SESSION_TAB_SCOPES]: record });
+  } catch {
+    /* session 存储不可用时只留内存 */
+  }
+}
+
+async function rememberTabScope(tabId: number, scope: ConvScope): Promise<void> {
+  (await getTabScopes()).set(tabId, scope);
+  await persistTabScopes();
+}
+
+async function forgetTabScope(tabId: number): Promise<void> {
+  const scopes = await getTabScopes();
+  if (!scopes.delete(tabId)) return;
+  await persistTabScopes();
+}
+
 /** 归一化：空串与「没有作用域」等价，避免把 `''` 当成一次真正的会话切换 */
 function scopeKey(scope: ConvScope | null | undefined): string | null {
   const convId = scope?.convId?.trim();
   return convId ? convId : null;
 }
 
-/** 结束会话作用域：内存与 session 存储一并置空（`isLeaveScope` 分支专用） */
+/** 结束**全局**会话快照（`isLeaveScope` 分支专用；槽的清理由 `dropSlot` 负责） */
 async function clearScope(): Promise<void> {
   activeScope = null;
   try {
@@ -212,63 +316,78 @@ async function clearScope(): Promise<void> {
   }
 }
 
-async function applyScope(scope: ConvScope): Promise<void> {
+/**
+ * 应用一次会话上报 —— **作用范围 = 这一个标签页的槽**（§38）。
+ *
+ * `tabId === null`（拿不到标签页，例如诊断页在没有豆包标签页时取状态）只记全局快照，
+ * 不动任何槽：绝不能因为「不知道是谁」就把某个槽清掉。
+ */
+async function applyScope(scope: ConvScope, tabId: number | null = null): Promise<void> {
   try {
-    const previous = await recallScope();
     const convId = scope.convId.trim();
 
     /*
-     * 离开会话（2026-09-27 第八轮）：豆包域内的非会话页（首页 `/chat` 等）。
-     * L1 语义补角：资源库 == 当前激活会话 —— 没有激活会话 → 库整体清空 + 作用域置空。
-     * 回到任何会话时 chain 历史重拉会照常恢复该会话的条目（与「切走即清空」同一语义）。
-     * 幂等：已处于无会话状态时直接返回。
-     * ⚠️ 只由**页面侧的 conv:scope** 触发 —— `buildStateResponse` / `syncScopeFromTab`
-     *   对 kind=none 仍然不调用本函数的清库分支（活动标签页不是豆包页 ≠ 离开会话，
-     *   不能因为用户切去别的网站就清掉后台豆包页的库）。
+     * 离开会话（2026-09-27 第八轮；§38 收窄到本标签页）：
+     * 豆包域内的非会话页（首页 `/chat` 等）→ **只清这个标签页的槽**。
+     * 旧实现 `persistLibrary({})` 清的是全局库 —— 多标签页下等于「切一下主页，
+     * 另外两个分享页的资源全没」（实机截图 2/3/4 就是这个）。
      */
     if (isLeaveScope(scope)) {
-      if (!scopeKey(previous)) return;
-      const library = await getLibrary();
-      const left = Object.keys(library).length;
-      await clearScope();
-      await persistLibrary({});
-      diag('bg.scope', `离开会话（kind=${scope.kind}）→ 资源库清空（原 ${left} 条）`);
+      if (tabId === null) return;
+      const previous = (await getTabScopes()).get(tabId);
+      if (!previous) return; // 幂等：本来就没有会话
+      await forgetTabScope(tabId);
+      const slot = slotOf(await getSlots(), tabId);
+      const left = Object.keys(slot).length;
+      if (left) await writeSlot(tabId, {});
+      if (scopeKey(await recallScope()) === scopeKey(previous)) await clearScope();
+      diag('bg.scope', `tab #${tabId} 离开会话（kind=${scope.kind}）→ 该槽清空（原 ${left} 条）`);
       return;
     }
 
+    // 没有标签页上下文时只记全局快照（不动槽）
+    const previous = tabId === null ? await recallScope() : ((await getTabScopes()).get(tabId) ?? null);
     const convChanged = scopeKey(previous) !== scopeKey(scope);
     const titleChanged = Boolean(convId && scope.title && previous?.title !== scope.title);
+
+    if (tabId !== null) {
+      await rememberTabScope(tabId, {
+        convId,
+        kind: scope.kind,
+        title: scope.title || (convChanged ? '' : (previous?.title ?? '')),
+      });
+    }
+    await rememberScope({
+      convId,
+      kind: scope.kind,
+      title: scope.title || (convChanged ? '' : (previous?.title ?? '')),
+    });
     if (!convChanged && !titleChanged) return;
 
-    const library = await getLibrary();
-    let next = library;
+    const slots = await getSlots();
+    const before = slotOf(slots, tabId);
+    let next = before;
     if (convChanged && convId) {
-      const previousId = scopeKey(previous);
       /*
        * 新建会话的占位 ID（`local_*`）→ 真实 ID（2026-09-27 第七轮）：
        * 占位窗口期入库的条目 convId 是占位值，直接 retainConv 会把它们当「异会话」清掉。
-       * 先重键到真实会话、再裁剪其它会话 —— 新会话生成阶段捕获的素材因此不会丢。
+       * 先重键到真实会话、再裁剪 —— 新会话生成阶段捕获的素材因此不会丢。
+       * ⚠️ §38 起顺序很重要：**先重键、后裁剪**，且都只在本标签页的槽内进行。
        */
+      const previousId = scopeKey(previous);
       if (previousId && isLocalConvId(previousId) && !isLocalConvId(convId)) {
         next = rekeyConv(next, previousId, convId);
       }
       next = retainConv(next, convId);
     }
     if (convId && scope.title) next = retitleConv(next, convId, scope.title);
-
-    // 标题留空时沿用同一会话上一次已知的真实标题（页面可能先报空、随后再报标题）
-    await rememberScope({
-      convId,
-      kind: scope.kind,
-      title: scope.title || (scopeKey(previous) === scopeKey(scope) ? (previous?.title ?? '') : ''),
-    });
-    if (next !== library) await persistLibrary(next);
+    if (tabId !== null && next !== before) await writeSlot(tabId, next);
 
     diag(
       'bg.scope',
-      `convId=${convId || '-'} kind=${scope.kind} title=${scope.title || '-'} 会话变更=${convChanged} 保留=${
+      `tab #${tabId ?? '-'} convId=${convId || '-'} kind=${scope.kind} title=${scope.title || '-'} 会话变更=${convChanged} 槽内保留=${
         Object.keys(next).length
-      }/${Object.keys(library).length}`,
+      }/${Object.keys(before).length}`,
     );
   } catch (error) {
     // 会话作用域是增强能力：出错绝不能让 state:get / library:list 挂住
@@ -277,14 +396,14 @@ async function applyScope(scope: ConvScope): Promise<void> {
 }
 
 /**
- * 主动向某个标签页问一次页面信息，并据此应用会话作用域。
+ * 主动向某个标签页问一次页面信息，并据此应用会话作用域（**只影响该标签页的槽**）。
  * 用作兜底：即使 `conv:scope` 消息丢了（SW 被回收等），打开弹窗 / 资源库时也会收敛。
  */
 async function syncScopeFromTab(tabId: number | null): Promise<PageInfo | null> {
   if (tabId === null) return null;
   const info = await trySendToTab<PageInfo>(tabId, MSG.TabQuery);
   if (!info || typeof info.kind !== 'string' || info.kind === 'none') return null;
-  await applyScope({ convId: info.convId, title: info.title, kind: info.kind });
+  await applyScope({ convId: info.convId, title: info.title, kind: info.kind }, tabId);
   return info;
 }
 
@@ -292,11 +411,21 @@ async function syncScopeFromTab(tabId: number | null): Promise<PageInfo | null> 
 /* 媒体草稿入库（短去抖：SSE 增量推送会高频触发）                                  */
 /* --------------------------------------------------------------------------- */
 
-let draftBuffer: MediaDraft[] = [];
+/** 缓冲里的草稿**必须带着来源标签页**：入库要写进「它自己那个槽」（§38） */
+interface BufferedDraft {
+  tabId: number;
+  draft: MediaDraft;
+}
+
+let draftBuffer: BufferedDraft[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-function queueDrafts(drafts: MediaDraft[]): void {
-  draftBuffer.push(...drafts);
+function queueDrafts(drafts: MediaDraft[], tabId: number | null): void {
+  if (typeof tabId !== 'number') {
+    diag('bg.upsert', `丢弃无标签页来源的草稿 ${drafts.length} 条`, { level: 'warn' });
+    return;
+  }
+  draftBuffer.push(...drafts.map((draft) => ({ tabId, draft })));
   if (draftBuffer.length >= LIMITS.DRAFT_BATCH_MAX) {
     void flushDrafts();
     return;
@@ -317,62 +446,101 @@ async function flushDrafts(): Promise<void> {
   const buffered = draftBuffer;
   draftBuffer = [];
 
-  // 会话作用域：只收「当前激活会话」的草稿 ——
-  // chain / SSE 的响应可能晚于「用户切走」才到，那时页面盖的是新会话的 ID，
-  // 收进来就会变成另一条会话下的重复资源。
-  const scope = await recallScope();
-  // 没有激活会话（已离开会话页，第八轮）→ 草稿一律不入库。
-  // 否则首页期间兜到的「unknown 会话」草稿会写进刚清空的库，残留重新出现。
-  if (!scope?.convId) {
-    diag('bg.upsert', `无激活会话，丢弃草稿 ${buffered.length} 条`, { level: 'warn' });
-    return;
+  // 按来源标签页分组：每组写进各自的槽（§38 —— 不再有「全局作用域」这一步）
+  const byTab = new Map<number, MediaDraft[]>();
+  for (const entry of buffered) {
+    const list = byTab.get(entry.tabId);
+    if (list) list.push(entry.draft);
+    else byTab.set(entry.tabId, [entry.draft]);
   }
-  const drafts = filterDraftsByConv(buffered, scope.convId);
-  const dropped = buffered.length - drafts.length;
-  if (dropped > 0) {
-    diag('bg.upsert', `丢弃异会话草稿 ${dropped} 条（当前会话=${scope?.convId || '-'}）`, { level: 'warn' });
+
+  const config = await readConfig();
+  const slots = { ...(await getSlots()) };
+  let touched = false;
+  /** 体积实测要等**写库之后**再发（否则 `getSlots()` 还是旧缓存，条目看起来「不存在」→ 静默漏测） */
+  const pendingProbes: Array<{ tabId: number; ids: string[] }> = [];
+
+  for (const [tabId, drafts] of byTab) {
+    /*
+     * 会话作用域：只收「**这个标签页**当前会话」的草稿 —— chain / SSE 的响应可能晚于
+     * 「用户在这个标签页里切走」才到，收进来就会变成该槽里另一个会话的残留条目
+     * （原全局版判定的语义一字未改，只是把「当前会话」从全局换成按标签页）。
+     */
+    const scope = (await getTabScopes()).get(tabId);
+    if (!scope?.convId) {
+      diag('bg.upsert', `tab #${tabId} 无激活会话，丢弃草稿 ${drafts.length} 条`, { level: 'warn' });
+      continue;
+    }
+    const accepted = filterDraftsByConv(drafts, scope.convId);
+    const dropped = drafts.length - accepted.length;
+    if (dropped > 0) {
+      diag('bg.upsert', `tab #${tabId} 丢弃异会话草稿 ${dropped} 条（该槽会话=${scope.convId}）`, { level: 'warn' });
+    }
+    if (!accepted.length) continue;
+
+    const slot = slotOf(slots, tabId);
+    const result = upsertDrafts(slot, accepted, { skipThumbOnly: config.skipThumbOnly });
+    if (result.added || result.merged) {
+      slots[String(tabId)] = result.library;
+      touched = true;
+      broadcast(MSG.LibrarySync, { convId: scope.convId, library: result.library } satisfies LibrarySyncPayload);
+    }
+
+    diag(
+      'bg.upsert',
+      `tab #${tabId} in=${accepted.length} added=${result.added} merged=${result.merged} skipped=${result.skipped} evicted=${result.evicted} slot=${Object.keys(result.library).length} skipThumbOnly=${config.skipThumbOnly}`,
+      result.added || result.merged ? {} : { level: 'warn' },
+    );
+
+    // 体积实测：创作树里查不到体积的条目（候选流 / 超期视频 / 超过约三个月的旧图片）
+    // 立刻量一次真实字节数 —— **入库即测**（`pending` 也测：先给出「预览体积」，
+    // 原片就绪后由树里的真值覆盖，见 `core/size-probe.ts` 与 `docs/03` §37）。
+    // ⚠️ 真正发起在**本批全部写库之后**（下面的循环），否则读到的还是旧缓存；
+    // 且**不 await**：每条最多 8s，等在这里会把入库链路拖住几十秒，期间别的写入
+    // （`bg.expire` 的超期落库等）可能被旧快照回写覆盖 —— 实测踩过这个坑。
+    pendingProbes.push({ tabId, ids: accepted.map((draft) => itemId(draft.convId, draft.fingerprint)) });
   }
-  if (!drafts.length) return;
 
-  const [library, config] = await Promise.all([getLibrary(), readConfig()]);
-  const result = upsertDrafts(library, drafts, { skipThumbOnly: config.skipThumbOnly });
-  if (result.added || result.merged) await persistLibrary(result.library);
-
-  diag(
-    'bg.upsert',
-    `in=${drafts.length} added=${result.added} merged=${result.merged} skipped=${result.skipped} evicted=${result.evicted} total=${Object.keys(result.library).length} skipThumbOnly=${config.skipThumbOnly}`,
-    result.added || result.merged ? {} : { level: 'warn' },
-  );
-
-  // 体积兜底：创作树里查不到体积的条目（超期视频 / 超过约三个月的旧图片）实测一次字节数。
-  // ⚠️ **不 await**：每条最多 8s，等在这里会把入库链路拖住几十秒，期间别的写入
-  // （`bg.expire` 的超期落库等）可能被旧快照回写覆盖 —— 实测踩过这个坑。
-  void backfillSizes(drafts.map((draft) => itemId(draft.convId, draft.fingerprint)));
+  if (touched) await persistSlots(slots);
+  for (const probe of pendingProbes) void backfillSizes(probe.tabId, probe.ids);
 }
 
 /* --------------------------------------------------------------------------- */
-/* 体积兜底（2026-09-28 第十轮补丁）                                              */
+/* 体积实测（2026-09-28 第十轮补丁；2026-10-02 §37 改「入库即测」）                    */
 /*                                                                             */
 /* 体积的**首选来源**是创作树节点 `size`（视频由 vid 三步 API 带回、图片由页面侧         */
 /* `imageSizeOf` 查树带回）—— 零额外请求、实测与落盘字节数一致。                      */
-/* 树里没有的条目（超期视频 / 超过约三个月的旧图片）就只能**实测**：                       */
+/* 树里没有的条目（候选流 / 超期视频 / 超过约三个月的旧图片）就只能**实测**：            */
 /* 对条目 `primary`（点下载真正会拿到的那个地址）发一次 `Range: bytes=0-0`，             */
 /* 从 `Content-Range` 读总长 —— 只下 1 字节。                                      */
 /*                                                                             */
-/* ⚠️ 必须在这里（background）发：页面里发会被 CORS 挡住响应头（探针实测              */
-/* `content-range=null`）；扩展上下文有 host_permissions，能读全。                     */
-/* ⚠️ 只测「已定局」的条目（`pending` 表示还在解析中，体积等一下就会随解析结果来），        */
-/* 且同一条目在一个 SW 生命周期内只测一次（失败不重试，等 F5 重解析）。                  */
+/* ⚠️ 必须在这里（background）发：页面里发会被 CORS 挡住响应头（探针实测                */
+/* `content-range=null`；而 `*.365yg.com` 还会因为页面请求带豆包 Referer 直接回 403）。  */
+/* 扩展上下文有 host_permissions（不需要 `Range` 的**预检**也实测能过：该域回 200 +      */
+/* `ACAO: *` + `Allow-Headers: range`），能读全 —— 见 `docs/03` §37 的四个 curl 实验。   */
+/*                                                                             */
+/* ⚠️ 调度规则见 `core/size-probe.ts`（纯函数、可单测）：**入库即测**（`state=pending`     */
+/* 也测）、**按「条目 + 归一化地址」记账**（地址换成另一个文件就允许重测）、              */
+/* **失败只重试 1 次**（`LIMITS.SIZE_PROBE_RETRY`），绝不做无上限轮询。                 */
 /* --------------------------------------------------------------------------- */
 
-const probedSizeIds = new Set<string>();
+/**
+ * 探测记账：**每个标签页一份**（`tabId → (sizeProbeKey(item) → 已尝试次数)`）。
+ *
+ * ⚠️ 原实现是 `Set<itemId>` 且**在测量之前就记下** → 一次失败即永久跳过（时有时无的根因），
+ * 且地址换成另一个文件后也不会重测。现在按「条目 + 归一化地址」记账、失败留重试额度。
+ * 量到就写 `meta.size`，`needsSizeProbe` 见它有值即跳过 —— 成功不需要额外标记。
+ * §38 起再按标签页分层：条目 id 只在槽内唯一（同一会话在两个标签页里会有两份同名 id）。
+ */
+const sizeProbeAttempts = new Map<number, Map<string, number>>();
 
-/** 该条目现在还值得测体积吗（已定局、缺体积、地址是可取的 http(s)） */
-function needsSizeProbe(item: MediaItem): boolean {
-  if (item.meta.size !== undefined) return false;
-  if (item.state === 'pending') return false;
-  if (probedSizeIds.has(item.id)) return false;
-  return /^https?:/i.test(item.primary);
+function attemptsFor(tabId: number): Map<string, number> {
+  let map = sizeProbeAttempts.get(tabId);
+  if (!map) {
+    map = new Map<string, number>();
+    sizeProbeAttempts.set(tabId, map);
+  }
+  return map;
 }
 
 /**
@@ -419,55 +587,117 @@ async function measureBytes(url: string): Promise<{ size?: number; note: string 
 }
 
 /**
- * 给「体积仍缺失且已定局」的条目实测字节数，回写 `meta.size`。
+ * 给「体积仍缺失」的条目实测字节数，回写 `meta.size`。
  * 每轮最多 `SIZE_PROBE_MAX_PER_ROUND` 条、串行执行（避免对 CDN 打出脉冲）。
  *
- * 入参是**条目 id**（`itemId()` 的产物）—— upsert 后与「原片已超期」落库后都要走一次。
+ * 入参是**条目 id**（`itemId()` 的产物）—— 入库后（`flushDrafts`）与「原片已超期」落库后
+ * 都要走一次；地址换成另一个文件的条目也会被下一次 upsert 重新排进来（按地址记账）。
  */
-async function backfillSizes(ids: Iterable<string>): Promise<void> {
+async function backfillSizes(tabId: number, ids: Iterable<string>): Promise<void> {
   const unique = [...new Set(ids)];
   if (!unique.length) return;
-  const library = await getLibrary();
+  const slot = slotOf(await getSlots(), tabId);
+  const attempts = attemptsFor(tabId);
   const candidates = unique
-    .map((id) => library[id])
-    .filter((item): item is MediaItem => !!item && needsSizeProbe(item));
+    .map((id) => slot[id])
+    .filter((item): item is MediaItem => !!item && needsSizeProbe(item, attempts));
   const todo = candidates.slice(0, LIMITS.SIZE_PROBE_MAX_PER_ROUND);
   const rest = candidates.slice(LIMITS.SIZE_PROBE_MAX_PER_ROUND).map((item) => item.id);
   if (!todo.length) return;
 
   let measured = 0;
+  let rawCount = 0;
   let failed = 0;
+  /** 扫描到「该测」、但轮到它时条目已经被清掉（切会话/关标签页）—— 单列一档，别混进「失败」 */
+  let vanished = 0;
+  /** 写回被守卫拦下（预览实测值晚于创作树真值到场，§41）—— 保留真值，不覆盖 */
+  let keptRaw = 0;
   const notes: string[] = [];
+  const samples: string[] = [];
+  const retryIds: string[] = [];
+  /** 写回了「预览体积」但条目已原片就绪 → 稍后自触发一次升级补测（§41，不等下一次 upsert） */
+  const upgradeIds: string[] = [];
   for (const item of todo) {
-    probedSizeIds.add(item.id);
+    // 先记账再发请求（并发安全）；失败时额度没用完 → 排一次重试
+    const used = recordProbeAttempt(attempts, item);
     const result = await measureBytes(item.primary);
     if (result.size === undefined) {
       failed += 1;
       if (notes.length < 2) notes.push(result.note);
+      if (canRetryProbe(used)) retryIds.push(item.id);
       continue;
     }
     /*
-     * 每条**重新读一次**当前库再打补丁：批量下载/解析期间别的路径（如 `bg.expire`、
+     * 每条**重新读一次**当前槽再打补丁：批量下载/解析期间别的路径（如 `bg.expire`、
      * 页面新草稿）也在写库，用旧快照整体回写会把它们的成果抹掉。
+     *
+     * ⚠️ **归属标记必须按「测量那一刻」的快照判定**（§39）：`item` 是扫描时的快照，
+     * 而 `primary` 可能在测量的这 ~0.7s 里从候选流切到原片 —— 旧实现只写数字不写归属，
+     * 于是「候选流的 3.0 MB」被记成了原片体积（实机卡片 `3.0 MB` 对真原片 `7.1 MB`）。
+     * ⚠️ 判据用 `sizeForNow()`（`rawReady`：`state === 'raw'` **或** primary 是 isRaw 变体）——
+     * 与「要不要升级测量」共用同一把尺子，避免两处判据分叉（§39.6 的实机 bug）。
+     * ⚠️ **写回守卫（§41）**：若测的是预览归属、而条目此刻已拿着原片归属的体积
+     * （创作树真值在探测在飞期间落库），这次写回是**降级**，必须跳过 ——
+     * 实机：真值 35.9 MB 落库后 0.4s 被在飞预览实测覆盖回「预览 5.1 MB」，
+     * 而升级补测没有自触发，卡片停了 ~39s 才因用户开弹窗触发重解析翻正。
      */
-    const current = (await getLibrary())[item.id];
-    if (!current) continue;
-    await persistLibrary(patchItem(await getLibrary(), item.id, { meta: { ...current.meta, size: result.size } }));
+    const current = slotOf(await getSlots(), tabId)[item.id];
+    if (!current) {
+      vanished += 1;
+      continue;
+    }
+    const sizeFor = sizeForNow(item);
+    if (probeWriteBlocked(item, current)) {
+      keptRaw += 1;
+      continue;
+    }
+    await writeSlot(tabId, patchItem(slotOf(await getSlots(), tabId), item.id, {
+      meta: { ...current.meta, size: result.size, sizeFor },
+    }));
     measured += 1;
+    if (sizeFor === 'raw') rawCount += 1;
+    else if (needsRawSizeUpgrade(current)) upgradeIds.push(item.id);
+    /*
+     * 样本行（§40）：诊断里必须能看出「这条体积是量谁得到的、算到哪个文件头上」——
+     * 此前 `bg.size` 只有汇总数字，排查「卡片体积不对」时无从下手（`docs/03` §39 / §39.6
+     * 两轮都得反推）。最多留 3 条，控制记录长度。
+     */
+    if (samples.length < 3) {
+      const tag = item.fingerprint.length > 8 ? item.fingerprint.slice(-8) : item.fingerprint;
+      samples.push(`${tag}→${(result.size / 1048576).toFixed(1)}MB(${sizeFor === 'raw' ? '原片' : '预览'})`);
+    }
   }
   diag(
     'bg.size',
-    `实测字节：成功 ${measured} 条 / 失败 ${failed} 条（候选 ${todo.length} 条${
+    `实测字节（tab #${tabId}）：成功 ${measured} 条（原片 ${rawCount} / 预览体积 ${measured - rawCount}）/ 失败 ${failed} 条${
+      vanished ? ` / 已消失 ${vanished} 条` : ''
+    }${keptRaw ? ` / 保留真值 ${keptRaw} 条（§41）` : ''}（候选 ${todo.length} 条${
       rest.length ? `，余 ${rest.length} 条下一轮继续` : ''
-    }）${notes.length ? `｜失败原因：${notes.join(' ; ')}` : ''}`,
-    measured ? {} : { level: 'warn' },
+    }${
+      retryIds.length ? `，${retryIds.length} 条 ${Math.round(LIMITS.SIZE_PROBE_RETRY_DELAY_MS / 1000)}s 后重试` : ''
+    }${
+      upgradeIds.length
+        ? `，${upgradeIds.length} 条 ${Math.round(LIMITS.SIZE_PROBE_UPGRADE_DELAY_MS / 1000)}s 后升级补测（原片就绪、只有预览体积）`
+        : ''
+    }）${samples.length ? `｜样本：${samples.join(' ')}` : ''}${notes.length ? `｜失败原因：${notes.join(' ; ')}` : ''}`,
+    measured || keptRaw ? {} : { level: 'warn' },
   );
   /*
    * 一个会话里可能压着几十条待测（例如整屏都是超过三个月的旧图片），而每轮只放
    * `SIZE_PROBE_MAX_PER_ROUND` 条 —— 剩下的**分批续跑**（一次性定时器，不是轮询；
-   * 每轮都会把测过的 id 记进 `probedSizeIds`，所以一定会收敛到「没有候选」而停下）。
+   * 每轮都会把测过的地址记进 `sizeProbeAttempts`，所以一定会收敛到「没有候选」而停下）。
    */
-  if (rest.length) setTimeout(() => void backfillSizes(rest), LIMITS.SIZE_PROBE_CONTINUE_MS);
+  if (rest.length) setTimeout(() => void backfillSizes(tabId, rest), LIMITS.SIZE_PROBE_CONTINUE_MS);
+  // 失败重试：同样是一次性定时器，且额度写死在 `LIMITS.SIZE_PROBE_RETRY`（用户拍板 1 次）
+  if (retryIds.length) setTimeout(() => void backfillSizes(tabId, retryIds), LIMITS.SIZE_PROBE_RETRY_DELAY_MS);
+  /*
+   * 升级补测自触发（§41）：写回「预览体积」时条目已原片就绪（创作树真值没给 `size`、
+   * 或真值落库与本轮写回赛跑）—— 原实现只能等「下一次 upsert」才有机会升级，
+   * 用户不动界面就一直停在「预览 X.X MB」。这里主动排一次补测：走同一套记账与额度
+   * （原片地址是新账本），若下一次 upsert 先到且已带来真值，补测醒来发现
+   * `needsSizeProbe = false` 自然空转退出，不会多发请求。
+   */
+  if (upgradeIds.length) setTimeout(() => void backfillSizes(tabId, upgradeIds), LIMITS.SIZE_PROBE_UPGRADE_DELAY_MS);
 }
 
 /* --------------------------------------------------------------------------- */
@@ -489,10 +719,23 @@ const queue = new DownloadQueue({
   },
 });
 
+/**
+ * 把一个条目落成「获取失败」。
+ *
+ * §38 起库是**多槽**的，而队列任务只带条目 id（槽内唯一，跨槽可能重名）——
+ * 所以在所有槽里找一遍，命中几个就标几个（同一会话开在两个标签页时，两边都该显示失败）。
+ */
 async function markItemFailed(itemId: string): Promise<void> {
-  const library = await getLibrary();
-  if (!library[itemId]) return;
-  await persistLibrary(markFailed(library, itemId));
+  const slots = { ...(await getSlots()) };
+  let touched = false;
+  for (const [tabKey, slot] of Object.entries(slots)) {
+    if (!slot[itemId]) continue;
+    const next = markFailed(slot, itemId);
+    if (next === slot) continue;
+    slots[tabKey] = next;
+    touched = true;
+  }
+  if (touched) await persistSlots(slots);
 }
 
 /** 等待某个 chrome.downloads 任务结束 */
@@ -665,8 +908,27 @@ async function resolveReportTarget(explicitTabId?: number, follow = false): Prom
   return { tabId: activeTabId, followedRecent: false };
 }
 
-/** 把 UI / 页面的下载请求展开成一批下载目标 */
-async function buildTargets(request: DownloadRequest): Promise<DownloadTarget[]> {
+/**
+ * 在所有槽里找一个条目（**唯一命中**才算数，§38）。
+ *
+ * 用于兜底：UI 传来的 id 是槽内键（`convId::fingerprint`），跨槽可能重名
+ * （同一会话开在两个标签页）。正常路径先在「请求方标签页的槽」里找，找不到才来这里；
+ * 多个槽都有同名条目时返回 null（说不清是哪一个 → 让调用方跳过，宁可不下载也不下错）。
+ */
+async function findItemEverywhere(id: string): Promise<{ tabId: number; item: MediaItem } | null> {
+  const slots = await getSlots();
+  let hit: { tabId: number; item: MediaItem } | null = null;
+  for (const [tabKey, slot] of Object.entries(slots)) {
+    const item = slot[id];
+    if (!item) continue;
+    if (hit) return null;
+    hit = { tabId: Number(tabKey), item };
+  }
+  return hit;
+}
+
+/** 把 UI / 页面的下载请求展开成一批下载目标（**优先在请求方标签页的槽里找**） */
+async function buildTargets(request: DownloadRequest, tabId: number | null): Promise<DownloadTarget[]> {
   if (request.url) {
     return [
       {
@@ -680,11 +942,17 @@ async function buildTargets(request: DownloadRequest): Promise<DownloadTarget[]>
 
   const ids = request.ids ?? [];
   if (!ids.length) return [];
-  const library = await getLibrary();
+  const slot = slotOf(await getSlots(), tabId);
   const targets: DownloadTarget[] = [];
   for (const id of ids) {
-    const item = library[id];
-    if (!item) continue;
+    let item: MediaItem | undefined = slot[id];
+    let slotTabId = tabId ?? undefined;
+    if (!item) {
+      const found = await findItemEverywhere(id);
+      if (!found) continue;
+      item = found.item;
+      slotTabId = found.tabId;
+    }
     const target: DownloadTarget = {
       itemId: item.id,
       convId: item.convId,
@@ -693,6 +961,8 @@ async function buildTargets(request: DownloadRequest): Promise<DownloadTarget[]>
       // 文件名要用的两个站点真值：真实生成时间 + 所属对话页标题（弱/缺失时 download.ts 里兜底）
       createdAtMs: item.meta.createdAt,
       convTitle: item.convTitle,
+      // 自愈回写要知道改哪个槽（§38）
+      slotTabId,
     };
     // 视频指纹形如 `vid:<x>` —— 签名地址过期时靠它让页面重新解析
     if (item.fingerprint.startsWith('vid:')) target.vid = item.fingerprint.slice(4);
@@ -712,9 +982,10 @@ async function refreshTargetUrl(target: DownloadTarget, tabId: number | null): P
   const url = res?.url ?? null;
   if (!url) return null;
 
-  const library = await getLibrary();
-  if (target.itemId && library[target.itemId]) {
-    await persistLibrary(patchItem(library, target.itemId, { primary: url, state: 'raw' }));
+  const slotTab = target.slotTabId ?? tabId;
+  const slot = slotOf(await getSlots(), slotTab);
+  if (target.itemId && slot[target.itemId]) {
+    await writeSlot(slotTab, patchItem(slot, target.itemId, { primary: url, state: 'raw' }));
   }
   diag('bg.download', `已重新解析原片地址 vid=${target.vid}（签名过期自愈）`);
   return url;
@@ -724,10 +995,10 @@ async function handleDownloadRequest(
   request: DownloadRequest,
   senderTabId?: number,
 ): Promise<{ ok: boolean; queued: number; error?: string }> {
-  const targets = await buildTargets(request);
+  const tabId = senderTabId ?? (await resolveActiveTabId());
+  const targets = await buildTargets(request, tabId);
   if (!targets.length) return { ok: false, queued: 0, error: '没有可下载的资源' };
 
-  const tabId = senderTabId ?? (await resolveActiveTabId());
   const allocator = new FilenameAllocator();
   diag('bg.download', `入队 ${targets.length} 项（ids=${request.ids?.length ?? 0} inline=${request.url ? 1 : 0} tabId=${tabId ?? '-'}）`);
 
@@ -761,7 +1032,13 @@ function isDoubaoUrl(url: string | undefined): boolean {
   if (!isDoubaoHostUrl(url)) return false;
   try {
     const { pathname } = new URL(url ?? '');
-    return CHAT_PATH_PATTERN.test(pathname) || THREAD_PATH_PATTERN.test(pathname);
+    /*
+     * ⚠️ 2026-10-02 §36/§38：`/video-sharing`（单条视频分享页）**也是会话页** ——
+     * 它的会话 ID 在查询参数里（`share_<share_id>`，见 `convIdFromUrl`），
+     * 旧实现只认 chat / thread 两条路径，导致分享页被当成「非豆包页」
+     * （`stale` 判定失效 + 槽的离开判定误伤）。
+     */
+    return CHAT_PATH_PATTERN.test(pathname) || THREAD_PATH_PATTERN.test(pathname) || VIDEO_SHARE_PATH_PATTERN.test(pathname);
   } catch {
     return false;
   }
@@ -775,7 +1052,7 @@ function isDoubaoUrl(url: string | undefined): boolean {
  * `detectKind` 同一条口径）。
  */
 function isDoubaoConversationUrl(url: string | undefined): boolean {
-  return isDoubaoUrl(url) && CONV_ID_PATTERN.test(url ?? '');
+  return isDoubaoUrl(url) && Boolean(convIdFromUrl(url));
 }
 
 const NONE_PAGE: PageInfo = { kind: 'none', convId: '', title: '', url: '', injected: false };
@@ -794,7 +1071,8 @@ async function buildStateResponse(request?: StateRequest): Promise<StateResponse
       if (page.kind !== 'none') {
         void rememberContentTab(tabId);
         // 会话作用域兜底收敛：即使 conv:scope 消息丢了，问一次页面也能对齐
-        await applyScope({ convId: page.convId, title: page.title, kind: page.kind });
+        // ⚠️ §38 起必须带上 tabId —— 否则会去动「别人的槽」（多标签页实机 bug）
+        await applyScope({ convId: page.convId, title: page.title, kind: page.kind }, tabId);
       }
     } else {
       // 内容脚本没应答：区分「豆包会话页但没注入」与「压根不是会话页」
@@ -811,14 +1089,14 @@ async function buildStateResponse(request?: StateRequest): Promise<StateResponse
     }
   }
 
-  // ⚠️ 必须等会话作用域收敛之后再取库，否则本次的 stats 会按「裁剪前」的旧库算
-  const library = await getLibrary();
-  const stats = statsOf(library, page.convId || undefined);
+  // ⚠️ 必须等会话作用域收敛之后再取库，否则本次的 stats 会按「裁剪前」的旧槽算
+  const slot = slotOf(await getSlots(), tabId);
+  const stats = statsOf(slot, page.convId || undefined);
   diag(
     'bg.state',
     `tabId=${tabId ?? '-'}${followedRecent ? '(跟随最近豆包页)' : ''} page=${page.kind}/${page.convId || '-'} title=${
       page.title || '-'
-    } lib=${Object.keys(library).length} stats=${stats.total}`,
+    } slot=${Object.keys(slot).length} stats=${stats.total}`,
   );
 
   return {
@@ -826,7 +1104,7 @@ async function buildStateResponse(request?: StateRequest): Promise<StateResponse
     page,
     stale,
     stats,
-    libraryTotal: Object.keys(library).length,
+    libraryTotal: Object.keys(slot).length,
     version: EXT_VERSION,
     progress: lastProgress,
   };
@@ -841,10 +1119,15 @@ onRuntimeMessage((env, sender, sendResponse) => {
     /* ---- content → bg ---- */
     case MSG.MediaAppend: {
       const drafts = env.payload as MediaDraft[] | undefined;
-      if (typeof sender.tab?.id === 'number') void rememberContentTab(sender.tab.id);
+      const tabId = sender.tab?.id;
+      if (typeof tabId === 'number') void rememberContentTab(tabId);
       if (Array.isArray(drafts) && drafts.length) {
-        queueDrafts(drafts);
-        diag('bg.media', `收到草稿 ${drafts.length} 条：${drafts.map((d) => `${d.kind}:${d.state}`).join(',')}`);
+        // §38：草稿必须带回来源标签页 —— 它决定进哪个槽
+        queueDrafts(drafts, typeof tabId === 'number' ? tabId : null);
+        diag(
+          'bg.media',
+          `tab #${tabId ?? '-'} 收到草稿 ${drafts.length} 条：${drafts.map((d) => `${d.kind}:${d.state}`).join(',')}`,
+        );
       }
       sendResponse({ ok: true });
       return undefined;
@@ -859,12 +1142,13 @@ onRuntimeMessage((env, sender, sendResponse) => {
       return undefined;
     }
 
-    // 当前激活会话变了（第四轮）→ 资源库按会话裁剪 + 刷新会话名
+    // 当前激活会话变了（第四轮；§38 起**只作用于本标签页的槽**）→ 裁剪该槽 + 刷新会话名
     case MSG.ConvScope: {
       const scope = env.payload as ConvScope | undefined;
-      if (typeof sender.tab?.id === 'number') void rememberContentTab(sender.tab.id);
+      const tabId = sender.tab?.id;
+      if (typeof tabId === 'number') void rememberContentTab(tabId);
       if (scope && typeof scope.convId === 'string') {
-        void applyScope(scope).then(() => sendResponse({ ok: true }));
+        void applyScope(scope, typeof tabId === 'number' ? tabId : null).then(() => sendResponse({ ok: true }));
         return true;
       }
       sendResponse({ ok: false });
@@ -874,15 +1158,16 @@ onRuntimeMessage((env, sender, sendResponse) => {
     // 原片已超期（2026-09-27 Finding C）：页面翻遍创作树未见该 vid → 确定性失败，不再永挂「解析中」
     case MSG.LibraryExpire: {
       const payload = env.payload as { convId?: string; fingerprint?: string; vid?: string } | undefined;
-      if (payload?.convId && payload.fingerprint) {
+      const tabId = sender.tab?.id;
+      if (payload?.convId && payload.fingerprint && typeof tabId === 'number') {
         void (async () => {
-          const library = await getLibrary();
-          const next = markExpired(library, payload.convId as string, payload.fingerprint as string);
-          if (next !== library) {
-            await persistLibrary(next);
+          const slot = slotOf(await getSlots(), tabId);
+          const next = markExpired(slot, payload.convId as string, payload.fingerprint as string);
+          if (next !== slot) {
+            await writeSlot(tabId, next);
             diag(
               'bg.expire',
-              `convId=${payload.convId} fingerprint=${payload.fingerprint} → 原片已超期（创作树二次确认仍未见）`,
+              `tab #${tabId} convId=${payload.convId} fingerprint=${payload.fingerprint} → 原片已超期（创作树二次确认仍未见）`,
               { level: 'warn' },
             );
             /*
@@ -890,7 +1175,7 @@ onRuntimeMessage((env, sender, sendResponse) => {
              * 站点可下载的那个文件 —— 实测一次字节数，卡片就有「文件大小」了
              * （口径：显示的是**能下载到的那个文件**的体积，用户已拍板，2026-09-28）。
              */
-            void backfillSizes([itemId(payload.convId as string, payload.fingerprint as string)]);
+            void backfillSizes(tabId, [itemId(payload.convId as string, payload.fingerprint as string)]);
           }
           sendResponse({ ok: true });
         })();
@@ -922,12 +1207,19 @@ onRuntimeMessage((env, sender, sendResponse) => {
     }
 
     case MSG.LibraryList: {
+      const request = (env.payload ?? {}) as LibraryRequest;
       void (async () => {
-        // 打开资源库时主动对齐一次会话作用域：保证返回的库就是「当前激活会话的库」
-        const { tabId } = await resolveReportTarget(undefined, false);
+        /*
+         * 打开资源库时主动对齐一次会话作用域：保证返回的库就是「当前标签页那个槽」。
+         * §38：取库范围 = **报告目标标签页的槽** —— 弹窗不传 `follow`（活动标签页就是用户
+         * 在看的那页），诊断页传 `follow: true`（它自己是 active tab，得跟随豆包页）。
+         * `syncScopeFromTab` 也只动这个槽。
+         */
+        const { tabId } = await resolveReportTarget(request.tabId, request.follow === true);
         await syncScopeFromTab(tabId);
-        const [library, config, scope] = await Promise.all([getLibrary(), readConfig(), recallScope()]);
-        sendResponse({ library, config, scope });
+        const [slots, config] = await Promise.all([getSlots(), readConfig()]);
+        const scope = tabScopeOf(tabId) ?? (await recallScope());
+        sendResponse({ library: slotOf(slots, tabId), config, scope });
       })();
       return true;
     }
@@ -989,12 +1281,84 @@ chrome.runtime.onStartup.addListener(() => {
   void migrate();
 });
 
-onStateChanged((change) => {
-  // background 是唯一写入方，库里出现外部变更只可能是别的上下文写入 → 同步缓存
-  if (change.library) libraryCache = change.library;
+/* --------------------------------------------------------------------------- */
+/* 标签页槽的生命周期（2026-10-02 §38）                                            */
+/*                                                                             */
+/* 多槽之后，「什么时候删」必须明确，否则要么互相删（旧 bug）、要么永久堆积：        */
+/*   · **关标签页** → 删该槽；                                                    */
+/*   · **该标签页离开会话**（导航到非会话页：豆包首页 / 别的站点）→ 清该槽；           */
+/*   · **浏览器重启 / 扩展重载**后 tabId 会重新分配 → 启动时对账，删掉不存在的槽。     */
+/* ⚠️ 页面侧自报 `kind=none`（首页）走的是 `applyScope` 的离开分支，两条路都覆盖。       */
+/* --------------------------------------------------------------------------- */
+
+/** 该会话是否还被别的活标签页占着（同一会话开两个标签页时，别把另一个的槽删了） */
+async function convStillOpen(convId: string, exceptTabId: number): Promise<boolean> {
+  for (const [tabId, scope] of (await getTabScopes()).entries()) {
+    if (tabId !== exceptTabId && scope.convId === convId) return true;
+  }
+  return false;
+}
+
+/** 释放一个标签页的槽（关标签页 / 离开会话）；会话仍被别的标签页占着时只忘掉映射，不删槽 */
+async function releaseTab(tabId: number, reason: string): Promise<void> {
+  const scope = (await getTabScopes()).get(tabId);
+  await forgetTabScope(tabId);
+  if (!scope?.convId) return;
+  if (await convStillOpen(scope.convId, tabId)) return;
+  await dropSlot(tabId, reason);
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void releaseTab(tabId, '标签页已关闭');
 });
 
-// SW 唤醒后从磁盘恢复资源库缓存
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  // 只在**地址真的换了**时判断（SPA 的同文档导航也会给 changeInfo.url）
+  if (typeof changeInfo.url !== 'string') return;
+  if (convIdFromUrl(changeInfo.url)) return; // 仍是会话页（含 /video-sharing）→ 交给页面自报
+  void releaseTab(tabId, `导航离开会话（${changeInfo.url.slice(0, 80)}）`);
+});
+
+/**
+ * 启动对账：删掉「已不存在的标签页」的槽。
+ *
+ * SW 被回收再唤醒 / 浏览器重启后，`tabId` 可能是上一轮的编号（浏览器重启后一定重排），
+ * 留着只会让存储缓慢膨胀、并可能被新标签页复用而串味。
+ */
+async function reconcileSlots(): Promise<void> {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const alive = new Set<number>();
+    for (const tab of tabs) if (typeof tab.id === 'number') alive.add(tab.id);
+
+    const slots = await getSlots();
+    const stale = Object.keys(slots).filter((key) => !alive.has(Number(key)));
+    if (stale.length) {
+      const next = { ...slots };
+      for (const key of stale) delete next[key];
+      await persistSlots(next);
+      diag('bg.slot', `启动对账：删除 ${stale.length} 个已不存在的标签页槽（${stale.join(',')}）`);
+    }
+
+    const scopes = await getTabScopes();
+    const scopesStale = [...scopes.keys()].filter((tabId) => !alive.has(tabId));
+    if (scopesStale.length) {
+      for (const tabId of scopesStale) scopes.delete(tabId);
+      await persistTabScopes();
+    }
+  } catch {
+    /* 对账是清理性工作，失败不影响业务 */
+  }
+}
+
+onStateChanged((change) => {
+  // background 是唯一写入方，库里出现外部变更只可能是别的上下文写入 → 同步缓存
+  if (change.library) slotsCache = change.library;
+});
+
+// SW 唤醒后从磁盘恢复资源库缓存，并做一次标签页对账（**延后 2s**：浏览器重启时标签页还在恢复，
+// 太早查会漏掉尚未恢复的标签页而误删它们的槽 —— 反正那些页面会重新加载并重新解析，代价为零）
 void readState().then((state) => {
-  libraryCache = state.library;
+  slotsCache = state.library;
+  setTimeout(() => void reconcileSlots(), 2_000);
 });

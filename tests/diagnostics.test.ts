@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { clip, describe as describeValue, isKeepEvent, makeRecord, pushBounded, sample } from '../src/core/diagnostics';
+import {
+  REPEAT_SUPPRESS_EVENTS,
+  clip,
+  createRepeatSuppressor,
+  describe as describeValue,
+  isKeepEvent,
+  makeRecord,
+  pushBounded,
+  sample,
+} from '../src/core/diagnostics';
 import type { DiagRecord } from '../src/core/diagnostics';
 
 describe('clip 截断', () => {
@@ -176,5 +185,46 @@ describe('pushBounded 淘汰（§26 补正：缓冲被关键记录填满时不�
     for (let n = 1; n <= 200; n++) list = pushBounded(list, nonCrit(n), 400, 900_000);
     expect(list.filter((r) => isKeepEvent(r.event)).length).toBe(300); // 关键记录一条不少
     expect(list.filter((r) => r.event === 'bg.upsert').length).toBe(100); // 非关键只保留配额余量
+  });
+});
+
+/**
+ * 纯查询回执的重复抑制（2026-10-02 §40）。
+ *
+ * 实测：一次 500 条的诊断导出里约四成是 `page.query` / `content.query` / `bg.state` ——
+ * 纯噪声会稀释 `vid.*` / `bg.size` / `draft.emit` 这些真证据。抑制规则**只对这三类生效**，
+ * 且**只与前一条同事件记录比较**：内容变了就记（会话切换 / 槽条数变化都看得见）。
+ */
+describe('createRepeatSuppressor（重复抑制，§40）', () => {
+  it('同一事件 + 同一 detail 连刷 → 只记第一条', () => {
+    const should = createRepeatSuppressor();
+    expect(should('page.query', 'kind=chat convId=a title=T')).toBe(true);
+    expect(should('page.query', 'kind=chat convId=a title=T')).toBe(false);
+    expect(should('page.query', 'kind=chat convId=a title=T')).toBe(false);
+    // 内容变了 → 记
+    expect(should('page.query', 'kind=chat convId=b title=T2')).toBe(true);
+    expect(should('page.query', 'kind=chat convId=b title=T2')).toBe(false);
+  });
+
+  it('★只抑制纯查询回执三类；`vid.*` / `bg.size` / `net.*` 等的重复**必须保留**（重复即证据）', () => {
+    const should = createRepeatSuppressor();
+    expect(should('vid.recheck', 'vid=v1 → 10s 后第 2/30 轮重扫')).toBe(true);
+    expect(should('vid.recheck', 'vid=v1 → 10s 后第 2/30 轮重扫')).toBe(true); // 不许吞
+    expect(should('bg.size', '实测字节：成功 1 条 / 失败 0 条')).toBe(true);
+    expect(should('bg.size', '实测字节：成功 1 条 / 失败 0 条')).toBe(true); // 不许吞
+    expect(should('net.xhr', '/im/chain/single len=45042')).toBe(true);
+    expect(should('net.xhr', '/im/chain/single len=45042')).toBe(true);
+  });
+
+  it('三个受抑制事件各自独立记账（互不干扰）', () => {
+    const should = createRepeatSuppressor();
+    expect(should('page.query', 'kind=none')).toBe(true);
+    expect(should('content.query', 'kind=none')).toBe(true); // 同 detail、不同事件 → 记
+    expect(should('bg.state', 'kind=none')).toBe(true);
+    expect(should('page.query', 'kind=none')).toBe(false); // 各自记忆里仍是旧的
+  });
+
+  it('抑制事件清单是**白名单**（写死三类，避免误伤排查事件）', () => {
+    expect([...REPEAT_SUPPRESS_EVENTS].sort()).toEqual(['bg.state', 'content.query', 'page.query']);
   });
 });

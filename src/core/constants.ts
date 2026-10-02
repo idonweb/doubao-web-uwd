@@ -5,7 +5,7 @@ import type { Config } from './types';
 export const EXT_NAME = '豆包无水印下载器';
 export const EXT_SHORT_NAME = 'UWD';
 /** 扩展显示版本（与 package.json 保持同步；manifest 版本在构建期由 package.json 注入） */
-export const EXT_VERSION = '1.1.3';
+export const EXT_VERSION = '1.2.0';
 
 /**
  * GitHub 仓库地址（2026-09-27 首发时回填）。
@@ -26,7 +26,7 @@ export const AUTHOR_BILI_UID = '400911';
 export const AUTHOR_BILI_NAME = 'B站 @暮星河';
 
 /** 存储 schema 版本，用于未来迁移 */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 /*
  * 版本历史：
  *   1 —— 初版。
@@ -46,7 +46,7 @@ export const STORAGE = {
 } as const;
 
 export const LIMITS = {
-  /** 资源库上限，超出按 lastSeen 升序 FIFO 淘汰 */
+  /** 资源库上限，超出按 lastSeen 升序 FIFO 淘汰 —— ⚠️ §38 起是**每个标签页槽**各自的上限 */
   LIBRARY_MAX: 99,
   /** 下载并发（豆包限流未知，取保守值 1） */
   DOWNLOAD_CONCURRENCY: 1,
@@ -90,20 +90,46 @@ export const LIMITS = {
    */
   VID_RETRY_COOLDOWN_MS: 3 * 60_000,
   /**
-   * 「实测文件字节数」的请求超时与每轮上限（2026-09-28 第十轮补丁）。
+   * 「实测文件字节数」的请求超时与每轮上限（2026-09-28 第十轮补丁；2026-10-02 §37 改「入库即测」）。
    *
-   * 创作树里没有的条目（超期视频 / 超过约三个月的旧图片）拿不到节点 `size`，
+   * 创作树里没有的条目（候选流 / 超期视频 / 超过约三个月的旧图片）拿不到节点 `size`，
    * 由 background 对条目 `primary` 发一次 `Range: bytes=0-0` 的 GET 读总长 ——
-   * 只下 1 字节，但仍然是一次真实网络请求，所以：单次 8s 超时、每轮入库最多 6 条，
-   * 且**同一条目在一个 background 生命周期内只测一次**（失败不重试，等 F5 重解析）。
+   * 只下 1 字节，但仍然是一次真实网络请求，所以：单次 8s 超时、每轮入库最多 6 条。
+   *
+   * ⚠️ 调度规则 2026-10-02 改版（用户拍板，见 `core/size-probe.ts` 文件头）：
+   *   · **不再等「已定局」** —— 入库即测（`state=pending` 也测），界面先显示「预览体积」，
+   *     原片解析成功后再由创作树真值覆盖；
+   *   · **按「条目 + 归一化地址」记账**，地址换成另一个文件就允许重测；
+   *   · 失败**只重试 `SIZE_PROBE_RETRY` 次**（用户拍板：1 次），仍失败等 F5 重解析，绝不轮询。
    */
   SIZE_PROBE_TIMEOUT_MS: 8_000,
   SIZE_PROBE_MAX_PER_ROUND: 6,
+  /**
+   * 单次体积探测失败后的**重试次数**（2026-10-02 §37，用户拍板：只重试 1 次）。
+   *
+   * 为什么需要：探测是一次真实网络请求，偶发失败（超时 / CDN 抖动 / 读不到头）会让卡片
+   * 永久空着体积 —— 原实现甚至把失败也记成「测过」，连 F5 之外没有任何翻案机会。
+   * 为什么不能多：与 vid 解析的失败冷却同一考量（踩坑 21）—— 无上限重试会把站点限流
+   * 喂着永不恢复；1 次重试足够盖住偶发抖动，确定性失败（403 / 结构变化）留给 F5。
+   */
+  SIZE_PROBE_RETRY: 1,
+  /** 失败重试前的等待（2s；给 CDN 抖动一点恢复时间，也不至于让用户等太久） */
+  SIZE_PROBE_RETRY_DELAY_MS: 2_000,
   /**
    * 待测条目多于一屏时的**分批续跑间隔**（一次性定时器，不是轮询）。
    * 每轮都会把测过的 id 记进 `probedSizeIds`，所以续跑一定收敛到「没有候选」而停下。
    */
   SIZE_PROBE_CONTINUE_MS: 1_500,
+  /**
+   * 「升级补测」的**自触发延迟**（2026-10-02 §41，一次性定时器，不是轮询）。
+   *
+   * 背景（实机）：探测批次在飞期间创作树真值落库 → 迟到的预览实测曾把真值降级覆盖
+   * （现由 `probeWriteBlocked` 拦下）；而「原片就绪但手里只有预览体积」的升级测量
+   * 原本只挂在「下一次 upsert」上 —— 用户不动界面就没有下一次，卡片长期停在
+   * 「预览 5.1 MB」（体感 ~39s 才翻正）。现在写回预览体积且条目已原片就绪时，
+   * 主动排一次补测（1.5s 后，走同一套「条目 + 阶段 + 地址」记账与额度，有界收敛）。
+   */
+  SIZE_PROBE_UPGRADE_DELAY_MS: 1_500,
   /**
    * 「原片已超期」的**结论阈值**（首次「树里未见」后经过多久仍未见，才允许判超期）。
    *
@@ -228,6 +254,16 @@ export const MSG = {
   DownloadMany: 'download:many',
   DownloadRetry: 'download:retry',
   DownloadProgress: 'download:progress',
+  /**
+   * bg → UI：**当前标签页槽**的资源库有更新（2026-10-02 §38）。
+   *
+   * 为什么需要这条广播：库改为**按标签页分槽**后（`storage.ts::LibrarySlots`），
+   * UI（扩展页）没有 tabId，无法从 `storage.onChanged` 里挑出自己的槽 ——
+   * 所以由 bg 在写槽之后**主动推**「这个标签页当前的槽」给 UI。
+   * 同一时刻只会有一个弹窗（扩展弹窗是单例），因此无条件采用是安全的；
+   * 诊断页仍走 `diag:changed` 的快照（`lib` 字段 = 当前槽条数）。
+   */
+  LibrarySync: 'library:sync',
 
   /* ---- 诊断（真机联调） ---- */
   /** content → bg：追加诊断记录 */

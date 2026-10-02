@@ -18,6 +18,19 @@
 export const CHAT_PATH_PATTERN = /\/chat\//;
 /** 分享链接页路径特征 [上游] */
 export const THREAD_PATH_PATTERN = /\/thread\//;
+/**
+ * **视频分享页**路径特征（单条视频的 H5 分享页）[实测 2026-10-02]
+ *
+ * 站位形态（用户手机上「分享 → 复制链接」得到的）：
+ *   `https://www.doubao.com/video-sharing?source_type=mobile&share_id=<19位数字>&video_id=<vid>`
+ * `location.pathname` 就是 `/video-sharing`（**没有尾斜杠**，别写成 `/video-sharing/`）。
+ *
+ * 它与 `/thread/`（整段对话分享）一样属于**分享页**，因此本项目把它判成 `kind='thread'` ——
+ * 资源库作用域、页面徽标「分享页」、「原片不可得」这套措辞全部沿用现成实现，
+ * **不新增页面类型**（新增会牵动 `ConvKind` / UI 徽标 / 后台作用域好几处）。
+ * 它唯一不同的是**数据来源**：页面渲染前由路由 loader 单独发一个接口，见 §2.7。
+ */
+export const VIDEO_SHARE_PATH_PATTERN = /\/video-sharing(?:\/|$)/;
 /** 从 URL 中提取会话 ID 的特征（/chat/<id> 或 /thread/<id>） [上游] */
 export const CONV_ID_PATTERN = /\/(?:chat|thread)\/([A-Za-z0-9_-]+)/;
 
@@ -195,12 +208,17 @@ export const AISPACE_NODE_TYPE_VIDEO = 6;
  *
  * 📌 与之相对：**视频**的节点 `size` 是**已验证**的（实测与落盘原片字节数完全一致，§17.9），
  * 所以视频仍用「创作树 `size` 优先」。
+ *
+ * 📌 **调度口径 2026-10-02 改版（§37）**：实测「只测已定局条目 + 一个条目只测一次（失败也算测过）」
+ * 会让卡片体积**时有时无**。现行 = **入库即测**（`state=pending` 也测，界面先用「预览体积」如实标注）
+ * + **按「条目 + 归一化地址」记账**（换文件即可重测）+ **失败只重试 1 次**
+ * （`core/size-probe.ts`、`docs/03` §37）。
  */
 
 /**
  * 「按需实测文件字节数」的 Range 取值（2026-09-28 探针实测）。
  *
- * 用途：创作树里没有的条目（超期视频 / 超过约三个月的旧图片）拿不到节点 `size`，
+ * 用途：创作树里没有的条目（候选流 / 超期视频 / 超过约三个月的旧图片）拿不到节点 `size`，
  * 由 **background** 对该条目 `primary` 发一次 `Range: bytes=0-0` 的 GET，
  * 从响应头读总字节数 —— 量到的就是「点下载真正会拿到的那个文件」的体积。
  * 实测：服务器**支持** Range（回 206，`content-length: 1`，只下 1 字节）。
@@ -416,6 +434,142 @@ export const MODEL_LABEL_ALIASES: ReadonlyArray<readonly [string, string]> = [['
  * 而 `seedance_v2.0`（无后缀）同时对应标准版 / Fast / Mini → 有歧义，不采用。
  */
 export const MODEL_SINGLE_VARIANT_VERSIONS: readonly string[] = ['2.5'];
+
+/* ============================================================================
+ * §2.7 视频分享页（`/video-sharing`）—— 2026-10-02 第十六轮 [实测]
+ *
+ * 场景：用户在手机上把**单条视频**分享出来，链接形如
+ *   https://www.doubao.com/video-sharing?source_type=mobile
+ *     &share_id=57139820578269954&video_id=v0269cg10004daamhk27dld2vpu8bbgg
+ * 站点给这个路由起了一个**固定**的页面标题「豆包 AI 视频」
+ * （页面 chunk 里就是 `` `${DEFAULT_NAME} AI 视频` ``，与具体视频无关）。
+ *
+ * ── 为什么必须单独适配：数据来源与 `/thread/` 完全不同 ────────────────────────
+ *   · `/thread/`（整段对话分享）—— 数据在**页面自身的 chain / SSE 报文**里，hook 照常解析；
+ *   · `/video-sharing` —— 页面渲染前由**路由 loader** 发一次
+ *     `POST /creativity/share/get_video_share_info`（body `{share_id, vid, creation_id}`），
+ *     响应直接给出播放地址。这个接口**不在** chain / SSE 上，所以必须单独 hook
+ *     （`page/hook.ts::handleShareInfo`）。
+ *
+ * ── 实测响应形状（2026-10-02，curl 直调该接口）────────────────────────────────
+ *   { code: 0, msg: "",
+ *     data: {
+ *       play_info: { main, backup, height, width, definition, poster_url },
+ *       user_info: { user_id, user_name, nickname },
+ *       prompt: "8K 3D CG写实，……",
+ *       source_info: { author_uid, message_id, creation_task_id } } }
+ *
+ * 关键结论（都影响实现，别按直觉改）：
+ *   ① `main` / `backup` 都是**带水印**转码流（`lr=video_gen_watermark_dyn&download=true`），
+ *      就是网页播放的那个文件 —— 即「分享页只能拿到带水印版」，与既有口径一致；
+ *   ② 响应里**没有 vid**（只能从 URL 的 `video_id` 取）、**没有生成时间**、**没有文件体积** ——
+ *      所以这条素材的时间药丸排末尾、体积由 background 实测（`bg.size`，§37 起**入库即测**）兜底；
+ *   ③ `play_info.width/height`（实测 720×1280，`definition: "720p"`）描述的是**上面那个带水印
+ *      文件自己**的规格 —— 2026-10-02 用户拍板：**取它**，界面上显示成「预览 720×1280」没关系
+ *      （`toDraft` 对所有视频宽高一律打 `dimsPreview` 标记，措辞就是「预览」；
+ *      这比「什么都不显示」对用户更有信息量）。`definition` 字段**仍然不取** ——
+ *      清晰度标签（`meta.label`）只允许描述「最终下载的那个文件」，而该字段会在 vid 解析成功后
+ *      可能换成另一个文件（见 `docs/03` §12.7 的历史教训），宁缺勿假。
+ *
+ * ⚠️ **绝对不要把这个 CDN 加进 `CORS_INJECT_HOST_FILTERS`**（实测血泪，2026-10-02）：
+ *   播放地址的域名是 `*.365yg.com`（实测见过 `v5-se-gddgtc-default.365yg.com` /
+ *   `v9-default.365yg.com`，按 CDN 调度变）。该 CDN 的行为是：
+ *     · **不带 Referer** → `206 Partial Content`（正常，能下）；
+ *     · `Referer: https://www.doubao.com/…`（任何形态）→ **403 Forbidden**；
+ *     · 带 `Origin: chrome-extension://…`（background 实测体积时就是这样）→ 206 + `ACAO: *`。
+ *   而 `CORS_INJECT_HOST_FILTERS` 那两条规则**除了 CORS 响应头还会注入 Referer** ——
+ *   把 `365yg.com` 加进去，等于亲手把「本来能下的文件」打成 403。
+ *   弹窗里的封面在 `p26-sign.douyinpic.com`，那个域本来就在封面注入名单里，不受影响。
+ * ========================================================================== */
+
+/** `/video-sharing` 的数据接口（POST JSON，站点路由 loader 调用）[实测 2026-10-02] */
+export const VIDEO_SHARE_INFO_ENDPOINT = '/creativity/share/get_video_share_info';
+
+/** 分享页 URL 里三个查询参数（站点 loader 读的就是它们）[实测 2026-10-02] */
+export const VIDEO_SHARE_QUERY = {
+  shareId: 'share_id',
+  creationId: 'creation_id',
+  videoId: 'video_id',
+} as const;
+
+/**
+ * `/video-sharing` 页面的**会话 ID 前缀**（插件侧自己造的）。
+ *
+ * 该页 URL 的**路径里没有 ID**（id 全在查询参数里），而资源库是「会话作用域」的
+ * （`retainConv` 按 convId 裁剪），所以必须有一个人造的稳定键：
+ * `share_<share_id | creation_id | video_id>`。
+ * 加前缀有两个用处：诊断里一眼看出它来自分享页；且**不会与对话页 / `/thread/` 的
+ * 纯数字 convId 撞车**。
+ */
+export const SHARE_CONV_ID_PREFIX = 'share_';
+
+/** 「正在看的这条分享视频」的上下文（三个参数都取不到时全是空串） */
+export interface VideoShareQuery {
+  shareId: string;
+  creationId: string;
+  videoId: string;
+}
+
+/** 从 URL 里取分享页的三个参数（URL 非法 → 全空；**不编造**） */
+export function parseVideoShareQuery(href: string): VideoShareQuery {
+  const out: VideoShareQuery = { shareId: '', creationId: '', videoId: '' };
+  try {
+    const params = new URL(href).searchParams;
+    out.shareId = params.get(VIDEO_SHARE_QUERY.shareId) ?? '';
+    out.creationId = params.get(VIDEO_SHARE_QUERY.creationId) ?? '';
+    out.videoId = params.get(VIDEO_SHARE_QUERY.videoId) ?? '';
+  } catch {
+    /* 非法 URL → 全空 */
+  }
+  return out;
+}
+
+/**
+ * 分享页的**会话作用域键**：三个参数都取不到时返回空串（= 不算会话，
+ * 界面照旧提示「未检测到豆包对话或分享页面」，不会拿一个空作用域去清库）。
+ */
+export function videoShareConvId(href: string): string {
+  const { shareId, creationId, videoId } = parseVideoShareQuery(href);
+  const id = shareId || creationId || videoId;
+  return id ? SHARE_CONV_ID_PREFIX + id : '';
+}
+
+/**
+ * 从**任意 URL** 反推它属于哪个会话作用域（2026-10-02 §38 多标签页修复新增）。
+ *
+ * 用途：资源库按标签页分槽后，两处必须知道「这个标签页此刻在哪个会话」——
+ *   ① 存储迁移（v2 单库 → v3 分槽）时把旧条目归位到仍开着的那个标签页；
+ *   ② `tabs.onUpdated`：标签页导航到**非会话页**（豆包首页 / 别的站点）时
+ *      「离开会话」→ 清掉它的槽。
+ *
+ * ⚠️ 与页面侧 `detectConvId()` 必须同源（都走这里/`videoShareConvId`），
+ * 否则会出现「bg 认为这是会话页、页面认为不是」的静默分叉。
+ * 拿不到会话返回空串（**不编造**，绝不用空串去清库）。
+ */
+export function convIdFromUrl(url: string | undefined | null): string {
+  if (!url || !isDoubaoHostUrl(url)) return '';
+  const share = videoShareConvId(url);
+  if (share) return share;
+  const match = url.match(/\/(?:chat|thread)\/([A-Za-z0-9_-]+)/);
+  return match?.[1] ?? '';
+}
+
+/* --- 响应字段路径（以**整个响应体**为根求值）--------------------------------- */
+
+/** 播放信息子对象 */
+export const SHARE_PLAY_INFO_PATH = ['data', 'play_info'] as const;
+/** 播放地址（实测 `lr=video_gen_watermark_dyn&download=true`，**带水印**、网页播放的同一个文件） */
+export const SHARE_PLAY_MAIN_KEY = 'main';
+/** 备用播放地址（同为带水印转码流；因语义一致而复用 `RawMedia.fallbackApi`，只作末位候选） */
+export const SHARE_PLAY_BACKUP_KEY = 'backup';
+/**
+ * 播放文件的宽 / 高（实测 720×1280；数字形态，与站点其它数字字段一样可能给字符串，
+ * 故一律经 `asNumber()` 读取）。`toDraft` 会打上 `dimsPreview` 标记 → 界面显示「预览 720×1280」。
+ */
+export const SHARE_PLAY_WIDTH_KEY = 'width';
+export const SHARE_PLAY_HEIGHT_KEY = 'height';
+/** 封面图（实测在 `p26-sign.douyinpic.com`，走站点自己的带水印封面，不抓原片帧） */
+export const SHARE_POSTER_KEY = 'poster_url';
 
 /** 判定「一个对象是不是 creation」：含 `video` 或 `image` 子对象 [上游] */
 export const CREATION_MEDIA_KEYS = ['video', 'image'] as const;

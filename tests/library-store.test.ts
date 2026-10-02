@@ -8,7 +8,10 @@ import {
   itemId,
   markExpired,
   markFailed,
+  primaryIsRaw,
   queryLibrary,
+  rawReady,
+  sizeForNow,
   retainConv,
   retitleConv,
   statsOf,
@@ -16,7 +19,7 @@ import {
   type Library,
 } from '../src/core/library-store';
 import { RANK } from '../src/core/extract/common';
-import type { MediaDraft, MediaVariant } from '../src/core/types';
+import type { MediaDraft, MediaItem, MediaVariant } from '../src/core/types';
 
 const CONV = '7f3a92c1-08b4';
 
@@ -344,7 +347,7 @@ describe('体积与主地址的一致性（2026-09-28 实机踩坑的回归锁�
       { now: 2 },
     ).library;
     expect(second[id].primary).toBe('https://v.douyinvod.com/a/raw.mp4');
-    expect(second[id].meta.size).toBeUndefined(); // 旧数字不再属于新文件 → 清掉，交给 bg 实测
+    expect(second[id].meta.size).toBeUndefined(); // 旧数字不再属于新文件 → 清掉，§37 起由 bg 对新地址自动重测
   });
 
   it('primary 换地址但本次草稿自带 size（视频解析结果同批到达）→ 保留新 size', () => {
@@ -368,6 +371,100 @@ describe('体积与主地址的一致性（2026-09-28 实机踩坑的回归锁�
     const id = itemId(CONV, 'vid:v0abc');
     const second = upsertDrafts(first, [draft({ meta: { ext: 'png' }, cover: 'https://x/c.jpeg' })], { now: 2 }).library;
     expect(second[id].meta.size).toBe(3_996_293);
+  });
+
+  it('★§39：旧体积作废时，归属标记 `sizeFor` 一并清掉（不留「有归属、没数字」的残影）', () => {
+    const id = itemId(CONV, 'vid:v0abc');
+    const candidate: MediaVariant = {
+      url: 'https://v26-vdl.doubao.com/candidate.mp4',
+      label: '原始下载地址',
+      rank: 60,
+      isRaw: false,
+    };
+    const first = upsertDrafts(
+      {},
+      [draft({ state: 'pending', variants: [candidate], meta: { ext: 'mp4', size: 3_145_728, sizeFor: 'preview' } })],
+      { now: 1 },
+    ).library;
+    const second = upsertDrafts(
+      first,
+      [draft({ variants: [rawVariant('https://v.douyinvod.com/a/raw.mp4')], meta: { ext: 'mp4' } })],
+      { now: 2 },
+    ).library;
+    expect(second[id].primary).toBe('https://v.douyinvod.com/a/raw.mp4');
+    expect(second[id].meta.size).toBeUndefined();
+    expect(second[id].meta.sizeFor).toBeUndefined();
+  });
+
+  it('★§39：原片真值（size + sizeFor=raw）同批到达 → 覆盖掉旧的「预览体积」标注', () => {
+    const id = itemId(CONV, 'vid:v0abc');
+    const first = upsertDrafts({}, [draft({ meta: { ext: 'mp4', size: 3_145_728, sizeFor: 'preview' } })], {
+      now: 1,
+    }).library;
+    const second = upsertDrafts(
+      first,
+      [draft({ meta: { ext: 'mp4', size: 7_444_480, sizeFor: 'raw' } })],
+      { now: 2 },
+    ).library;
+    expect(second[id].meta.size).toBe(7_444_480);
+    expect(second[id].meta.sizeFor).toBe('raw');
+  });
+});
+
+describe('primaryIsRaw：当前下载地址是不是无水印原片（2026-10-02 §37 的「预览体积」判据）', () => {
+  const candidate: MediaVariant = {
+    url: 'https://v26-vdl.doubao.com/candidate.mp4?sign=1',
+    label: '候选地址（参数改写）',
+    rank: 60,
+    isRaw: false,
+  };
+  const raw: MediaVariant = { url: 'https://v.douyinvod.com/a/raw.mp4?sign=1', label: '无水印原片', rank: 120, isRaw: true };
+
+  const built = (variants: MediaVariant[], state: MediaItem['state'] = 'pending'): MediaItem => {
+    const library = upsertDrafts({}, [draft({ variants, state })], { now: 1 }).library;
+    return library[itemId(CONV, 'vid:v0abc')];
+  };
+
+  it('只有候选流 → false（卡片要标「预览体积」）', () => {
+    expect(primaryIsRaw(built([candidate]))).toBe(false);
+  });
+
+  it('原片变体就位并被选为 primary → true', () => {
+    expect(primaryIsRaw(built([raw, candidate], 'raw'))).toBe(true);
+  });
+
+  it('原片地址换了一份签名仍然算原片（按 normalizeUrl 比较）', () => {
+    const staleOwner = upsertDrafts({}, [draft({ variants: [raw, candidate], state: 'raw' })], { now: 1 }).library;
+    const id = itemId(CONV, 'vid:v0abc');
+    const resigned = { ...staleOwner[id], primary: 'https://v.douyinvod.com/a/raw.mp4?sign=99999&l=2026' };
+    expect(primaryIsRaw(resigned)).toBe(true);
+  });
+
+  it('下载失败（state=fail）不改判据 —— 原片体积不该被贴上「预览」', () => {
+    expect(primaryIsRaw(built([raw, candidate], 'raw'))).toBe(true);
+    expect(primaryIsRaw(built([candidate]))).toBe(false);
+  });
+
+  it('空 primary → false（不抛异常）', () => {
+    expect(primaryIsRaw({ ...built([candidate]), primary: '' })).toBe(false);
+  });
+
+  it('★rawReady / sizeForNow：`state=raw` 与「primary 是 isRaw」两个证据任一成立即算原片就绪', () => {
+    // 证据①：state=raw（变体关系可能还没稳定，实机 §39.6 就是这种情况）
+    const byState = { ...built([candidate]), state: 'raw' as const, meta: { ext: 'mp4', size: 1 } };
+    expect(primaryIsRaw(byState)).toBe(false); // 单看变体判不出来
+    expect(rawReady(byState)).toBe(true); // 但 state 已声明原片就绪
+    expect(sizeForNow(byState)).toBe('raw');
+
+    // 证据②：pending 但 primary 已是 isRaw 变体（例如 chain 直接给了 ori_raw）
+    const byVariant = built([raw, candidate]);
+    expect(byVariant.state).toBe('pending');
+    expect(rawReady(byVariant)).toBe(true);
+    expect(sizeForNow(byVariant)).toBe('raw');
+
+    // 都没有：pending + 只有候选流 → 体积属于「预览」
+    expect(rawReady(built([candidate]))).toBe(false);
+    expect(sizeForNow(built([candidate]))).toBe('preview');
   });
 });
 

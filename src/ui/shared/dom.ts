@@ -1,6 +1,7 @@
 /** UI 通用工具：转义、格式化、主题、Toast、复制 */
 
 import type { Config, MediaItem, MediaState } from '../../core/types';
+import { sizeForOf } from '../../core/library-store';
 import type { IconName } from './icons';
 
 /** HTML 转义 —— 上游把未转义的 URL 直接拼进 href，属于注入风险，这里统一收口 */
@@ -44,16 +45,26 @@ export function fmtClock(ts: number): string {
 /**
  * 卡片副信息：`2048×2048 · 3.2 MB`；信息不足时退回扩展名。
  * （真实生成时间不在这里 —— 它由 `itemTimeLabel()` 单独给出，位置见 `popup.ts` 的卡片模板。）
+ *
+ * 「预览」前缀（2026-10-02 §37 起用；§39 改为**按体积归属**判定，用户拍板）：
+ * 原片还没就绪时，卡片上那个数字描述的是**带水印候选流**（点下载此刻会拿到的那个文件），
+ * 如实标成「预览 3.1 MB」；拿到原片字节数（创作树真值 / 对原片的实测）后变回纯数字。
+ *   ① 判据 = `sizeForOf(item)`（**跟着数字走的归属标记**），**不是** `primaryIsRaw()` ——
+ *      后者是现场推断，在「实测候选流 → 原片才切过来」的竞态下会把候选流的数字当成原片体积
+ *      （实机 bug：卡片 `3.0 MB` + 「无水印原片」，而真原片 `7.1 MB`，见 `docs/03` §39）；
+ *   ② 宽高本来就是预览规格时（`meta.dimsPreview`，如 `预览 384×216`）**不再重复**两个字 ——
+ *      整行读作「预览 384×216 · 3.1 MB」，前缀对整个规格串生效。
  */
 export function itemMetaLine(item: MediaItem): string {
   const parts: string[] = [];
+  const dimsPreview = Boolean(item.meta.dimsPreview && item.meta.width && item.meta.height);
   if (item.meta.width && item.meta.height) {
     // 视频宽高常是预览转码流的规格（`docs/03` §12），如实标注「预览」，避免与清晰度标签矛盾
     const dims = `${item.meta.width}×${item.meta.height}`;
-    parts.push(item.meta.dimsPreview ? `预览 ${dims}` : dims);
+    parts.push(dimsPreview ? `预览 ${dims}` : dims);
   }
   const size = fmtBytes(item.meta.size);
-  if (size) parts.push(size);
+  if (size) parts.push(dimsPreview || sizeForOf(item) === 'raw' ? size : `预览 ${size}`);
   if (!parts.length) return (item.meta.ext || 'bin').toUpperCase();
   return parts.join(' · ');
 }
@@ -132,16 +143,28 @@ export function stateTagTitle(item: MediaItem): string {
 /* 主题                                                                          */
 /* --------------------------------------------------------------------------- */
 
-const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+/**
+ * 系统深色偏好 —— **懒取**（2026-10-02 §37）。
+ *
+ * 原先在模块顶层直接 `window.matchMedia(...)`，于是这个文件在 node 环境里**无法被 import**
+ * （`window is not defined`）——同文件的 `itemMetaLine()` 等纯函数因此没法单测。
+ * 改成首次使用时才创建：对象仍是同一个、`.matches` 仍然是实时的，行为不变。
+ */
+let darkQuery: MediaQueryList | null = null;
+
+function systemDarkQuery(): MediaQueryList {
+  darkQuery ??= window.matchMedia('(prefers-color-scheme: dark)');
+  return darkQuery;
+}
 
 export function resolveTheme(theme: Config['theme']): 'light' | 'dark' {
   if (theme === 'light' || theme === 'dark') return theme;
-  return darkQuery.matches ? 'dark' : 'light';
+  return systemDarkQuery().matches ? 'dark' : 'light';
 }
 
 /** 跟随系统主题变化（仅在 theme === 'system' 时生效） */
 export function watchSystemTheme(getTheme: () => Config['theme'], onChange: () => void): void {
-  darkQuery.addEventListener('change', () => {
+  systemDarkQuery().addEventListener('change', () => {
     if (getTheme() === 'system') onChange();
   });
 }

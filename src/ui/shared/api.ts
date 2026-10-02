@@ -3,13 +3,15 @@
 import { MSG } from '../../core/constants';
 import type { DiagRecord } from '../../core/diagnostics';
 import { onRuntimeMessage, sendToBg } from '../../core/messaging';
-import { onStateChanged, type Library } from '../../core/storage';
+import { onStateChanged } from '../../core/storage';
 import type {
   Config,
   DiagChangedPayload,
   DownloadProgress,
   DownloadRequest,
   LibraryResponse,
+  LibrarySyncPayload,
+  LibraryRequest,
   StateRequest,
   StateResponse,
 } from '../../core/types';
@@ -23,8 +25,8 @@ export async function patchConfig(patch: Partial<Config>): Promise<Config> {
   return res.config;
 }
 
-export async function listLibrary(): Promise<LibraryResponse> {
-  return sendToBg<LibraryResponse>(MSG.LibraryList);
+export async function listLibrary(request?: LibraryRequest): Promise<LibraryResponse> {
+  return sendToBg<LibraryResponse>(MSG.LibraryList, request);
 }
 
 export async function requestDownload(request: DownloadRequest): Promise<{ ok: boolean; queued: number; error?: string }> {
@@ -69,9 +71,18 @@ export function onProgress(handler: (progress: DownloadProgress) => void): () =>
   });
 }
 
-export function onLibraryChanged(handler: (library: Library) => void): () => void {
-  return onStateChanged((change) => {
-    if (change.library) handler(change.library);
+/**
+ * 订阅「当前标签页槽」的资源库变化（2026-10-02 §38）。
+ *
+ * ⚠️ 不能再订阅 `storage.onChanged` 的 `library`：那已经是**分槽结构**（tabId → 槽），
+ * 而 UI（扩展页）没有 tabId。bg 在写槽后会主动广播「当前槽」，弹窗是单例，直接采用即可。
+ */
+export function onLibrarySync(handler: (payload: LibrarySyncPayload) => void): () => void {
+  return onRuntimeMessage((env) => {
+    if (env.type !== MSG.LibrarySync) return undefined;
+    const payload = env.payload as LibrarySyncPayload | undefined;
+    if (payload && payload.library && typeof payload.convId === 'string') handler(payload);
+    return undefined;
   });
 }
 

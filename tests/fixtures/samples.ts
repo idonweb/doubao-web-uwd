@@ -330,6 +330,50 @@ export const DOWNLOAD_INFO_RESPONSE = {
 };
 
 /* --------------------------------------------------------------------------- */
+/* 视频分享页（/video-sharing）样本（2026-10-02 第十六轮）                          */
+/*                                                                             */
+/* 形态取自 2026-10-02 对该接口的直调实测（`POST /creativity/share/                */
+/* get_video_share_info`，body `{share_id, vid, creation_id}`）：响应是**普通 JSON** */
+/* （不是 SSE、也没有多层转义），字段为 `data.{play_info,user_info,prompt,source_info}`。*/
+/* 下面按实测逐字构造，只把签名/域名替换成等价假值。                                */
+/* --------------------------------------------------------------------------- */
+
+/** 实测播放地址的宿主是 `*.365yg.com`（CDN 调度，取值会变），带水印 + `download=true` */
+export const SHARE_VIDEO_MAIN =
+  'https://v9-default.365yg.com/ssample/video/tos/cn/tos-cn-v-9ecd54/ssample-hash/?a=0&lr=video_gen_watermark_dyn&mime_type=video_mp4&download=true';
+export const SHARE_VIDEO_BACKUP =
+  'https://v26-default.365yg.com/ssample/video/tos/cn/tos-cn-v-9ecd54/ssample-hash/?a=0&lr=video_gen_watermark_dyn&mime_type=video_mp4&download=true';
+/** 实测封面在 `p26-sign.douyinpic.com`（站点自己的带水印封面，带时效签名） */
+export const SHARE_VIDEO_POSTER =
+  'https://p26-sign.douyinpic.com/tos-cn-p-9ecd54/ssample-poster~tplv-noop.image?x-expires=1791528392&x-signature=abc';
+/** 实测 URL 查询参数里的 vid（响应体里**没有** vid） */
+export const SHARE_VIDEO_ID = 'v0269cg10004daamhk27dld2vpu8bbgg';
+/** 实测 URL 查询参数里的分享 id */
+export const SHARE_ID = '57139820578269954';
+
+/** 实测响应形状（`code` / `msg` / `data.{play_info,user_info,prompt,source_info}`） */
+export const VIDEO_SHARE_INFO_RESPONSE = {
+  code: 0,
+  msg: '',
+  data: {
+    play_info: {
+      main: SHARE_VIDEO_MAIN,
+      backup: SHARE_VIDEO_BACKUP,
+      height: 1280,
+      width: 720,
+      definition: '720p',
+      poster_url: SHARE_VIDEO_POSTER,
+    },
+    user_info: { user_id: 2830607241447786, user_name: '', nickname: '『ф✥』' },
+    prompt: '8K 3D CG写实，PBR物理材质，16:9画幅，60fps，暴雨肆虐的建筑群……',
+    source_info: { author_uid: 2830607241447786, message_id: '54072066510398466', creation_task_id: '54072741844764674' },
+  },
+};
+
+/** 实测的分享页 URL 形态（`source_type=mobile`；pathname 就是 `/video-sharing`） */
+export const VIDEO_SHARE_URL = `https://www.doubao.com/video-sharing?source_type=mobile&share_id=${SHARE_ID}&video_id=${SHARE_VIDEO_ID}`;
+
+/* --------------------------------------------------------------------------- */
 /* 「模型提示」样本（2026-09-29 第十四轮 §34）                                     */
 /*                                                                             */
 /* 结构等价样本，形态取自实测报文 `uwd-diag-1790690882278.json`：                  */

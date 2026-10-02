@@ -149,8 +149,10 @@ async function buildReport(): Promise<string> {
   /*
    * 导出是用户主动动作，这里的库**现取一次**：保证 summary 的「条数」与「条目」一致，且都是此刻的值。
    * 环境卡片为了不扰动诊断缓冲走的是广播快照；导出这一次多一次 `tab:query` 可以接受。
+   * ⚠️ `follow: true`（2026-10-02 §38）：库按标签页分槽后，不跟随的话拿到的是「诊断页那个槽」——
+   * 它不属于任何豆包会话，永远是空的。
    */
-  const library = await listLibrary();
+  const library = await listLibrary({ follow: true });
   const page = state?.page;
   const live = liveScopeFields(page);
   const summary = {
@@ -178,7 +180,7 @@ async function buildReport(): Promise<string> {
 
 async function reload(): Promise<void> {
   // follow=true：本页自己就是 active tab，不让 bg 跟随的话环境卡片永远是 none（docs/03 §3 缺陷 2）
-  const [diag, st, library] = await Promise.all([getDiag(), getState({ follow: true }), listLibrary()]);
+  const [diag, st, library] = await Promise.all([getDiag(), getState({ follow: true }), listLibrary({ follow: true })]);
   records = diag;
   state = st;
   // 打底值：此后由 `diag:changed` 广播持续更新 —— 本页不再轮询（见 core/types.ts::DiagChangedPayload）
