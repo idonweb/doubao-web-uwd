@@ -5,7 +5,7 @@ import type { Config } from './types';
 export const EXT_NAME = '豆包无水印下载器';
 export const EXT_SHORT_NAME = 'UWD';
 /** 扩展显示版本（与 package.json 保持同步；manifest 版本在构建期由 package.json 注入） */
-export const EXT_VERSION = '1.2.0';
+export const EXT_VERSION = '1.3.0';
 
 /**
  * GitHub 仓库地址（2026-09-27 首发时回填）。
@@ -191,6 +191,23 @@ export const LIMITS = {
   DIAG_MAX_TEXT: 6000,
   /** 诊断：整体最大字节数（超出从最旧的开始丢） */
   DIAG_MAX_BYTES: 900_000,
+  /**
+   * 补角重建条目的**卡片封面**长边像素（2026-10-03 第三十一轮）。
+   *
+   * 卡片缩略图最大也就 ~200px 宽，480px 足够清晰（含高分屏），又能把 data URL 压在
+   * ~20KB 量级；再大只是白花解码 / 传输成本（封面是**预览用**，不是交付物）。
+   */
+  PATCH_COVER_MAX_PX: 480,
+  /** 封面 JPEG 质量（0~1）。封面只用于屏幕显示，0.82 肉眼无损、体积减半。 */
+  PATCH_COVER_QUALITY: 0.82,
+  /**
+   * 页面侧封面缓存条数（FIFO）。
+   *
+   * 缓存的是合成好的 data URL（~20KB 一张），按「底板地址 + 来源档地址」为键 ——
+   * 弹窗每次重新打开（模块重载）都会再问一遍，有它就不必重新取两档全尺寸图。
+   * 12 条 ≈ 250KB，足以覆盖一屏可见的补角条目。
+   */
+  PATCH_COVER_CACHE_MAX: 12,
 } as const;
 
 export const DEFAULT_CONFIG: Config = {
@@ -245,6 +262,47 @@ export const MSG = {
   MediaAppend: 'media:append',
   /** bg → content：在页面上下文里 fetch + blob 下载（取流方案 B） */
   FetchBlob: 'content:fetch-blob',
+  /**
+   * bg → content：**补角重建后下载**（2026-10-03 第二十三轮 §43.9 方案 B）。
+   *
+   * 老链路「修改生成」的图片（`msg.content.image_list[*]`）站点只给了两档带水印的**同源底图**，
+   * 没有现成的无水印档；页面侧取两档 → 同源校验 → 把来源档的水印矩形**原样覆盖**到底板上
+   * → 合成出的就是无水印图（无损，见 `core/image-patch.ts`）。MV3 的 service worker
+   * 没有 OffscreenCanvas / createObjectURL，所以这一步必须在页面上下文里做。
+   * 回执：`{ ok, patched }` —— `patched:false` 表示**同源校验没过**（未合成、未下载），
+   * 由 bg 退回「直接下带水印原图」并把条目标成 `meta.patchFail`。
+   */
+  FetchPatchBlob: 'content:fetch-patch-blob',
+
+  /**
+   * bg → content：**解析分享页视频的无水印直链**（2026-10-03 第二十八轮 §48）。
+   *
+   * 为什么必须走页面：① `get_video_model` 要**登录 cookie**（同源请求才带得上）；
+   * ② fplay 响应是**跨域**，要靠 DNR 注入的 CORS 头（`||vas-lf-x.snssdk.com/`）。
+   *
+   * 请求 `{ vid, quality }`；回执 `{ ok, url?, error? }`。
+   * ⚠️ 直链**带时效** ⇒ 只能在**下载那一刻**现解现用，**绝不入库**。
+   */
+  ResolveShareVideo: 'content:resolve-share-video',
+
+  /**
+   * bg → content：**合成补角重建图的卡片封面**（2026-10-03 第三十一轮）。
+   *
+   * 为什么要有这条：补角条目的卡片封面原本直接用站点的 `image_thumb`
+   * （`downsize_watermark`，**带水印**）—— 卡片上写着「无水印（补角重建）」，
+   * 封面却是一个带水印的缩略图，自相矛盾（`docs/03` §45.1 的开放子项）。
+   *
+   * 做法与下载链路**同一套**（取两档 → 同源校验 → 覆盖 → 降采样），只是产物不落盘，
+   * 而是缩到 `LIMITS.PATCH_COVER_MAX_PX` 后编码成 **data URL** 回给弹窗填 `<img src>`。
+   *
+   * ⚠️ **只在弹窗要显示时才做**（`IntersectionObserver` 只对可见卡片发问）：合成要取两档
+   *   **全尺寸**图，提前给整个会话的图都做一遍是白耗流量。
+   * ⚠️ **不落库**：data URL 只活在这一次弹窗里（页面侧另有一份有界缓存，见
+   *   `LIMITS.PATCH_COVER_CACHE_MAX`）—— 像素不是资源的描述，没必要写进存储。
+   * 回执：`{ ok, cover? , error? }`；失败（取图失败 / 同源校验没过 / 页面不支持 canvas）
+   * 时弹窗**保持站点缩略图**，不假装有封面。
+   */
+  PatchCover: 'content:patch-cover',
 
   /* ---- UI ↔ bg ---- */
   StateGet: 'state:get',
@@ -301,6 +359,28 @@ export const STATE_LABEL: Record<string, string> = {
   pending: '解析中',
   fail: '获取失败',
 };
+
+/**
+ * 「补角重建」条目的文案（2026-10-03 第二十三轮 §43.9 方案 B）。
+ *
+ * ⚠️ **必须与「无水印原片」区分开**：这一族（老链路 `msg.content.image_list[*]`）站点**没给**原片，
+ * 只有两张带水印的同源底图；无水印是**本插件在下载时互补还原**出来的。
+ * 按「宁缺勿假」，界面如实写「重建」，绝不冒充站点原片。
+ */
+export const IMG_PATCH_LABEL = '无水印（补角重建）';
+/** 补角**同源校验未通过** ⇒ 只能下到带水印的那一档，如实说（`meta.patchFail`） */
+export const IMG_PATCH_FAIL_LABEL = '仅带水印档';
+
+/**
+ * **分享页视频**条目的文案（2026-10-03 第三十轮 §48.7）。
+ *
+ * 分享页视频被判「原片不可得」（`meta.expired`，创作树按登录账号隔离、别人的作品永远不在）
+ * **不等于**拿不到无水印 —— §47/§48 之后分享直链两档可下（轻量 / 原画质）。
+ * 旧口径「原片不可得」在这个场景自相矛盾（卡片标着取不到、下载却拿到无水印文件），
+ * 故按补角条目的先例（落地即标能力、失败才降级），分享页视频 expired 后直接标本标签。
+ * ⚠️ **只用于 `convKind='thread'` 且 `kind='video'`**；对话页「原片已超期」与分享页图片不动。
+ */
+export const SHARE_VIDEO_LABEL = '无水印（分享页）';
 
 /** 取流方案：A = chrome.downloads + DNR 注入 Referer；B = content 内 fetch + blob（回退） */
 export const DOWNLOAD_STRATEGY: 'auto' | 'downloads' | 'blob' = 'auto';

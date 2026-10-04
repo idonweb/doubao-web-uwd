@@ -13,7 +13,6 @@ import {
   HOST_DOLA,
   HOST_IMAGE_CDN_SUFFIXES,
   HOST_SHARE_SHORTLINK_SUFFIX,
-  IMAGE_SUFFIX_REWRITES,
   LEGACY_STORAGE_KEYS,
   LOGO_TYPE_PARAM,
   LOGO_TYPE_VALUE,
@@ -152,15 +151,6 @@ export function isThumbLike(url: string): boolean {
   return THUMB_HINTS.some((h) => lower.includes(h.toLowerCase()));
 }
 
-/** 图片水印后缀族 → 无水印后缀（命中多条时逐条应用，幂等） */
-export function rewriteImageSuffix(url: string): string {
-  let out = url;
-  for (const rule of IMAGE_SUFFIX_REWRITES) {
-    if (rule.test.test(out)) out = rule.apply(out);
-  }
-  return out;
-}
-
 /** 视频 lr 参数改写：doubao 走 video_gen_no_watermark，dola 走 unwatermarked */
 export function rewriteVideoLr(url: string, host = ''): string {
   if (!url) return url;
@@ -186,10 +176,18 @@ export function stripLogoType(url: string): string {
   }
 }
 
-/** 对任意媒体地址做「尽可能无水印化」改写，用于把候选地址规格化到同一形态 */
+/**
+ * 对任意媒体地址做「尽可能无水印化」改写，用于把候选地址规格化到同一形态。
+ *
+ * ⚠️ **图片分支是原样直通**（2026-10-03 第三十一轮）：图片后缀改写表早年从上游照搬
+ * （`~tplv-…-downsize_watermark_1_6.png` → `…-image-qvalue.jpeg` 之类），实测**从未命中过**
+ * 一个真实地址（站点后缀早已从 `1_5` 爬到 `1_5b` / `1_6_b`），而且**一旦命中就是有害的**——
+ * 该 CDN 的 `x-signature` 覆盖整个路径（含 `~tplv-` 后缀），改后缀即 **403**
+ * （`docs/03` §43.6 / §45.2）。故整表连同 `rewriteImageSuffix` 一并删除，图片地址原样进库。
+ */
 export function sanitizeMediaUrl(url: string, kind: MediaKind): string {
   if (!url) return '';
-  let out = kind === 'image' ? rewriteImageSuffix(url) : rewriteVideoLr(url);
+  let out = kind === 'video' ? rewriteVideoLr(url) : url;
   out = stripLogoType(out);
   return out;
 }

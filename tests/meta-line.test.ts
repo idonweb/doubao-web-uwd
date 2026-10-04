@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { itemMetaLine } from '../src/ui/shared/dom';
+import { itemMetaLine, stateTagLabel, stateTagOf, stateTagTitle } from '../src/ui/shared/dom';
 import type { MediaItem, MediaVariant } from '../src/core/types';
 
 const CANDIDATE: MediaVariant = {
@@ -118,5 +118,70 @@ describe('itemMetaLine：预览体积', () => {
 
   it('没有体积也没有宽高 → 退回扩展名（旧行为不变）', () => {
     expect(itemMetaLine(item({ meta: { ext: 'mp4' } }))).toBe('MP4');
+  });
+});
+
+/**
+ * 状态标签（`stateTagLabel` / `stateTagTitle`）—— 分享页视频例外（2026-10-03 第三十轮 §48.7）。
+ *
+ * 口径：分享页视频被判「原片不可得」（`meta.expired`）**不等于**拿不到无水印 ——
+ * §47/§48 之后分享直链两档可下，旧文案「原片不可得」与「下载却拿到无水印文件」自相矛盾
+ * （实机截图 2026-10-3 19-2-4.png）。故：
+ *   ① thread + video + expired → 「无水印（分享页）」（按补角先例：落地即标能力、失败才降级）；
+ *   ② bg 回写 `meta.shareDlFail`（这次直链没解出）→ 如实降级「仅带水印档」；
+ *   ③ 对话页「原片已超期」与分享页**图片**条目不受影响（原口径仍准确）；
+ *   ④ 正证据优先不变：拿到原片（state=raw）一律压过 expired。
+ */
+describe('stateTagLabel / stateTagTitle：分享页视频例外（§48.7）', () => {
+  const expiredShareVideo = {
+    state: 'fail' as const,
+    meta: { ext: 'mp4', expired: true },
+  };
+
+  it('★分享页视频 + 原片不可得 →「无水印（分享页）」（不再显示旧文案「原片不可得」）', () => {
+    const entry = item(expiredShareVideo);
+    expect(stateTagLabel(entry)).toBe('无水印（分享页）');
+    // ★配色与语义同源（用户 2026-10-03 19:4x 反馈）：语义是「可用」→ 成功绿 + check，不是 fail 红
+    const tag = stateTagOf(entry);
+    expect(tag.cls).toBe('t-raw');
+    expect(tag.icon).toBe('check');
+    // 悬停说明讲清能力来源与档位，不再是「取不到无水印原片」的旧说法
+    const title = stateTagTitle(entry);
+    expect(title).toContain('分享直链');
+    expect(title).toContain('原画质');
+    expect(title).not.toContain('取不到无水印原片');
+  });
+
+  it('★bg 回写 shareDlFail（这次直链没解出）→ 如实降级「仅带水印档」+ fail 红，说明里给恢复路径', () => {
+    const entry = item({ ...expiredShareVideo, meta: { ext: 'mp4', expired: true, shareDlFail: true } });
+    expect(stateTagLabel(entry)).toBe('仅带水印档');
+    const tag = stateTagOf(entry);
+    expect(tag.cls).toBe('t-fail');
+    expect(tag.icon).toBe('alert');
+    const title = stateTagTitle(entry);
+    expect(title).toContain('带水印播放档');
+    expect(title).toContain('自动恢复');
+  });
+
+  it('对话页视频 + 原片不可得 → 仍是「原片已超期」（原口径不动）', () => {
+    const entry = item({ convKind: 'chat', convId: 'c1', id: 'c1::vid:x', ...expiredShareVideo });
+    expect(stateTagLabel(entry)).toBe('原片已超期');
+    expect(stateTagTitle(entry)).toContain('只对作品所属账号开放');
+  });
+
+  it('★判据按条目本身（kind） gate：分享页图片条目（若出现 expired）仍走「原片不可得」', () => {
+    const entry = item({ ...expiredShareVideo, kind: 'image', fingerprint: 'img:x', id: 'share_5713::img:x' });
+    expect(stateTagLabel(entry)).toBe('原片不可得');
+  });
+
+  it('★正证据优先不变：拿到原片（state=raw）压过 expired →「无水印原片」', () => {
+    const entry = item({
+      state: 'raw',
+      variants: [RAW],
+      primary: RAW.url,
+      meta: { ext: 'mp4', expired: true },
+    });
+    expect(stateTagLabel(entry)).toBe('无水印原片');
+    expect(stateTagTitle(entry)).toBe('');
   });
 });

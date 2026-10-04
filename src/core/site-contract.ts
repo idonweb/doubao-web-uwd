@@ -554,7 +554,182 @@ export function convIdFromUrl(url: string | undefined | null): string {
   return match?.[1] ?? '';
 }
 
+/* ============================================================================
+ * §2.8 老链路「修改生成」的图片容器 `image_list`（2026-10-03 第二十三轮 [实测]）
+ *
+ * 场景：**几个月前的老会话**里，「修改生成 / 二次编辑」产出的图**不进** `creation_block.creations`，
+ * 而是挂在 `msg.content.image_list[*]` 下（探测实录 `docs/03` §43.1）。字段形如：
+ *
+ *   { key, image_thumb, image_ori, preview_img, image_raw, image_thumb_ori }
+ *     宽高/URL 都在各自子对象里：{ url, width, height, format }
+ *
+ * ⚠️ 三个必须记住的实测事实（`docs/03` §43，10 次观测 / 8 张独立底图）：
+ *   ① **没有 `image_ori_raw`** —— 也就是站点**没给现成的无水印档**（这正是「嗅探不到」的根因：
+ *      老实现只认 `image.image_ori_raw.url`，于是这一族整条被当成 thumb 丢掉）。
+ *   ② `image_raw`（≡ `preview_img`）与 `image_ori` 是**同一张底图的两种带水印档**：
+ *      `image_raw` = `…_pre_watermark_1_5b.png`（**水印在左上**）、
+ *      `image_ori` = `…_image_dld_watermark_1_5b.png`（**水印在右下**）；
+ *      **底图逐像素完全相同**（排除两块水印矩形后全域差 = 0）。
+ *   ③ 两处水印**互不相邻**（左上 / 右下，相距 >1000px）⇒ **互换同位置像素即可无损还原**。
+ *
+ * ⚠️ **字段名有误导性**：这里 `image_raw` 指向的是**带水印的预览档**，
+ *    与新版布局里「`image_ori_raw` → `…_image_raw.png`（真干净）」**同名不同物**。
+ *    按字段名推断一律不算数 —— 必须看像素（这条踩过坑，见 `docs/03` §43.7）。
+ *
+ * ⚠️ **不许改写后缀去水印**：该 CDN 的 `x-signature` **覆盖整个路径（含 `~tplv-` 后缀）**，
+ *    后缀一改即 **403**（6 组对照实测，`docs/03` §43.6）。唯一可行的是**两档互补补角**。
+ *
+ * 📌 本容器**只出现在老链路**：新版会话的结果回到 `creation_block.creations[].image` 且带
+ *    `image_ori_raw`（实测 `image_list 命中 = 0`）—— 这就是「老对话多、新对话少」的原因。
+ * ========================================================================== */
+
+/** 「修改生成」结果的容器键（实测路径 `msg.content.image_list`，`content` 可能是转义 JSON 字符串） */
+export const IMG_LIST_KEY = 'image_list';
+/** 预览档（**全尺寸、水印在左上**）—— 补角的**底板** */
+export const IMG_LIST_PRE_KEY = 'image_raw';
+/** 下载档（**全尺寸、水印在右下**）—— 补角的**像素来源** */
+export const IMG_LIST_PATCH_KEY = 'image_ori';
+/** 缩略档（326×580，带水印）—— 只当卡片封面 */
+export const IMG_LIST_THUMB_KEY = 'image_thumb';
+
+/**
+ * **补角矩形**：把「下载档」这块矩形里的像素，原样覆盖到「预览档」的同一位置。
+ *
+ * 取法（实测并集，10 次观测）：水印在预览档上的矩形是 `x25~227 y25~116`（203×92），
+ * 但**会随背景对比度抖动 ±5px**（亮背景 203×92 / 暗背景 195~197×85）。
+ * 所以这里取**宽松框** `0,0 260×150`（留 ~30px 余量）。
+ *
+ * ⚠️ **放大无害**：两档底图逐像素相同 ⇒ 多补进来的区域两档本就一致，**覆盖等于没覆盖**
+ *    （这是「同源底图」这条性质的直接红利，见 `docs/03` §43.11）。
+ */
+export const IMG_PATCH_RECT = { x: 0, y: 0, w: 260, h: 150 } as const;
+
+/**
+ * **来源档（下载档 `image_ori`）自己的水印矩形** —— 距**右下角**的宽松框尺寸。
+ *
+ * ⚠️ **2026-10-03 第二十六轮实机修复（务必先读）**：同源校验**必须把两块水印都排除**。
+ *   原先只排除了补角矩形（底板**左上**那处），于是「稀疏全图采样」（step=37）必然扫到
+ *   **来源档右下角的水印** ⇒ 两档在那里本来就不同 ⇒ 校验**恒定失败**、补角**一次都没成功过**。
+ *   实机症状（`docs/03` §46）：全部条目显示「仅带水印档」，诊断 `content.patch` 恒为
+ *   「同源校验未通过」；像素复核证明两档底图逐像素相同、差异只在左上 + 右下两个水印角。
+ *
+ * 实测来源档水印矩形 = `x1267~1513 y2644~2703`（原图 1536×2730），与左上那处一样
+ * **随背景对比度抖动 ±5px** ⇒ 同取宽松框 `296×110`（距右下角；并集与余量见 `docs/03` §43.11）。
+ *
+ * 📌 只用于**校验时排除**，不参与覆盖 —— 覆盖只动底板左上的补角矩形（那里已是干净像素）。
+ */
+export const IMG_PATCH_SRC_MARK = { w: 296, h: 110 } as const;
+
+/**
+ * 补角前的**同源校验**步长（像素）。
+ *
+ * 补角的正确性建立在「两档底图逐像素相同」之上 —— 万一站点将来改成两档不同源，
+ * 覆盖就会把**别处的画面**糊到这块矩形里（比带水印更糟）。
+ * 所以下载前先做一次**稀疏全图采样**（步长 37px ≈ 3000 个采样点）逐像素比对：
+ * 一致才补角，不一致**退回下载带水印的预览档**并把它标成「补角失败」。
+ */
+export const IMG_PATCH_VERIFY_STEP = 37;
+
+/** 补角校验时矩形外扩的环带宽度（像素）—— 紧邻水印的一圈必须逐像素一致 */
+export const IMG_PATCH_VERIFY_RING = 16;
+
+/* ============================================================================
+ * §2.9 分享页「无水印视频」—— 档位开关与 fplay / qAAB 契约（2026-10-03 第二十七轮 [实测]）
+ *
+ * 场景：**别人分享出来的**视频（`/thread/` 整段对话分享、`/video-sharing` 单条分享）。
+ * 站点在页面上只给**带水印**的播放档；无水印档要用下面这条链路换：
+ *
+ *   ① 拿 `fallback_api`（形如 `https://vas-lf-x.snssdk.com/video/fplay/1/<hash>/<vid>?…&key_seed=…`）
+ *      · `/thread/`：**页面 SSR / chain 报文里就有**（本项目早已抽取 `RawMedia.fallbackApi`），**免登录**；
+ *      · `/video-sharing`：页面里没有 ⇒ 必须调 `VIDEO_MODEL_ENDPOINT`（**需登录态**）。
+ *   ② 改 fplay 请求：**先删 `logo_type` / `force_fids`**，再按档位设 `codec_type`
+ *      （见 `FPLAY_CODEC_LIGHT` / `FPLAY_CODEC_HEAVY`）；
+ *   ③ GET → 响应 `video_info.data.{key_seed, video_list[*].main_url | backup_url_1}`
+ *      —— 值是 **qAAB 加密 token**，要用 `core/fplay.ts::decodeQaabToken` 解成明文直链；
+ *   ④ 明文直链**带时效签名** ⇒ 只能**下载那一刻现解现用**，**绝不入库**。
+ *
+ * ⚠️ 三条实测事实（`docs/03` §47.9 / §47.10 / §47.11）：
+ *   ① **`codec_type` 才是档位开关**：`1` = 轻量无水印、`5`/`8` = 原画质无水印、
+ *      **`3` = 带水印**（`/video-sharing` 页面给的原始值）；
+ *   ② **URL 里的 `lr` 只是装饰**：同一次请求里 `lr=unwatermarked` 与「无 lr」**解出同一个文件、同 MD5**；
+ *   ③ **作者身份不参与**：`fallback_api` 里的 `user_id` 是**请求者**（实测 ≠ 分享接口给的 `author_uid`）
+ *      ⇒ 非原作者一样能拿到无水印档；只有 `/video-sharing` 那条路要求「**任意账号已登录**」。
+ *
+ * ⚠️ 高画质档的**绝对码率随片源走**（实测竖版 15.36 Mbps / 横版 4.6 Mbps）⇒ **UI 不得承诺具体体积**。
+ * ========================================================================== */
+
+/** fplay 的路径前缀（用来校验「这个 fallback_api 长得对不对」） */
+export const FPLAY_PATH_PREFIX = '/video/fplay/';
+/** fplay 的受信域名后缀（只认它，避免把别处 URL 当接口去请求） */
+export const FPLAY_HOST_SUFFIX = 'snssdk.com';
+
+/** 改写 fplay 请求时**必须先删掉**的参数（实测：留着会把档位钉回带水印/默认档） */
+export const FPLAY_DROP_PARAMS = ['logo_type', 'force_fids'] as const;
+
+/** **轻量档**：`codec_type=1` —— hevc 720P 级，体积与站点带水印档几乎一样（实测 2.39 MB / 1.91 Mbps） */
+export const FPLAY_CODEC_LIGHT = '1';
+/** **高画质档**：`codec_type=5` + `force_fids=FPLAY_FORCE_FIDS_ORIGINAL` */
+export const FPLAY_CODEC_HEAVY = '5';
+/** `base64("original")` —— 高画质档的 `force_fids` 取值（照搬站点/同类实现的写法，不可推导） */
+export const FPLAY_FORCE_FIDS_ORIGINAL = 'b3JpZ2luYWw=';
+
+/** fplay 响应里「取哪几个字段当直链候选」（其它字段一律不取） */
+export const FPLAY_VIDEO_URL_KEYS = ['main_url', 'backup_url_1'] as const;
+/** fplay 响应里数据都在这个路径下（顶层是 `{video_info, message, code}`） */
+export const FPLAY_RESPONSE_DATA_PATH = ['video_info', 'data'] as const;
+/** `video_list` 可能是**对象**（键为序号）也可能是**数组**，两种都要吃 */
+export const FPLAY_VIDEO_LIST_KEY = 'video_list';
+/** 解密用的种子（base64）——响应里也有，比 URL query 里那份更权威 */
+export const FPLAY_KEY_SEED_KEY = 'key_seed';
+
+/** qAAB 解密的**固定盐**（64 字节 hex；与 `docs/probe-decode-qaab.mjs` / 开源实现同一份，照搬） */
+export const FPLAY_KDF_SALT_HEX =
+  '4dd4c2e6b83162090e52b3c7a6733ba4' +
+  '1cb2462b829ab58a196b39db57177524' +
+  'f49baf7f08e8d68d26a72e37c1a95a2f' +
+  '1f05a51892aef2949732b62a38aadd58';
+
+/** qAAB token 的被剥离前缀（前 4 字节）；不是这个值就走「不剥」的退化分支 */
+export const FPLAY_TOKEN_PREFIX = [0xa8, 0x00, 0x01, 0x00] as const;
+
+/**
+ * `/video-sharing` 专用：**只吃 vid** 的接口，返回带 `fallback_api` 的视频模型。
+ * ⚠️ **需要登录 cookie**（实测无 cookie 回 `code:710012001 登录已过期`），
+ *    且**不要求你是作者**（见本节开头第 ③ 条）。
+ */
+export const VIDEO_MODEL_ENDPOINT = '/alice/resource/get_video_model';
+/** 该接口的强制 query（照搬同类实现；缺 `aid` 会被服务端吞掉/拒绝） */
+export const VIDEO_MODEL_QUERY: Readonly<Record<string, string>> = {
+  version_code: '20800',
+  language: 'zh-CN',
+  device_platform: 'web',
+  aid: '497858',
+  real_aid: '497858',
+  pkg_type: 'release_version',
+  samantha_web: '1',
+  'use-olympus-account': '1',
+};
+/** 请求体里 vid 的字段名（实测是 `uri`，**不是** `vid`/`key`） */
+export const VIDEO_MODEL_URI_KEY = 'uri';
+/** 响应里拿 `fallback_api` 的路径（`video_model` 是**一层转义 JSON 字符串**） */
+export const VIDEO_MODEL_RESULT_PATH = ['data', 'results'] as const;
+export const VIDEO_MODEL_MODEL_PATH = ['video_model_result', 'video_model'] as const;
+export const VIDEO_MODEL_FALLBACK_KEY = 'fallback_api';
+
+/**
+ * 「原画质档」按钮的界面文案（2026-10-04 §52 由「高画质」收成两字）。
+ *
+ * ⚠️ **必须两字**：分享页卡片的动作行是「下载 / 原画 / 预览」三键等宽 46px，而 CJK 全角 = 1em，
+ * 三字时内容要 10 + 3 + 3×10.5 = 45px，会把按钮的左右内边距吃光（§52 实测：内容 45 / 可用 40）。
+ * 全称并没有丢 —— 悬停说明 `HQ_TITLE` 里写着「原画质档」。
+ */
+export const HQ_LABEL = '原画';
+export const HQ_TITLE = '下载无水印原画质档（体积随片源，可能十几～几十 MB）';
+/** 「轻量」不加按钮，只在「下载」的悬停说明里点明它是哪一档 */
+export const LQ_TITLE = '下载无水印（轻量档，体积与站点带水印档相当）';
+
 /* --- 响应字段路径（以**整个响应体**为根求值）--------------------------------- */
+
 
 /** 播放信息子对象 */
 export const SHARE_PLAY_INFO_PATH = ['data', 'play_info'] as const;
@@ -674,62 +849,14 @@ export const SHARE_DESCRIBE_MAX_FIELDS = 24;
 export const SHARE_TITLE_MAX_LEN = 200;
 
 /* ============================================================================
- * §3 水印改写规则
- *   同时用于：① 构建期生成 DNR 规则；② 运行期 URL 归一化（media-url.ts）
+ * §3 水印参数
+ *   只有两类：① 视频 `lr` 参数；② 动态水印 `logo_type` 参数。
+ *
+ * ⛔ **没有「图片后缀改写表」了**（2026-10-03 第三十一轮删除）：早年从上游照搬的
+ *   `~tplv-…-downsize_watermark_1_6.png → …-image-qvalue.jpeg` 一族**从未命中过**真实地址
+ *   （站点后缀已是 `1_5b` / `1_6_b`），而且签名覆盖整个路径、改后缀即 403，属**有害的死重**
+ *   （`docs/03` §43.6 / §45.2）。图片地址一律原样进库。
  * ========================================================================== */
-
-export interface SuffixRewriteRule {
-  /** 命中用的正则（对完整 URL 生效） */
-  test: RegExp;
-  /** 替换函数：返回改写后的 URL */
-  apply: (url: string) => string;
-  /** 生成 DNR regexFilter 时使用的原始模式（必须带一个捕获组） */
-  dnrPattern: string;
-  /** DNR regexSubstitution，`$1` 对应上文捕获组 */
-  dnrSubstitution: string;
-  note: string;
-}
-
-/** 图片水印后缀族 → 无水印后缀 [上游 rules.json id 1~6] */
-export const IMAGE_SUFFIX_REWRITES: SuffixRewriteRule[] = [
-  {
-    test: /~tplv-a9rns2rl98-downsize_watermark_1_6\.png/,
-    apply: (u) => u.replace(/~tplv-a9rns2rl98-downsize_watermark_1_6\.png/g, '~tplv-a9rns2rl98-image-qvalue.jpeg'),
-    dnrPattern: '^(https://[^/]+/[^?]+)~tplv-a9rns2rl98-downsize_watermark_1_6\\.png',
-    dnrSubstitution: '\\1~tplv-a9rns2rl98-image-qvalue.jpeg',
-    note: 'a9rns2rl98 图片水印后缀',
-  },
-  {
-    test: /~tplv-a9rns2rl98-video_dsz_watermark_1_6\.png/,
-    apply: (u) =>
-      u.replace(/~tplv-a9rns2rl98-video_dsz_watermark_1_6\.png/g, '~tplv-a9rns2rl98-video_cover.jpeg'),
-    dnrPattern: '^(https://[^/]+/[^?]+)~tplv-a9rns2rl98-video_dsz_watermark_1_6\\.png',
-    dnrSubstitution: '\\1~tplv-a9rns2rl98-video_cover.jpeg',
-    note: 'a9rns2rl98 视频封面水印后缀',
-  },
-  {
-    test: /~tplv-6187y3xstg-watermark.*\.(?:png|jpg|jpeg)/,
-    apply: (u) => u.replace(/~tplv-6187y3xstg-watermark[^?#]*\.(?:png|jpg|jpeg)/g, '~tplv-6187y3xstg-image.jpeg'),
-    dnrPattern: '^(https://[^/]+/[^?]+)~tplv-6187y3xstg-watermark.*\\.(?:png|jpg|jpeg)',
-    dnrSubstitution: '\\1~tplv-6187y3xstg-image.jpeg',
-    note: '6187y3xstg 图片水印后缀',
-  },
-  {
-    test: /~tplv-6187y3xstg-video_dsz_watermark.*\.(?:png|jpg|jpeg)/,
-    apply: (u) =>
-      u.replace(/~tplv-6187y3xstg-video_dsz_watermark[^?#]*\.(?:png|jpg|jpeg)/g, '~tplv-6187y3xstg-video_cover.jpeg'),
-    dnrPattern: '^(https://[^/]+/[^?]+)~tplv-6187y3xstg-video_dsz_watermark.*\\.(?:png|jpg|jpeg)',
-    dnrSubstitution: '\\1~tplv-6187y3xstg-video_cover.jpeg',
-    note: '6187y3xstg 视频封面水印后缀',
-  },
-  {
-    test: /~tplv-6187y3xstg-downsize_watermark.*\.(?:png|jpg|jpeg)/,
-    apply: (u) => u.replace(/~tplv-6187y3xstg-downsize_watermark[^?#]*\.(?:png|jpg|jpeg)/g, '~tplv-6187y3xstg-image.jpeg'),
-    dnrPattern: '^(https://[^/]+/[^?]+)~tplv-6187y3xstg-downsize_watermark.*\\.(?:png|jpg|jpeg)',
-    dnrSubstitution: '\\1~tplv-6187y3xstg-image.jpeg',
-    note: '6187y3xstg 降尺寸水印后缀',
-  },
-];
 
 /** 视频 lr 参数：带水印 → 无水印 [上游 rules.json id 8] */
 export const LR_WATERMARK_RE = /lr=video_gen_watermark(?:_dyn)?/g;

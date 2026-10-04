@@ -788,12 +788,128 @@ async function downloadViaContentScript(tabId: number, url: string, filename: st
 }
 
 /**
+ * 把条目的**补角状态**写回库（2026-10-03 第二十三轮 §43）。
+ *
+ * `fail = true`  → 同源校验未通过（这一档只能下到带水印的版本）→ 界面显示「仅带水印档」；
+ * `fail = false` → 补角成功 → 清掉标记（**可自愈**，下次再下载/复验成功即恢复）。
+ *
+ * 与 `markItemFailed` 同一套多槽语义：条目 id 只在槽内唯一，所以在所有槽里找一遍。
+ * ⚠️ 必须走 `writeSlot`（它才广播 `library:sync`），否则界面不会刷新。
+ */
+async function setPatchFail(itemId: string, fail: boolean): Promise<void> {
+  if (!itemId) return;
+  const slots = await getSlots();
+  for (const [tabKey, slot] of Object.entries(slots)) {
+    const item = slot[itemId];
+    if (!item) continue;
+    if (fail ? item.meta.patchFail === true : item.meta.patchFail === undefined) continue;
+    const meta = { ...item.meta };
+    if (fail) meta.patchFail = true;
+    else delete meta.patchFail;
+    await writeSlot(Number(tabKey), { ...slot, [itemId]: { ...item, meta } });
+  }
+}
+
+/**
+ * 把条目的**分享直链解析状态**写回库（2026-10-03 第三十轮 §48.7）。
+ *
+ * 分享页视频即使被判「原片不可得」（`meta.expired`），无水印仍可经分享直链拿到；
+ * 但那一步在下载时可能失败（未登录 / 分享失效 / 网络问题）→ 这次实际下到的是
+ * **站点给的带水印播放档**，界面必须如实降级成「仅带水印档」，不假装无水印。
+ *
+ * `fail = true`  → 这一次直链没解出（回退下带水印档）→ 界面显示「仅带水印档」；
+ * `fail = false` → 直链解出并下载 → 清掉标记（**可自愈**，下次成功即恢复「无水印（分享页）」）。
+ *
+ * 与 `setPatchFail` 同一套多槽语义 + `writeSlot` 广播；`meta.shareDlFail` 与 `patchFail` 一样
+ * **不进 `metaMerge` 白名单**（它不是「文件的描述」，是下载时的一次解析结果，由 bg 显式设置/清除）。
+ */
+async function setShareFail(itemId: string, fail: boolean): Promise<void> {
+  if (!itemId) return;
+  const slots = await getSlots();
+  for (const [tabKey, slot] of Object.entries(slots)) {
+    const item = slot[itemId];
+    if (!item) continue;
+    if (fail ? item.meta.shareDlFail === true : item.meta.shareDlFail === undefined) continue;
+    const meta = { ...item.meta };
+    if (fail) meta.shareDlFail = true;
+    else delete meta.shareDlFail;
+    await writeSlot(Number(tabKey), { ...slot, [itemId]: { ...item, meta } });
+  }
+}
+
+/**
  * 取流方案（方案 §7.3）：
  *   auto      → 先试 A，失败自动回退 B（默认）
  *   downloads → 只用 A
  *   blob      → 只用 B
+ *
+ * 📌 **补角条目（2026-10-03 §43.9 方案 B）先走另一条路**：`chrome.downloads` 与页面 fetch
+ * 都只能拿到「板上带水印的预览档」，只有**页面内的 canvas 合成**才能产出无水印图。
+ * 所以有 `patch` 时先请页面补角；页面明确回「同源校验没过」时把条目标成 `patchFail`
+ * （界面如实显示「仅带水印档」），然后照常回退下载带水印的原图 —— **绝不假装无水印**。
  */
 async function performDownload(target: DownloadTarget, filename: string, tabId: number | null): Promise<void> {
+  /*
+   * **分享页无水印**（2026-10-03 第二十八轮 §48）：`/thread/` 与 `/video-sharing` 的视频条目
+   * 站点只给带水印播放档，无水印档要靠页面把 vid 换成无水印直链（§47 实测走通）。
+   *
+   * ⚠️ 直链**带时效** ⇒ 只能**下载那一刻现解现用**；解析失败 / 下载失败都**如实回退**
+   *    去下站点给的那个档（带水印）—— **绝不假装无水印**（与补角链路同一哲学）。
+   */
+  if (target.shareVideo) {
+    if (tabId === null || !target.vid) {
+      diag('bg.download', `分享页无水印链路不可用（${tabId === null ? '无豆包标签页' : '条目没有 vid'}）→ 下站点给的档 ${filename}`, { level: 'warn' });
+      await setShareFail(target.itemId, true);
+    } else {
+      const quality = target.quality ?? 'light';
+      const resolved = await trySendToTab<{ ok: boolean; url?: string; error?: string }>(
+        tabId,
+        MSG.ResolveShareVideo,
+        { vid: target.vid, quality },
+        30_000,
+      );
+      const url = resolved?.ok ? resolved.url : undefined;
+      if (!url) {
+        diag('bg.download', `分享页无水印解析未成功（${resolved?.error ?? '页面脚本未就绪'}）→ 下站点给的档 ${filename}`, { level: 'warn' });
+        await setShareFail(target.itemId, true);
+      } else {
+        diag('bg.download', `分享页无水印直链已解出（${quality}）→ 方案 A ${filename}`);
+        try {
+          await downloadWithDownloadsApi(url, filename);
+          diag('bg.download', `方案 A 成功 ${filename}`);
+          await setShareFail(target.itemId, false);
+          return;
+        } catch (error) {
+          diag('bg.download', `方案 A 失败（${String((error as Error)?.message ?? error)}）→ 下站点给的档 ${filename}`, { level: 'warn' });
+          await setShareFail(target.itemId, true);
+        }
+      }
+    }
+  }
+
+  if (target.patch) {
+    if (tabId === null) {
+      diag('bg.download', `补角链路不可用（找不到可用的豆包标签页）→ 下带水印原图 ${filename}`, { level: 'warn' });
+    } else {
+      const result = await trySendToTab<{ ok: boolean; patched?: boolean; error?: string }>(
+        tabId,
+        MSG.FetchPatchBlob,
+        { url: target.url, patch: target.patch, filename },
+        10 * 60_000,
+      );
+      if (!result?.ok) {
+        diag('bg.download', `补角失败（${result?.error ?? '页面脚本未就绪'}）→ 下带水印原图 ${filename}`, { level: 'warn' });
+      } else if (result.patched) {
+        diag('bg.download', `补角重建成功 ${filename}`);
+        await setPatchFail(target.itemId, false);
+        return;
+      } else {
+        diag('bg.download', `补角同源校验未通过（${result.error ?? '-'}）→ 下带水印原图 ${filename}`, { level: 'warn' });
+        await setPatchFail(target.itemId, true);
+      }
+    }
+  }
+
   if (DOWNLOAD_STRATEGY === 'blob') {
     if (tabId === null) throw new Error('找不到可用的豆包标签页');
     await downloadViaContentScript(tabId, target.url, filename);
@@ -964,8 +1080,15 @@ async function buildTargets(request: DownloadRequest, tabId: number | null): Pro
       // 自愈回写要知道改哪个槽（§38）
       slotTabId,
     };
+    // 补角配方（2026-10-03 §43）：有它 ⇒ 这个条目的「无水印」要在页面里两档互补合成
+    if (item.meta.patch) target.patch = item.meta.patch;
     // 视频指纹形如 `vid:<x>` —— 签名地址过期时靠它让页面重新解析
     if (item.fingerprint.startsWith('vid:')) target.vid = item.fingerprint.slice(4);
+    // 分享页无水印（2026-10-03 §48）：UI 按当前页面类型置位，bg 再按条目类型筛（图片不走这条）
+    if (request.shareVideo && item.kind === 'video' && target.vid) {
+      target.shareVideo = true;
+      target.quality = request.quality === 'heavy' ? 'heavy' : 'light';
+    }
     targets.push(target);
   }
   return targets;
@@ -1260,6 +1383,47 @@ onRuntimeMessage((env, sender, sendResponse) => {
           level: found ? 'info' : 'warn',
         });
         sendResponse({ found });
+      })();
+      return true;
+    }
+
+    /*
+     * 弹窗请求「补角条目的卡片封面」（2026-10-03 第三十一轮）。
+     *
+     * 封面必须**在页面上下文里合成**（两档同源底图 → 覆盖 → 缩图；`<img>` 直接拿不到无水印的那张），
+     * 所以这里是纯转发：按条目 id 找到**它所属的那个槽的标签页**，把 `primary`（底板）+ `meta.patch`
+     * （来源档配方）交给页面，拿回一张小图 data URL。**不写库** —— 封面不是资源的描述，只给这次弹窗用。
+     * 失败（页面没开 / 取图失败 / 同源校验没过）一律如实回报，弹窗保持站点缩略图。
+     */
+    case MSG.PatchCover: {
+      const itemId = (env.payload as { itemId?: string } | undefined)?.itemId;
+      if (!itemId) {
+        sendResponse({ ok: false, error: '缺少条目 id' });
+        return undefined;
+      }
+      void (async () => {
+        const found = await findItemEverywhere(itemId);
+        if (!found) {
+          sendResponse({ ok: false, error: '资源库里没有这条（可能已随会话切换清掉）' });
+          return;
+        }
+        const patch = found.item.meta.patch;
+        if (!patch) {
+          sendResponse({ ok: false, error: '这条没有补角配方' });
+          return;
+        }
+        const res = await trySendToTab<{ ok?: boolean; cover?: string; error?: string }>(
+          found.tabId,
+          MSG.PatchCover,
+          { url: found.item.primary, patch, maxPx: LIMITS.PATCH_COVER_MAX_PX },
+          30_000,
+        );
+        if (res?.ok && res.cover) {
+          sendResponse({ ok: true, cover: res.cover });
+          return;
+        }
+        diag('bg.cover', `补角封面未取到（${res?.error ?? '页面脚本未就绪'}）item=${itemId}`, { level: 'warn' });
+        sendResponse({ ok: false, error: res?.error ?? '页面脚本未就绪' });
       })();
       return true;
     }

@@ -21,9 +21,10 @@ import {
   CHAIN_UNWATERMARK_TAG,
   CREATION_MEDIA_KEYS,
   CREATION_WALK_MAX_DEPTH,
+  IMG_LIST_KEY,
   MESSAGE_CREATE_TIME_KEY,
 } from '../site-contract';
-import { asNumber, decodeBase64, isObject, parseLooseJson, rawFromCreation } from './common';
+import { asNumber, decodeBase64, isObject, parseLooseJson, rawFromCreation, rawFromImageListEntry } from './common';
 import type { RawMedia } from '../types';
 
 /** 解析树遍历的节点预算，防止异常响应上打转 */
@@ -70,6 +71,14 @@ interface WalkState {
    * 于是图片 / 视频 / 旧作品都能拿到真实生成时间。
    */
   times: Array<number | null>;
+  /**
+   * **老链路「修改生成」**的结果条目（`msg.content.image_list[*]`，2026-10-03 §43）。
+   *
+   * 它们**不带 `image` 子对象**（字段直接挂在条目上：`image_raw` / `image_ori` / …），
+   * 所以 `CREATION_MEDIA_KEYS` 那条判据永远命中不了 —— 这正是「老会话里编辑图嗅探不到」
+   * 的根因（`docs/03` §43.2）。
+   */
+  list: Array<{ entry: Record<string, unknown>; createdAt: number | null }>;
   seen: Set<unknown>;
   budget: number;
 }
@@ -92,6 +101,20 @@ function walkForCreations(value: unknown, depth: number, state: WalkState, inher
   const ownTime = asNumber(obj[MESSAGE_CREATE_TIME_KEY]);
   const time = ownTime ?? inheritedTime;
 
+  /*
+   * 老链路「修改生成」的结果容器（§43）：**必须在 creation 判据之前收** ——
+   * 它们是「叶子」，但既没有 `image` 子对象也没有 `video` 子对象，走不到下面的 push 分支。
+   */
+  const listValue = obj[IMG_LIST_KEY];
+  if (listValue !== undefined) {
+    const entries = Array.isArray(listValue) ? listValue : parseLooseJson(listValue);
+    if (Array.isArray(entries)) {
+      for (const entry of entries) {
+        if (isObject(entry)) state.list.push({ entry, createdAt: time });
+      }
+    }
+  }
+
   if (CREATION_MEDIA_KEYS.some((key) => isObject(obj[key]))) {
     // creation 是叶子：不再往下钻，避免把同一条消息里的封面图当成第二条
     state.out.push(obj);
@@ -112,14 +135,30 @@ function walkForCreations(value: unknown, depth: number, state: WalkState, inher
   }
 }
 
+/**
+ * **一次遍历**同时取出两类目标（2026-10-03 §43）：
+ *   · `creations` —— 常规 creation（`creation_block.creations[]`，含 `image` / `video` 子对象）；
+ *   · `list` —— 老链路「修改生成」的结果（`msg.content.image_list[*]`，字段直接挂在条目上）。
+ * 合并成一次遍历是为了不重复解析这份几十~几百 KB 的报文。
+ */
+export function walkChainAll(text: string): {
+  creations: Array<{ creation: Record<string, unknown>; createdAt: number | null }>;
+  list: Array<{ entry: Record<string, unknown>; createdAt: number | null }>;
+} {
+  if (!text) return { creations: [], list: [] };
+  const parsed = parseLooseJson(text);
+  if (!parsed) return { creations: [], list: [] };
+  const state: WalkState = { out: [], times: [], list: [], seen: new Set(), budget: WALK_BUDGET };
+  walkForCreations(parsed, 0, state);
+  return {
+    creations: state.out.map((creation, i) => ({ creation, createdAt: state.times[i] ?? null })),
+    list: state.list,
+  };
+}
+
 /** 遍历收集 creation **及其所在消息的生成时间（秒级）**；`collectChainCreations` 的详细版 */
 export function walkChainCreations(text: string): { creation: Record<string, unknown>; createdAt: number | null }[] {
-  if (!text) return [];
-  const parsed = parseLooseJson(text);
-  if (!parsed) return [];
-  const state: WalkState = { out: [], times: [], seen: new Set(), budget: WALK_BUDGET };
-  walkForCreations(parsed, 0, state);
-  return state.out.map((creation, i) => ({ creation, createdAt: state.times[i] ?? null }));
+  return walkChainAll(text).creations;
 }
 
 /** 从报文文本里收集所有 creation 对象（结构化路线；解析不了就返回空） */
@@ -137,10 +176,21 @@ export function collectChainCreations(text: string): Record<string, unknown>[] {
 export function extractChainRaw(text: string): RawMedia[] {
   if (!text) return [];
 
-  const entries = walkChainCreations(text);
+  const { creations, list } = walkChainAll(text);
   const out: RawMedia[] = [];
-  for (const { creation, createdAt } of entries) {
+  for (const { creation, createdAt } of creations) {
     const media = rawFromCreation(creation, 'chain');
+    if (!media) continue;
+    if (media.createdAt === undefined && createdAt !== null) media.createdAt = createdAt;
+    out.push(media);
+  }
+  /*
+   * 老链路「修改生成」（2026-10-03 §43）：结果**不在** `creation_block.creations` 里，
+   * 而在 `msg.content.image_list[*]`。站点没给 `image_ori_raw`，只给两档带水印的同源底图 ——
+   * 抽取层存「预览档 + 补角配方」，下载时由内容脚本补齐（`docs/03` §43.9 方案 A+B）。
+   */
+  for (const { entry, createdAt } of list) {
+    const media = rawFromImageListEntry(entry, 'chain');
     if (!media) continue;
     if (media.createdAt === undefined && createdAt !== null) media.createdAt = createdAt;
     out.push(media);

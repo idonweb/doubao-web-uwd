@@ -5,17 +5,28 @@ import {
   decodeChainUrls,
   extractChainRaw,
   matchChainMainUrls,
+  walkChainAll,
   walkChainCreations,
 } from '../src/core/extract/chain';
 import { toDrafts } from '../src/core/extract/common';
+import { IMG_PATCH_LABEL } from '../src/core/constants';
+import { IMG_PATCH_RECT } from '../src/core/site-contract';
 import {
   CHAIN_DURATION,
   CHAIN_FALLBACK_API,
+  CHAIN_IMAGE_LIST_RESPONSE,
+  CHAIN_IMAGE_LIST_RESPONSE_NO_DLD,
   CHAIN_MESSAGE_CREATE_TIME,
   CHAIN_RESPONSE,
   CHAIN_RESPONSE_NOT_JSON,
   CHAIN_RESPONSE_URL_ONLY,
   CHAIN_VID,
+  IMG_LIST_CREATE_TIME,
+  IMG_LIST_DLD_URL,
+  IMG_LIST_HEIGHT,
+  IMG_LIST_PRE_URL,
+  IMG_LIST_THUMB_URL,
+  IMG_LIST_WIDTH,
   VIDEO_THUMB,
   chainWatermarkedUrl,
 } from './fixtures/samples';
@@ -137,5 +148,62 @@ describe('chain/single 坏输入', () => {
     expect(extractChainRaw('{"a":1}')).toEqual([]);
     expect(collectChainCreations('')).toEqual([]);
     expect(collectChainCreations('{"a":1}')).toEqual([]);
+  });
+});
+
+describe('老链路「修改生成」的 image_list（2026-10-03 §43）', () => {
+  const raws = extractChainRaw(CHAIN_IMAGE_LIST_RESPONSE);
+
+  it('能钻过 `content` 那层转义 JSON 字符串认出条目', () => {
+    expect(raws).toHaveLength(1);
+    expect(raws[0].kind).toBe('image');
+    expect(raws[0].origin).toBe('chain');
+  });
+
+  it('底板取**预览档**（`image_raw`）—— 不把它当「无水印原片」（字段名有误导性）', () => {
+    expect(raws[0].raw).toBe(IMG_LIST_PRE_URL);
+  });
+
+  it('带上补角配方：像素来源 = **下载档**（`image_ori`）+ 宽松矩形', () => {
+    expect(raws[0].patch).toEqual({ url: IMG_LIST_DLD_URL, rect: { ...IMG_PATCH_RECT } });
+  });
+
+  it('宽高取两档子对象（实测 1536×2730）；thumb 取缩略档当卡片封面', () => {
+    expect(raws[0].width).toBe(IMG_LIST_WIDTH);
+    expect(raws[0].height).toBe(IMG_LIST_HEIGHT);
+    expect(raws[0].thumb).toBe(IMG_LIST_THUMB_URL);
+  });
+
+  it('toDrafts：state=raw（不被 skipThumbOnly 丢）、变体标「无水印（补角重建）」、配方进 meta、时间继承消息 create_time', () => {
+    const drafts = toDrafts(raws, CTX);
+    expect(drafts).toHaveLength(1);
+    const draft = drafts[0];
+    expect(draft.state).toBe('raw');
+    const patchVariant = draft.variants.find((v) => v.label === IMG_PATCH_LABEL);
+    expect(patchVariant?.isRaw).toBe(true);
+    expect(draft.meta.patch).toEqual({ url: IMG_LIST_DLD_URL, rect: { ...IMG_PATCH_RECT } });
+    expect(draft.meta.createdAt).toBe(IMG_LIST_CREATE_TIME * 1000);
+  });
+
+  it('缺下载档（`image_ori`）时不给配方 ⇒ 落 state=thumb（宁缺勿假，不冒充无水印）', () => {
+    const rawsNoDld = extractChainRaw(CHAIN_IMAGE_LIST_RESPONSE_NO_DLD);
+    expect(rawsNoDld).toHaveLength(1);
+    expect(rawsNoDld[0].patch).toBeUndefined();
+    const draft = toDrafts(rawsNoDld, CTX)[0];
+    expect(draft.state).toBe('thumb');
+    expect(draft.meta.patch).toBeUndefined();
+  });
+
+  it('walkChainAll 一次遍历同时给出 creations 与 image_list', () => {
+    const all = walkChainAll(CHAIN_IMAGE_LIST_RESPONSE);
+    expect(all.creations).toHaveLength(0);
+    expect(all.list).toHaveLength(1);
+    expect(all.list[0].createdAt).toBe(IMG_LIST_CREATE_TIME);
+  });
+
+  it('旧行为不变：常规 creation 路线仍照旧（creation 与 image_list 互不干扰）', () => {
+    const all = walkChainAll(CHAIN_RESPONSE);
+    expect(all.creations).toHaveLength(1);
+    expect(all.list).toHaveLength(0);
   });
 });

@@ -224,6 +224,16 @@ function metaMerge(base: MediaItem['meta'], incoming: MediaItem['meta']): MediaI
     'label',
     'createdAt',
     'modelBadge',
+    /*
+     * `patch`（2026-10-03 §43）：**必须进白名单** —— 它描述「这个条目的无水印是怎么来的」
+     * （站点原片 vs 两档互补重建），重放同一批报文结果稳定；漏了它，F5 / 切会话后
+     * 条目会退回成「无水印原片」的口径，而实际上那张图的水印在左上。
+     * ⚠️ `patchFail` **不在这里**：它不是「文件的描述」，而是**下载时的一次校验结果**，
+     *     由 bg 显式设置/清除（`setPatchFail`），进白名单会被后续草稿反复覆盖。
+     * ⚠️ `shareDlFail`（2026-10-03 §48.7）同理**不在这里**：分享直链「这一次没解出」
+     *     也是下载时的一次结果，由 bg 显式设置/清除（`setShareFail`）。
+     */
+    'patch',
   ] as const) {
     const value = incoming[key];
     if (value !== undefined && value !== null && value !== '') {
@@ -455,6 +465,24 @@ export function sizeForOf(item: MediaItem): 'raw' | 'preview' {
  */
 export function sizeForNow(item: MediaItem): 'raw' | 'preview' {
   return rawReady(item) ? 'raw' : 'preview';
+}
+
+/**
+ * 这条资源**有没有可直接复制的无水印直链**（2026-10-04 §52）。
+ *
+ * 两种情形**没有** —— 它们的 `primary` 都不是无水印文件，复制出去会被当成原片：
+ *   ① **补角重建的图**（`meta.patch`）：无水印只存在于下载时的合成结果里；
+ *   ② **分享页视频而原片没到手**（`convKind === 'thread'` 且 `state !== 'raw'`）：
+ *      `primary` 是带水印的播放 / 预览档地址，还带时效签名；已解析回原片的照常有直链。
+ *
+ * ⚠️ 抽成函数是为了让**卡片「复制」置灰与批量条跳过共用同一把尺子**：原先两处各写一套
+ * （卡片看页面类型、批量条漏了补角图片），实机上就出现「卡片明明置灰、批量条却照样复制」。
+ * 改口径只改这里。⚠️ 用 `convKind`（条目自己的来源）而**不是**当前页面类型 ——
+ * 判据描述的是条目本身，与用户此刻正打开哪个页面无关。
+ */
+export function hasCopyableDirectLink(item: MediaItem): boolean {
+  if (item.meta.patch) return false;
+  return !(item.convKind === 'thread' && item.kind === 'video' && item.state !== 'raw');
 }
 
 /* --------------------------------------------------------------------------- */

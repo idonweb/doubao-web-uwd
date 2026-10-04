@@ -2,6 +2,12 @@
 
 export type MediaKind = 'video' | 'image';
 
+/**
+ * 分享页可选的**无水印档位**（2026-10-03 第二十八轮 §48）。
+ * `light` = 轻量档（默认，体积与站点带水印档相当）；`heavy` = 高画质原画质档（体积随片源）。
+ */
+export type ShareQuality = 'light' | 'heavy';
+
 /** raw = 已拿到无水印原片；thumb = 只解析到封面/缩略图；pending = 解析中；fail = 获取失败 */
 export type MediaState = 'raw' | 'thumb' | 'pending' | 'fail';
 
@@ -33,6 +39,25 @@ export interface MediaVariant {
   rank: number;
   /** 是否无水印原片 */
   isRaw: boolean;
+}
+
+/**
+ * **补角配方**（2026-10-03 第二十三轮 §43）。
+ *
+ * 老链路「修改生成」的图片（`msg.content.image_list[*]`）站点**只给了两档带水印的同源底图**：
+ *   · 预览档 `image_raw`（水印在**左上**，全尺寸）—— 补角的**底板**；
+ *   · 下载档 `image_ori`（水印在**右下**，全尺寸）—— 补角的**像素来源**。
+ * 两档**除各自的水印矩形外逐像素相同**（实测差 = 0），且两块水印矩形相距 >1000px
+ * ⇒ 把 `url` 的 `rect` 区域原样覆盖到底板同一位置，即得无水印图。
+ *
+ * ⚠️ 这是**无损补角**（copy 原像素），不是像素混合 / 插值 / 猜内容 —— 前提是「同源」，
+ * 下载前会做一次同源校验（`site-contract::IMG_PATCH_VERIFY_STEP`），不通过就不补。
+ */
+export interface ImagePatch {
+  /** 像素来源那一档（下载档 `image_ori` 的 URL，**带时效签名**） */
+  url: string;
+  /** 要覆盖的矩形（原图像素坐标；**宽松框**，含 ±5px 抖动余量） */
+  rect: { x: number; y: number; w: number; h: number };
 }
 
 export interface MediaMeta {
@@ -100,6 +125,28 @@ export interface MediaMeta {
    * 排序时一律排在有真时间的条目之后。
    */
   createdAt?: number;
+  /**
+   * **补角配方**（2026-10-03 第二十三轮 §43.9 方案 B）—— 有它 = 该条目的「无水印」
+   * 是**本插件由两档带水印同源底图互补重建**的，**不是站点直接给的原片**。
+   * 界面据此显示「无水印（补角重建）」，绝不冒充「无水印原片」（宁缺勿假）。
+   */
+  patch?: ImagePatch;
+  /**
+   * **补角同源校验未通过**（两档不是同一张底图）—— 由 background 在下载时回写。
+   * 有它时界面显示「仅带水印档」：此时下到的就是**带水印的预览档**，不假装无水印。
+   * 可自愈：下一次补角成功即清掉。
+   */
+  patchFail?: boolean;
+  /**
+   * **分享页无水印直链没有解出**（2026-10-03 §48.7）—— 由 background 在下载时回写。
+   *
+   * 分享页视频条目即使被判「原片不可得」（`expired`），无水印仍可经分享直链拿到
+   * （`/thread/` 免登录；`/video-sharing` 需任意账号登录）。但那一步可能在下载时失败
+   * （未登录 / 分享失效 / 网络问题）→ 这次实际下到的是**站点给的带水印播放档**，
+   * 界面必须如实降级成「仅带水印档」，不假装无水印。
+   * 可自愈：下一次分享直链解析成功即清掉（与 `patchFail` 同一套哲学）。
+   */
+  shareDlFail?: boolean;
 }
 
 export interface MediaItem {
@@ -184,6 +231,13 @@ export interface RawMedia {
    * 只对视频有意义（模型提示来自视频生成任务）。
    */
   modelBadge?: string;
+  /**
+   * **补角配方**（2026-10-03 第二十三轮 §43）。
+   * 出现它即表示：这条图片来自老链路 `image_list`，站点**没给** `image_ori_raw`，
+   * 只有两档带水印的同源底图 ⇒ `raw` 存的是预览档（全尺寸但水印在左上），
+   * 真正的无水印图由下载时的补角合成产出。
+   */
+  patch?: ImagePatch;
 }
 
 export interface Config {
@@ -255,10 +309,25 @@ export interface DownloadTarget {
   /** 资源所属对话页标题（= `convTitle`）；弱标题 / 缺失 → 文件名标题位回退会话 ID */
   convTitle?: string;
   /**
+   * **补角配方**（2026-10-03 §43）：有它就说明这条图片的「无水印」要靠两档互补合成，
+   * 下载链路据此改走「页面内补齐 → 覆盖 → 下载」而不是直接下 `url`。
+   */
+  patch?: ImagePatch;
+  /**
    * 该条目所在的**标签页槽**（2026-10-02 §38）。自愈重解析要把新地址写回这个槽 ——
    * 库是多槽的，光有 `itemId`（槽内键）定位不到。内联下载（只有 url）时缺省。
    */
   slotTabId?: number;
+  /**
+   * **分享页无水印**（2026-10-03 第二十八轮 §48）：该目标是分享页（`kind==='thread'`）的**视频**条目，
+   * 下载时先请页面把它解析成无水印直链，再走方案 A。
+   *
+   * 为什么不在入库时就解好：直链是**带时效的签名 URL** ⇒ 只能现解现用（同 `patch` 的思路）。
+   * 解析失败时**如实回退**去下 `url`（站点给的那个档），不假装无水印。
+   */
+  shareVideo?: boolean;
+  /** 要哪一档（仅 `shareVideo` 时有意义）：`light` = 轻量（默认）/ `heavy` = 高画质 */
+  quality?: ShareQuality;
 }
 
 export interface DownloadProgress {
@@ -329,6 +398,13 @@ export interface DownloadRequest {
   url?: string;
   ext?: string;
   convId?: string;
+  /**
+   * 分享页（`kind==='thread'`）的下载：请 bg 对**视频条目**先解析无水印直链
+   * （2026-10-03 第二十八轮 §48）。UI 按当前页面类型置位，bg 再按条目类型筛。
+   */
+  shareVideo?: boolean;
+  /** 档位（仅 `shareVideo` 时有意义）：`light` = 轻量（默认）/ `heavy` = 高画质 */
+  quality?: ShareQuality;
 }
 
 /** `library:list` 的应答 */

@@ -102,3 +102,17 @@ export function onConfigChanged(handler: (config: Config) => void): () => void {
 export async function locateInPage(keys: string[]): Promise<{ found: boolean; error?: string }> {
   return sendToBg<{ found: boolean; error?: string }>(MSG.PreviewLocate, { keys });
 }
+
+/**
+ * 取「补角重建」条目的**卡片封面**（2026-10-03 第三十一轮 §45.1 开放子项）。
+ *
+ * 补角条目的无水印图只存在于**合成结果**里，站点给的 `image_thumb` 是带水印的 —— 卡片上写着
+ * 「无水印（补角重建）」、封面却带水印，自相矛盾。这条请求让页面按同一套补角合成一张小图
+ * （data URL）回来填 `<img src>`。
+ *
+ * ⚠️ 合成要取两档**全尺寸**图，所以**只对可见卡片发问**（调用方用 `IntersectionObserver` 把关）；
+ * ⚠️ 失败就保持站点缩略图 —— 预览可以带水印，**绝不能糊错画面**。
+ */
+export async function requestPatchCover(itemId: string): Promise<{ ok: boolean; cover?: string; error?: string }> {
+  return sendToBg<{ ok: boolean; cover?: string; error?: string }>(MSG.PatchCover, { itemId });
+}

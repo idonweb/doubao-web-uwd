@@ -15,6 +15,10 @@ import {
   CHAIN_VID_DURATION_KEY,
   CREATION_WALK_MAX_DEPTH,
   IMG_DIMS_SUBOBJECTS,
+  IMG_LIST_PATCH_KEY,
+  IMG_LIST_PRE_KEY,
+  IMG_LIST_THUMB_KEY,
+  IMG_PATCH_RECT,
   IMG_PREVIEW_PATHS,
   IMG_RAW_PATH,
   IMG_THUMB_PATH,
@@ -36,6 +40,7 @@ import {
   VIDEO_MODEL_QUALITY_KEY,
 } from '../site-contract';
 import { dedupeVariants, looksUnwatermarked, normalizeUrl, pathExt, rewriteVideoLr, sanitizeMediaUrl } from '../media-url';
+import { IMG_PATCH_LABEL } from '../constants';
 import type { ConvKind, MediaDraft, MediaVariant, RawMedia } from '../types';
 
 /** 变体优先级：越大越优先 */
@@ -273,6 +278,56 @@ export function rawFromCreation(creation: unknown, origin: RawMedia['origin']): 
   return null;
 }
 
+/**
+ * **老链路「修改生成」的 `image_list` 条目 → RawMedia**（2026-10-03 第二十三轮 §43）。
+ *
+ * 与 `rawFromCreation` 的**关键差别**：这一族**没有 `image_ori_raw`** ——
+ * 站点没给现成的无水印档，只给了两档带水印的**同源底图**。因此：
+ *   · `raw` 存**预览档**（`image_raw`，全尺寸、水印在**左上**）—— 它是要补角的「底板」；
+ *   · `patch` 记下**补角配方**（像素来源 = 下载档 `image_ori`，水印在**右下**）。
+ * 于是 `toDraft` 会把它标成「无水印（补角重建）」并保持 `state='raw'`（库中可见、可下载）。
+ *
+ * ⚠️ **绝不把 `image_raw` 当「无水印原片」** —— 这个字段名是**误导性的**：实测它指向
+ *    `…_pre_watermark_1_5b.png`，左上角有「AI生成」水印（`docs/03` §43.7）。
+ *
+ * ⚠️ 两档**缺一即不给配方**：只拿到一档时补不了角，草稿会落成 `state='thumb'` 并被
+ *    `skipThumbOnly` 拦下 —— 宁缺勿假，不让一张带水印的图冒充「无水印」。
+ */
+export function rawFromImageListEntry(entry: unknown, origin: RawMedia['origin']): RawMedia | null {
+  if (!isObject(entry)) return null;
+  const base = asString(getPath(entry, [IMG_LIST_PRE_KEY, 'url']));
+  if (!base) return null;
+  const patchUrl = asString(getPath(entry, [IMG_LIST_PATCH_KEY, 'url']));
+  const thumb = asString(getPath(entry, [IMG_LIST_THUMB_KEY, 'url']));
+
+  // 宽高：两档子对象里都有（`{url,width,height,format}`），按「底板优先」取第一组非空值
+  let width: number | undefined;
+  let height: number | undefined;
+  for (const key of [IMG_LIST_PRE_KEY, IMG_LIST_PATCH_KEY, IMG_LIST_THUMB_KEY]) {
+    const sub = entry[key];
+    if (!isObject(sub)) continue;
+    width = width ?? asNumber(sub.width);
+    height = height ?? asNumber(sub.height);
+    if (width !== undefined && height !== undefined) break;
+  }
+
+  const raw: RawMedia = { kind: 'image', origin, thumb, width, height };
+  if (patchUrl) {
+    // 底板 = 预览档（全尺寸，水印在左上）+ 补角配方（像素来源 = 下载档，水印在右下）
+    raw.raw = base;
+    raw.patch = { url: patchUrl, rect: { ...IMG_PATCH_RECT } };
+  } else {
+    /*
+     * ⚠️ **只有一档时绝不能当原片** —— 那一档（预览档）左上角**是有水印的**。
+     * 这里退成普通预览图（`state='thumb'`），由恒开的 `skipThumbOnly` 拦下：
+     * 宁可不显示，也不让一张带水印的图顶着「无水印原片」出现在库里。
+     * （这个坑是单测抓出来的：早先无条件写 `raw` 会让缺档条目也标成 raw。）
+     */
+    raw.preview = base;
+  }
+  return raw;
+}
+
 /** 按 `VIDEO_ID_KEYS` 候选顺序取第一个非空的视频 id（`vid` 或 `video_id`） */
 export function pickVideoId(video: Record<string, unknown>): string | undefined {
   for (const key of VIDEO_ID_KEYS) {
@@ -414,7 +469,11 @@ function buildImageVariants(raw: RawMedia): MediaVariant[] {
   if (raw.raw) {
     variants.push({
       url: sanitizeMediaUrl(raw.raw, 'image'),
-      label: '无水印原片',
+      /*
+       * ⚠️ 带补角配方的条目**不能**标成「无水印原片」：`raw` 那一张（预览档）左上角是**有水印的**，
+       * 无水印是**下载时补角合成**出来的结果。口径见 `site-contract` §2.8 / `docs/03` §43.9。
+       */
+      label: raw.patch ? IMG_PATCH_LABEL : '无水印原片',
       rank: RANK.raw,
       isRaw: true,
     });
@@ -485,6 +544,13 @@ export function toDraft(raw: RawMedia, ctx: DraftContext): MediaDraft | null {
   const meta: MediaDraft['meta'] = {
     ext: raw.kind === 'video' ? 'mp4' : pathExt(primaryVariant.url, 'png'),
   };
+  /*
+   * 补角配方（2026-10-03 §43）：**必须搬进 meta** —— 下载链路
+   * （`bg/service-worker.ts::performDownload`）就是靠它决定「直接下这个 URL」还是
+   * 「先在页面里用两档互补合成、再下合成结果」。漏搬它就只能下到带水印的预览档。
+   * 只对图片有意义（老链路 `image_list` 一族）。
+   */
+  if (raw.kind === 'image' && raw.patch) meta.patch = raw.patch;
   if (raw.width !== undefined) meta.width = raw.width;
   if (raw.height !== undefined) meta.height = raw.height;
   if (raw.duration !== undefined) meta.duration = raw.duration;

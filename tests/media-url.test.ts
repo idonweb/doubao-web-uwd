@@ -12,7 +12,6 @@ import {
   normalizeUrl,
   pathExt,
   pickPrimary,
-  rewriteImageSuffix,
   rewriteVideoLr,
   sanitizeMediaUrl,
   stripLogoType,
@@ -65,32 +64,20 @@ describe('封面可用性判定（docs/03 P1-4）', () => {
   });
 });
 
-describe('水印改写（site-contract §3.3）', () => {
-  it('图片水印后缀族全部能改写', () => {
-    expect(
-      rewriteImageSuffix('https://p3-ibyteimg.com/img/a~tplv-a9rns2rl98-downsize_watermark_1_6.png'),
-    ).toBe('https://p3-ibyteimg.com/img/a~tplv-a9rns2rl98-image-qvalue.jpeg');
-
-    expect(
-      rewriteImageSuffix('https://p3-ibyteimg.com/img/a~tplv-a9rns2rl98-video_dsz_watermark_1_6.png'),
-    ).toBe('https://p3-ibyteimg.com/img/a~tplv-a9rns2rl98-video_cover.jpeg');
-
-    expect(rewriteImageSuffix('https://p3-ibyteimg.com/img/a~tplv-6187y3xstg-watermark_1_6.png')).toBe(
-      'https://p3-ibyteimg.com/img/a~tplv-6187y3xstg-image.jpeg',
-    );
-
-    expect(rewriteImageSuffix('https://p3-ibyteimg.com/img/a~tplv-6187y3xstg-video_dsz_watermark.jpg')).toBe(
-      'https://p3-ibyteimg.com/img/a~tplv-6187y3xstg-video_cover.jpeg',
-    );
-
-    expect(rewriteImageSuffix('https://p3-ibyteimg.com/img/a~tplv-6187y3xstg-downsize_watermark_1_6.jpeg')).toBe(
-      'https://p3-ibyteimg.com/img/a~tplv-6187y3xstg-image.jpeg',
-    );
-  });
-
-  it('无水印后缀保持不变（幂等）', () => {
-    const url = 'https://p3-ibyteimg.com/img/a~tplv-a9rns2rl98-image-qvalue.jpeg';
-    expect(rewriteImageSuffix(url)).toBe(url);
+describe('水印参数改写（site-contract §3）', () => {
+  /*
+   * ⛔ 图片后缀改写表已于 2026-10-03（第三十一轮）**整体删除**：
+   *   它从未命中过真实地址，且命中即 403（签名覆盖整个路径，`docs/03` §43.6 / §45.2）。
+   *   下面这组用例就是「图片地址必须原样直通」的守门人 —— **别再把改写表加回来**。
+   */
+  it('图片地址一律原样直通（后缀不改写）', () => {
+    for (const url of [
+      'https://p3-ibyteimg.com/img/a~tplv-a9rns2rl98-downsize_watermark_1_6.png',
+      'https://p3-ibyteimg.com/img/a~tplv-6187y3xstg-video_dsz_watermark.jpg',
+      'https://p9-flow-imagex-sign.byteimg.com/a~tplv-a9rns2rl98-downsize_watermark_1_5_b.png?x-signature=SIG',
+    ]) {
+      expect(sanitizeMediaUrl(url, 'image')).toBe(url);
+    }
   });
 
   it('视频 lr 参数：豆包走 video_gen_no_watermark，dola 走 unwatermarked', () => {
@@ -122,13 +109,12 @@ describe('水印改写（site-contract §3.3）', () => {
     expect(looksUnwatermarked('https://v.douyinvod.com/a.mp4?logo_type=video_gen_watermark_dyn')).toBe(false);
   });
 
-  it('sanitizeMediaUrl 组合改写（视频 / 图片）', () => {
+  it('sanitizeMediaUrl：视频走 lr/logo_type 改写，图片原样直通', () => {
     expect(sanitizeMediaUrl('https://v.douyinvod.com/a.mp4?lr=video_gen_watermark_dyn&logo_type=video_gen_watermark_dyn', 'video')).toBe(
       'https://v.douyinvod.com/a.mp4?lr=video_gen_no_watermark',
     );
-    expect(sanitizeMediaUrl('https://a.com/x~tplv-a9rns2rl98-downsize_watermark_1_6.png', 'image')).toBe(
-      'https://a.com/x~tplv-a9rns2rl98-image-qvalue.jpeg',
-    );
+    const img = 'https://a.com/x~tplv-a9rns2rl98-downsize_watermark_1_6.png';
+    expect(sanitizeMediaUrl(img, 'image')).toBe(img);
   });
 });
 

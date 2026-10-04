@@ -42,7 +42,7 @@
 import './popup.css';
 
 import { AUTHOR_BILI_NAME, AUTHOR_BILI_UID, EXT_NAME, REPO_URL } from '../../core/constants';
-import { displayConvTitle, queryLibrary, type Library } from '../../core/library-store';
+import { displayConvTitle, hasCopyableDirectLink, queryLibrary, type Library } from '../../core/library-store';
 import { mediaLookupKeys } from '../../core/media-url';
 import {
   getState,
@@ -54,9 +54,9 @@ import {
   openDebugPage,
   patchConfig,
   requestDownload,
+  requestPatchCover,
 } from '../shared/api';
 import {
-  STATE_TAG,
   copyText,
   esc,
   fmtBytes,
@@ -67,13 +67,15 @@ import {
   openExtensionManager,
   resolveTheme,
   stateTagLabel,
+  stateTagOf,
   stateTagTitle,
   toast,
   watchSystemTheme,
 } from '../shared/dom';
 import { icon, type IconName } from '../shared/icons';
-import { isDoubaoHostUrl } from '../../core/site-contract';
-import type { ConvScope, DownloadProgress, MediaItem, PageInfo, PageKind, StateResponse } from '../../core/types';
+import { wireSnapScroll } from '../shared/snap-scroll';
+import { HQ_LABEL, HQ_TITLE, isDoubaoHostUrl, LQ_TITLE } from '../../core/site-contract';
+import type { ConvScope, DownloadProgress, MediaItem, PageInfo, PageKind, ShareQuality, StateResponse } from '../../core/types';
 
 const rootEl = document.getElementById('app');
 if (!rootEl) throw new Error('#app 不存在');
@@ -229,11 +231,115 @@ function listModelPill(item: MediaItem): string {
   return `<span class="list-model" title="本次生成使用的模型：${esc(badge)}">${esc(badge)}</span>`;
 }
 
+/* --------------------------------------------------------------------------- */
+/* 补角条目的卡片封面（2026-10-03 第三十一轮）                                     */
+/* --------------------------------------------------------------------------- */
+
+/*
+ * 补角重建的图（老链路 `msg.content.image_list[*]`）**没有**可直接当封面的无水印地址 ——
+ * 站点给的 `image_thumb` 是带水印的缩略图，而卡片上写着「无水印（补角重建）」，自相矛盾
+ * （`docs/03` §45.1 的开放子项）。所以封面也走同一套补角**现场合成**：页面侧取两档 →
+ * 同源校验 → 覆盖 → 缩到 `LIMITS.PATCH_COVER_MAX_PX` → data URL 回来填 `<img>`。
+ *
+ * 三条节流 / 卫生口径：
+ *   · **只给可见卡片做**（`IntersectionObserver`）—— 合成要取两档**全尺寸**图，
+ *     给整个会话预生成是白耗流量；
+ *   · **并发上限 2、失败不重试**（失败集合）—— `render()` 会被下载进度频繁触发，
+ *     否则每次重渲都会把失败的那些再问一遍；
+ *   · **不写库**：data URL 只活在这一次弹窗里，页面侧另有一份有界缓存。
+ */
+const patchCovers = new Map<string, string>();
+/** 已入队 / 在飞（`patchCovers` 里还没有值） */
+const coverPending = new Set<string>();
+/** 这次弹窗里合成失败过 —— 不再重问 */
+const coverFailed = new Set<string>();
+const coverQueue: string[] = [];
+let coverActive = 0;
+const COVER_CONCURRENCY = 2;
+
+/** 这条卡片该用哪张封面：合成好的优先，其次是站点缩略图 */
+function coverOf(item: MediaItem): string {
+  return patchCovers.get(item.id) ?? item.cover ?? '';
+}
+
+/** 这条的封面还需不需要现场合成（可见时才真发问） */
+function needsPatchCover(item: MediaItem): boolean {
+  return Boolean(item.meta.patch) && item.meta.patchFail !== true && !patchCovers.has(item.id) && !coverFailed.has(item.id);
+}
+
+function pumpCovers(): void {
+  while (coverActive < COVER_CONCURRENCY && coverQueue.length) {
+    const itemId = coverQueue.shift();
+    if (!itemId) continue;
+    coverActive += 1;
+    void requestPatchCover(itemId)
+      .then((res) => {
+        if (!res.ok || !res.cover) {
+          coverFailed.add(itemId);
+          return;
+        }
+        patchCovers.set(itemId, res.cover);
+        swapCover(itemId, res.cover);
+      })
+      .catch(() => coverFailed.add(itemId))
+      .finally(() => {
+        coverPending.delete(itemId);
+        coverActive -= 1;
+        pumpCovers();
+      });
+  }
+}
+
+function queueCover(itemId: string): void {
+  if (!itemId || coverPending.has(itemId) || patchCovers.has(itemId) || coverFailed.has(itemId)) return;
+  coverPending.add(itemId);
+  coverQueue.push(itemId);
+  pumpCovers();
+}
+
+/** 就地换图 —— 不整页重渲（重渲会丢滚动位置、还会闪一下） */
+function swapCover(itemId: string, cover: string): void {
+  const card = root.querySelector<HTMLElement>(`.card[data-id="${CSS.escape(itemId)}"]`);
+  if (!card) return;
+  card.removeAttribute('data-patch-cover');
+  const img = card.querySelector<HTMLImageElement>('.thumb img');
+  if (img) {
+    img.src = cover;
+    return;
+  }
+  // 站点缩略图加载失败时它已被摘掉（render 里的 error 监听）→ 这里补一张进去
+  card.querySelector('.thumb')?.insertAdjacentHTML('afterbegin', `<img src="${esc(cover)}" alt="" />`);
+  card.querySelector('.ph')?.setAttribute('hidden', '');
+}
+
+/** 只观察可见卡片（外扩一屏余量），命中即取消观察 */
+let coverObserver: IntersectionObserver | null = null;
+
+function wirePatchCovers(): void {
+  coverObserver?.disconnect();
+  coverObserver = null;
+  const listEl = root.querySelector<HTMLElement>('.list');
+  const cards = listEl ? listEl.querySelectorAll<HTMLElement>('.card[data-patch-cover]') : [];
+  if (!listEl || !cards.length) return;
+  coverObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        coverObserver?.unobserve(entry.target);
+        queueCover((entry.target as HTMLElement).dataset.id ?? '');
+      }
+    },
+    { root: listEl, rootMargin: '160px' },
+  );
+  cards.forEach((card) => coverObserver?.observe(card));
+}
+
 function cardHtml(item: MediaItem): string {
-  const tag = STATE_TAG[item.state];
+  const tag = stateTagOf(item);
   const isSel = selected.has(item.id);
-  const cover = item.cover
-    ? `<img src="${esc(item.cover)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+  const coverUrl = coverOf(item);
+  const cover = coverUrl
+    ? `<img src="${esc(coverUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
     : '';
   /*
    * 真实生成时间（2026-09-28 第十轮）：站点的 `create_time`。同一份文案渲染两次 ——
@@ -252,7 +358,55 @@ function cardHtml(item: MediaItem): string {
    */
   const tagTitle = stateTagTitle(item);
 
-  return `<article class="card ${isSel ? 'sel' : ''}" data-id="${esc(item.id)}">
+  /*
+   * 补角重建条目（2026-10-03 §43）的两个文案差异：
+   *   · 「下载」= 先在页面里用两档互补补掉水印、再保存无水印图（不是直接下那个 URL）；
+   *   · 「复制」= **没有**可直接复制的无水印直链（无水印只存在于合成结果里）⇒ 禁用并说明。
+   * 这两条都是为了不让人以为「地址就是无水印的」。
+   */
+  const patch = item.meta.patch;
+  /*
+   * **分享页无水印**（2026-10-03 第二十八轮 §48）：分享页（`kind==='thread'`）的**视频**条目
+   * 有两个无水印档可选 —— 轻量（默认「下载」）与原画质档（按钮「原画」）。
+   *
+   * ⚠️ **只在分享页出现**：对话页的「下载」走的是 vid 三步 API 的**真原片**，档位无从选择；
+   *    图片条目也没有这个概念。按钮文案与悬停说明见 `site-contract` §2.9（`LQ_TITLE` / `HQ_TITLE`）。
+   */
+  const shareVideo = state?.page.kind === 'thread' && item.kind === 'video';
+  const dlTitle = patch
+    ? item.meta.patchFail
+      ? '补角不可用：将下载带水印的预览档'
+      : '下载：先用两档互补补掉水印，再保存无水印图'
+    : shareVideo
+      ? LQ_TITLE
+      : '下载无水印原片';
+  /*
+   * 「复制」禁用判据：现在只剩**补角重建的图**这一种情形 —— 无水印只存在于下载时的合成结果里，
+   * `primary` 是带水印的预览档，复制出去会被当成原片。
+   *
+   * ⚠️ 分享页视频**已不再有「复制」按钮**（2026-10-04 §52，用户定稿）：卡片动作行统一成
+   * 三键一行，分享页卡的尺寸才与对话页完全一致。它那条「没有直链就不给复制」的判据没有取消，
+   * 而是**搬到了批量条**（`runCopy`）—— 判据本体是 `library-store::hasCopyableDirectLink()`，
+   * 卡片与批量条共用，改口径只改那一处。
+   */
+  const cpBlocked = !hasCopyableDirectLink(item);
+  const cpTitle = patch
+    ? '补角重建的图没有可直接复制的无水印直链（无水印要在下载时合成）'
+    : '复制无水印原片地址';
+  const dl = `<button class="act" data-act="dl" data-id="${esc(item.id)}" title="${esc(dlTitle)}">${icon('dl')}下载</button>`;
+  const dlHq = `<button class="act" data-act="dlhq" data-id="${esc(item.id)}" title="${esc(HQ_TITLE)}">${icon('dl')}${esc(HQ_LABEL)}</button>`;
+  const cp = `<button class="act" data-act="cp" data-id="${esc(item.id)}" title="${esc(cpTitle)}"${cpBlocked ? ' disabled' : ''}>${icon('copy')}复制</button>`;
+  const pv = `<button class="act" data-act="pv" data-id="${esc(item.id)}" title="在豆包页面上定位它，并唤起豆包自己的预览">${icon('play')}预览</button>`;
+  /*
+   * 动作行**统一为三键一行**（2026-10-04 §52，用户定稿）：分享页视频是「下载 / 原画 / 预览」，
+   * 其余条目是「下载 / 复制 / 预览」—— 按钮数、行数、行高全部一致，卡片尺寸因此完全统一
+   * （网格卡缩略图 90、卡体 87；列表卡 66，与对话页同值）。⛔ 不要再给某一类卡片单独加换行类。
+   */
+  const actionRow = shareVideo
+    ? `${dl}${dlHq}${pv}`
+    : `${dl}${cp}${pv}`;
+
+  return `<article class="card ${isSel ? 'sel' : ''}" data-id="${esc(item.id)}"${needsPatchCover(item) ? ' data-patch-cover' : ''}>
     <div class="thumb">
       ${cover}
       <span class="ph" ${cover ? 'hidden' : ''}>${icon(item.kind === 'video' ? 'play' : 'image')}</span>
@@ -269,9 +423,7 @@ function cardHtml(item: MediaItem): string {
       <div class="card-meta" title="${esc(item.primary)}">${whenMeta}${esc(itemMetaLine(item))}</div>
       ${listModelPill(item)}
       <div class="card-actions">
-        <button class="act" data-act="dl" data-id="${esc(item.id)}" title="下载无水印原片">${icon('dl')}下载</button>
-        <button class="act" data-act="cp" data-id="${esc(item.id)}" title="复制无水印原片地址">${icon('copy')}复制</button>
-        <button class="act" data-act="pv" data-id="${esc(item.id)}" title="在豆包页面上定位它，并唤起豆包自己的预览">${icon('play')}预览</button>
+        ${actionRow}
       </div>
     </div>
   </article>`;
@@ -428,6 +580,13 @@ function render(): void {
   const { items, deduped, counts } = viewData();
   const selectedItems = Object.values(library).filter((item) => selected.has(item.id));
 
+  /*
+   * 滚动位置保留（2026-10-04 第三十三轮 §51）：`innerHTML` 把 `.list` 整个换掉 ⇒ `scrollTop` 归零，
+   * 而下载进度事件、`library:sync`、勾选都会触发 render() —— 表现为「下载中列表自己跳回顶部」。
+   * 记下旧值、渲染后写回；内容变短（筛选/批量条/换视图）时按新的上限钳一下。
+   */
+  const topBefore = root.querySelector<HTMLElement>('.list')?.scrollTop ?? 0;
+
   root.innerHTML = `
     ${headHtml()}
     ${sessHtml(items, deduped)}
@@ -450,9 +609,16 @@ function render(): void {
       <button class="link-btn" data-act="debug" title="解析不到资源时，打开诊断页取证">${icon('term', 'ic-sm')}诊断</button>
     </footer>`;
 
+  const listAfter = root.querySelector<HTMLElement>('.list');
+  if (listAfter && topBefore > 0) {
+    listAfter.scrollTop = Math.max(0, Math.min(topBefore, listAfter.scrollHeight - listAfter.clientHeight));
+  }
+
   root.querySelectorAll<HTMLImageElement>('.list img').forEach((img) => {
     img.addEventListener('error', () => img.remove());
   });
+
+  wirePatchCovers();
 }
 
 /* --------------------------------------------------------------------------- */
@@ -539,6 +705,10 @@ root.addEventListener('click', (event) => {
       case 'dl':
         void runDownload(id ? [id] : selectedIds);
         return;
+      case 'dlhq':
+        // 分享页「原画」：同一条链路，只把档位换成原画质（§48；按钮文案 §52 前叫「高画质」）
+        void runDownload(id ? [id] : selectedIds, 'heavy');
+        return;
       case 'cp':
         void runCopy(id ? [id] : selectedIds);
         return;
@@ -584,16 +754,30 @@ root.addEventListener('change', (event) => {
   render();
 });
 
+/*
+ * 滚轮翻页（2026-10-04 第三十三轮 §51）：一格滚轮 = 一屏（列表 5 行 / 网格两排 4 列）。
+ * 委托在 `root` 上只装一次（`render()` 会重建 `.list`）；口径与实现细节见 `shared/snap-scroll.ts`。
+ */
+wireSnapScroll(root);
+
 /* --------------------------------------------------------------------------- */
 /* 动作                                                                          */
 /* --------------------------------------------------------------------------- */
 
-async function runDownload(ids: string[]): Promise<void> {
+async function runDownload(ids: string[], quality?: ShareQuality): Promise<void> {
   if (!ids.length) {
     toast('请先选择资源', true);
     return;
   }
-  const result = await requestDownload({ ids });
+  /*
+   * 分享页（`kind==='thread'`）把「要解析无水印直链」随请求带给 bg；
+   * bg 只对**视频条目**生效（图片与对话页条目忽略这个标记，见 `buildTargets`）。
+   * ⚠️ 这不是入库字段：直链带时效，**下载那一刻才解析**（§48）。
+   */
+  const shareVideo = state?.page.kind === 'thread';
+  const result = await requestDownload(
+    shareVideo ? { ids, shareVideo: true, quality: quality ?? 'light' } : { ids },
+  );
   if (!result.ok) {
     toast(result.error ?? '下载失败', true);
     return;
@@ -608,13 +792,25 @@ async function runCopy(ids: string[]): Promise<void> {
     toast('请先选择资源', true);
     return;
   }
-  const urls = ids.map((id) => library[id]?.primary).filter((url): url is string => Boolean(url));
+  /*
+   * 没有可直接复制的无水印直链的条目要**跳过**（判据 = `hasCopyableDirectLink()`，
+   * 与卡片「复制」置灰共用）：补角重建的图、以及分享页视频里原片没到手的那些 ——
+   * 它们的 `primary` 是带水印的预览 / 播放档，复制出去会被当成原片。
+   * 全被跳过时不复制任何东西，只如实提示；跳了几条写在成功提示里。
+   */
+  const noDirectLink = ids.filter((id) => {
+    const item = library[id];
+    return item ? !hasCopyableDirectLink(item) : false;
+  });
+  const copyIds = ids.filter((id) => !noDirectLink.includes(id));
+  const urls = copyIds.map((id) => library[id]?.primary).filter((url): url is string => Boolean(url));
   if (!urls.length) {
-    toast('没有可复制的地址', true);
+    toast(noDirectLink.length ? '没有可直接复制的无水印直链（分享页视频 / 补角图片）' : '没有可复制的地址', true);
     return;
   }
   const ok = await copyText(urls.join('\n'));
-  toast(ok ? `已复制 ${urls.length} 条原片地址` : '复制失败', !ok);
+  const suffix = noDirectLink.length ? `（${noDirectLink.length} 条没有可复制直链，已跳过）` : '';
+  toast(ok ? `已复制 ${urls.length} 条原片地址${suffix}` : '复制失败', !ok);
 }
 
 /**

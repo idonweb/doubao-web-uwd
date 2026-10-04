@@ -483,3 +483,73 @@ export const MODEL_LABEL_MESSAGE = {
     },
   },
 };
+
+/* --------------------------------------------------------------------------- */
+/* 老链路「修改生成」的 image_list（2026-10-03 第二十三轮 §43）                    */
+/* --------------------------------------------------------------------------- */
+
+/** 两档共用的对象 key（实测形状：`tos-cn-i-a9rns2rl98/rc_gen_image/<32位hash>.jpeg`） */
+export const IMG_LIST_KEY_VALUE = 'tos-cn-i-a9rns2rl98/rc_gen_image/6e2b4866e9814c64a206e9b9f2d32e52.jpeg';
+/** 预览档（**水印在左上**）—— 站点把「预览档 URL」放在 `image_raw` 字段里（字段名有误导性） */
+export const IMG_LIST_PRE_URL = `https://p3-flow-imagex-sign.byteimg.com/${IMG_LIST_KEY_VALUE}~tplv-a9rns2rl98-image_pre_watermark_1_5b.png?x-signature=PRE`;
+/** 下载档（**水印在右下**）—— 补角的像素来源 */
+export const IMG_LIST_DLD_URL = `https://p26-flow-imagex-sign.byteimg.com/${IMG_LIST_KEY_VALUE}~tplv-a9rns2rl98-image_dld_watermark_1_5b.png?x-signature=DLD`;
+/** 缩略档（卡片封面） */
+export const IMG_LIST_THUMB_URL = `https://p9-flow-imagex-sign.byteimg.com/${IMG_LIST_KEY_VALUE}~tplv-a9rns2rl98-downsize_watermark_1_5_b.png?x-signature=THM`;
+/** 该批消息的生成时间（秒级 Unix） */
+export const IMG_LIST_CREATE_TIME = 1771000000;
+/** 两档共同的真实尺寸（实测 1536×2730） */
+export const IMG_LIST_WIDTH = 1536;
+export const IMG_LIST_HEIGHT = 2730;
+
+/** 一条 `image_list` 条目：**没有 `image_ori_raw`**（站点没给现成原片） */
+export const IMG_LIST_ENTRY = {
+  key: IMG_LIST_KEY_VALUE,
+  image_thumb: { url: IMG_LIST_THUMB_URL, width: 326, height: 580, format: 'jpeg' },
+  image_ori: { url: IMG_LIST_DLD_URL, width: IMG_LIST_WIDTH, height: IMG_LIST_HEIGHT, format: 'png' },
+  preview_img: { url: IMG_LIST_PRE_URL, width: IMG_LIST_WIDTH, height: IMG_LIST_HEIGHT, format: 'png' },
+  image_raw: { url: IMG_LIST_PRE_URL, width: IMG_LIST_WIDTH, height: IMG_LIST_HEIGHT, format: 'png' },
+  // 实测：只有宽高，**没有 url**（死字段）
+  image_thumb_ori: { width: 326, height: 580, format: 'jpeg' },
+};
+
+/** 只有预览档、缺下载档的条目（补不了角 ⇒ 应落 `state='thumb'`） */
+export const IMG_LIST_ENTRY_NO_DLD = {
+  key: IMG_LIST_KEY_VALUE,
+  image_thumb: { url: IMG_LIST_THUMB_URL, width: 326, height: 580, format: 'jpeg' },
+  image_raw: { url: IMG_LIST_PRE_URL, width: IMG_LIST_WIDTH, height: IMG_LIST_HEIGHT, format: 'png' },
+};
+
+/**
+ * 报文形状照实测：`messages[i].content` 是**被转义的 JSON 字符串**，解一层才是 `{ image_list: [...] }`
+ * （探针实录路径 `…messages[4].content.image_list[0]`，`docs/03` §43.5）。
+ */
+export const CHAIN_IMAGE_LIST_RESPONSE = JSON.stringify({
+  cmd: 3100,
+  downlink_body: {
+    pull_singe_chain_downlink_body: {
+      messages: [
+        {
+          message_id: '57100000000000001',
+          create_time: IMG_LIST_CREATE_TIME,
+          content: JSON.stringify({ image_list: [IMG_LIST_ENTRY] }),
+        },
+      ],
+    },
+  },
+});
+
+export const CHAIN_IMAGE_LIST_RESPONSE_NO_DLD = JSON.stringify({
+  cmd: 3100,
+  downlink_body: {
+    pull_singe_chain_downlink_body: {
+      messages: [
+        {
+          message_id: '57100000000000002',
+          create_time: IMG_LIST_CREATE_TIME,
+          content: JSON.stringify({ image_list: [IMG_LIST_ENTRY_NO_DLD] }),
+        },
+      ],
+    },
+  },
+});

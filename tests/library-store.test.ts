@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   displayConvTitle,
   filterDraftsByConv,
+  hasCopyableDirectLink,
   isFallbackTitle,
   isWeakTitle,
   itemId,
@@ -465,6 +466,46 @@ describe('primaryIsRaw：当前下载地址是不是无水印原片（2026-10-02
     // 都没有：pending + 只有候选流 → 体积属于「预览」
     expect(rawReady(built([candidate]))).toBe(false);
     expect(sizeForNow(built([candidate]))).toBe('preview');
+  });
+});
+
+describe('hasCopyableDirectLink：有没有可直接复制的无水印直链（2026-10-04 §52）', () => {
+  const built = (overrides: Partial<MediaDraft> = {}): MediaItem => {
+    const library = upsertDrafts({}, [draft(overrides)], { now: 1 }).library;
+    return library[itemId(CONV, 'vid:v0abc')];
+  };
+
+  it('对话页条目：有直链（图片 / 视频都算）', () => {
+    expect(hasCopyableDirectLink(built())).toBe(true);
+    expect(hasCopyableDirectLink(built({ kind: 'image' }))).toBe(true);
+  });
+
+  it('对话页视频还在解析中（state=pending）也照旧可复制 —— 本次刻意不动这一档', () => {
+    expect(hasCopyableDirectLink(built({ state: 'pending' }))).toBe(true);
+  });
+
+  it('补角重建的图 → 没有直链（无水印只存在于下载时的合成结果里）', () => {
+    const item = built({
+      kind: 'image',
+      meta: { ext: 'png', patch: { url: 'https://p3.douyinpic.com/ori.png', rect: { x: 0, y: 0, w: 518, h: 116 } } },
+    });
+    expect(item.meta.patch).toBeDefined();
+    expect(hasCopyableDirectLink(item)).toBe(false);
+  });
+
+  it('分享页视频：原片没到手（state≠raw）→ 没有直链；已解析回原片 → 有', () => {
+    expect(hasCopyableDirectLink(built({ convKind: 'thread', state: 'pending' }))).toBe(false);
+    expect(hasCopyableDirectLink(built({ convKind: 'thread', state: 'fail' }))).toBe(false);
+    expect(hasCopyableDirectLink(built({ convKind: 'thread', state: 'raw' }))).toBe(true);
+  });
+
+  it('分享页的图片不受影响（「档位」只对视频有意义）', () => {
+    expect(hasCopyableDirectLink(built({ convKind: 'thread', kind: 'image', state: 'pending' }))).toBe(true);
+  });
+
+  it('判据只看条目自己 —— 同一批里混装时逐条各判各的', () => {
+    const items = [built(), built({ convKind: 'thread', state: 'pending' }), built({ kind: 'image' })];
+    expect(items.map(hasCopyableDirectLink)).toEqual([true, false, true]);
   });
 });
 
