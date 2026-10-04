@@ -468,21 +468,42 @@ export function sizeForNow(item: MediaItem): 'raw' | 'preview' {
 }
 
 /**
+ * 这条**视频**要不要走「站点播放源换无水印」（fplay 通路）—— 行为判据（2026-10-04 第三十五轮）。
+ *
+ * 满足三条才算：
+ *   · `kind === 'video'`（图片没有这条路）；
+ *   · `state !== 'raw'`（已经拿到原片的条目**必须**用原片，fplay 那个是预览家族，别降级）；
+ *   · **分享页**（`convKind='thread'`）无条件成立；**对话页**要求 `meta.expired`
+ *     （创作者本人的对话页里，只有创作树原片已被清除的老作品才需要补救）。
+ *
+ * 用途：`hasCopyableDirectLink`（复制置灰）、`popup` 的卡片「下载 / 原画」、bg 的下载分支。
+ * ⚠️ 抽成函数是让这几处共用同一把尺子 —— 先前各写一套，改口径必然漏一处。
+ *
+ * 📌 **标签判据 = 本判据**（2026-10-04 §55 起，见 `stateTagOf`）—— 分享页条目不再等
+ *    `meta.expired` 就标「无水印（分享页）」（否则要等三步链路翻树 + 20s 确认窗口，
+ *    实机体感「下载已生效、标签还在解析中」）。⚠️ 只有**悬停说明**仍等 `meta.expired`。
+ */
+export function needsShareWatermark(item: MediaItem): boolean {
+  if (item.kind !== 'video' || item.state === 'raw') return false;
+  return item.convKind === 'thread' || item.meta.expired === true;
+}
+
+/**
  * 这条资源**有没有可直接复制的无水印直链**（2026-10-04 §52）。
  *
  * 两种情形**没有** —— 它们的 `primary` 都不是无水印文件，复制出去会被当成原片：
  *   ① **补角重建的图**（`meta.patch`）：无水印只存在于下载时的合成结果里；
- *   ② **分享页视频而原片没到手**（`convKind === 'thread'` 且 `state !== 'raw'`）：
+ *   ② **要靠播放源换无水印的视频**（`needsShareWatermark()`）：分享页视频、以及对话页的超期视频，
  *      `primary` 是带水印的播放 / 预览档地址，还带时效签名；已解析回原片的照常有直链。
  *
  * ⚠️ 抽成函数是为了让**卡片「复制」置灰与批量条跳过共用同一把尺子**：原先两处各写一套
  * （卡片看页面类型、批量条漏了补角图片），实机上就出现「卡片明明置灰、批量条却照样复制」。
- * 改口径只改这里。⚠️ 用 `convKind`（条目自己的来源）而**不是**当前页面类型 ——
+ * 改口径只改这里。⚠️ 用 `convKind` / `meta`（条目自己的属性）而**不是**当前页面类型 ——
  * 判据描述的是条目本身，与用户此刻正打开哪个页面无关。
  */
 export function hasCopyableDirectLink(item: MediaItem): boolean {
   if (item.meta.patch) return false;
-  return !(item.convKind === 'thread' && item.kind === 'video' && item.state !== 'raw');
+  return !needsShareWatermark(item);
 }
 
 /* --------------------------------------------------------------------------- */

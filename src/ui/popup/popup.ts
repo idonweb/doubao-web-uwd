@@ -42,7 +42,7 @@
 import './popup.css';
 
 import { AUTHOR_BILI_NAME, AUTHOR_BILI_UID, EXT_NAME, REPO_URL } from '../../core/constants';
-import { displayConvTitle, hasCopyableDirectLink, queryLibrary, type Library } from '../../core/library-store';
+import { displayConvTitle, hasCopyableDirectLink, needsShareWatermark, queryLibrary, type Library } from '../../core/library-store';
 import { mediaLookupKeys } from '../../core/media-url';
 import {
   getState,
@@ -366,43 +366,51 @@ function cardHtml(item: MediaItem): string {
    */
   const patch = item.meta.patch;
   /*
-   * **分享页无水印**（2026-10-03 第二十八轮 §48）：分享页（`kind==='thread'`）的**视频**条目
-   * 有两个无水印档可选 —— 轻量（默认「下载」）与原画质档（按钮「原画」）。
+   * **播放源换无水印**（§48 分享页；2026-10-04 §53 扩到**对话页超期视频**）：
+   * 这类视频站点只给带水印播放档，无水印要在下载那一刻用 `fallback_api` 换。
    *
-   * ⚠️ **只在分享页出现**：对话页的「下载」走的是 vid 三步 API 的**真原片**，档位无从选择；
-   *    图片条目也没有这个概念。按钮文案与悬停说明见 `site-contract` §2.9（`LQ_TITLE` / `HQ_TITLE`）。
+   * ⚠️ 判据是**条目自己的属性**（`needsShareWatermark`），不是当前页面类型 —— 与标签、复制置灰同源。
+   * ⚠️ 「原画」按钮**只在分享页出现**：分享页有两个档位可选（轻量 / 原画质）；
+   *    对话页超期视频**只给原画质档**（对标「创作者对话页本来就该拿高码率无水印原片」的语义），
+   *    所以它的动作行仍是「下载 / 复制 / 预览」（复制按判据置灰）。
    */
-  const shareVideo = state?.page.kind === 'thread' && item.kind === 'video';
+  const sharePath = needsShareWatermark(item);
+  const showHq = sharePath && item.convKind === 'thread';
   const dlTitle = patch
     ? item.meta.patchFail
       ? '补角不可用：将下载带水印的预览档'
       : '下载：先用两档互补补掉水印，再保存无水印图'
-    : shareVideo
+    : showHq
       ? LQ_TITLE
-      : '下载无水印原片';
+      : sharePath
+        ? '下载无水印原画质档：原片已超期，下载时用站点播放源现场换取（直链带时效，不入库）'
+        : '下载无水印原片';
   /*
-   * 「复制」禁用判据：现在只剩**补角重建的图**这一种情形 —— 无水印只存在于下载时的合成结果里，
-   * `primary` 是带水印的预览档，复制出去会被当成原片。
+   * 「复制」禁用判据（判据本体 `library-store::hasCopyableDirectLink()`）：
+   * 补角重建的图、以及要靠播放源换无水印的视频（分享页视频 / 对话页超期视频），
+   * 它们的 `primary` 都不是无水印文件，复制出去会被当成原片。
    *
    * ⚠️ 分享页视频**已不再有「复制」按钮**（2026-10-04 §52，用户定稿）：卡片动作行统一成
-   * 三键一行，分享页卡的尺寸才与对话页完全一致。它那条「没有直链就不给复制」的判据没有取消，
-   * 而是**搬到了批量条**（`runCopy`）—— 判据本体是 `library-store::hasCopyableDirectLink()`，
-   * 卡片与批量条共用，改口径只改那一处。
+   * 三键一行，分享页卡的尺寸才与对话页完全一致。判据没有取消，而是**搬到了批量条**（`runCopy`）——
+   * 卡片与批量条共用同一把尺子，改口径只改那一处。对话页超期视频仍保留该键，但按判据置灰。
    */
   const cpBlocked = !hasCopyableDirectLink(item);
   const cpTitle = patch
     ? '补角重建的图没有可直接复制的无水印直链（无水印要在下载时合成）'
-    : '复制无水印原片地址';
+    : sharePath
+      ? '没有可直接复制的无水印直链（当前地址是带水印的播放档，无水印要在下载时现场换取）'
+      : '复制无水印原片地址';
   const dl = `<button class="act" data-act="dl" data-id="${esc(item.id)}" title="${esc(dlTitle)}">${icon('dl')}下载</button>`;
   const dlHq = `<button class="act" data-act="dlhq" data-id="${esc(item.id)}" title="${esc(HQ_TITLE)}">${icon('dl')}${esc(HQ_LABEL)}</button>`;
   const cp = `<button class="act" data-act="cp" data-id="${esc(item.id)}" title="${esc(cpTitle)}"${cpBlocked ? ' disabled' : ''}>${icon('copy')}复制</button>`;
   const pv = `<button class="act" data-act="pv" data-id="${esc(item.id)}" title="在豆包页面上定位它，并唤起豆包自己的预览">${icon('play')}预览</button>`;
   /*
-   * 动作行**统一为三键一行**（2026-10-04 §52，用户定稿）：分享页视频是「下载 / 原画 / 预览」，
-   * 其余条目是「下载 / 复制 / 预览」—— 按钮数、行数、行高全部一致，卡片尺寸因此完全统一
-   * （网格卡缩略图 90、卡体 87；列表卡 66，与对话页同值）。⛔ 不要再给某一类卡片单独加换行类。
+   * 动作行**统一为三键一行**（2026-10-04 §52，用户定稿）：
+   * **分享页视频**是「下载 / 原画 / 预览」（两个档位可选），其余条目是「下载 / 复制 / 预览」——
+   * 按钮数、行数、行高全部一致，卡片尺寸因此完全统一（网格卡缩略图 90、卡体 87；列表卡 66）。
+   * ⛔ 不要再给某一类卡片单独加换行类；对话页超期视频也走后者（复制置灰）。
    */
-  const actionRow = shareVideo
+  const actionRow = showHq
     ? `${dl}${dlHq}${pv}`
     : `${dl}${cp}${pv}`;
 
@@ -770,13 +778,18 @@ async function runDownload(ids: string[], quality?: ShareQuality): Promise<void>
     return;
   }
   /*
-   * 分享页（`kind==='thread'`）把「要解析无水印直链」随请求带给 bg；
-   * bg 只对**视频条目**生效（图片与对话页条目忽略这个标记，见 `buildTargets`）。
-   * ⚠️ 这不是入库字段：直链带时效，**下载那一刻才解析**（§48）。
+   * 「要现场换无水印」随请求带给 bg —— bg 用 `needsShareWatermark()` **逐条筛**
+   * （图片、已拿到原片的、非超期的视频一律忽略，见 `buildTargets`）。两类场景的默认档不同：
+   *   · **分享页**（`kind==='thread'`）：默认**轻量档**，「原画」按钮再传 `heavy`；
+   *   · **对话页**（`kind==='chat'`）：只给**原画质档**（2026-10-04 §53 —— 对标「创作者对话页
+   *     本来就该拿高码率无水印原片」的语义），故默认即 `heavy`。
+   * ⚠️ 直链带时效：这不是入库字段，**下载那一刻**才解析（§48）。
    */
-  const shareVideo = state?.page.kind === 'thread';
+  const kind = state?.page.kind;
+  const onConvPage = kind === 'thread' || kind === 'chat';
+  const fallbackQuality: ShareQuality = kind === 'chat' ? 'heavy' : 'light';
   const result = await requestDownload(
-    shareVideo ? { ids, shareVideo: true, quality: quality ?? 'light' } : { ids },
+    onConvPage ? { ids, shareVideo: true, quality: quality ?? fallbackQuality } : { ids },
   );
   if (!result.ok) {
     toast(result.error ?? '下载失败', true);

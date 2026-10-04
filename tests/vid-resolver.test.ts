@@ -511,7 +511,45 @@ describe('createVidResolver', () => {
     });
   });
 
-  it('§33 年龄闸门不误伤老资源：生成于 2 小时前的作品缺树 → 阈值到点照旧判超期并进负缓存', async () => {
+  it('§54 老资源（生成于 2 小时前）缺树 → **首次未见即定案**，不等 20s 确认窗口、不排轮次重扫', async () => {
+    let clock = 1_790_700_000_000;
+    const calls: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/samantha/aispace/homepage')) return ok(HOMEPAGE_RESPONSE);
+      if (url.includes('/samantha/aispace/node_info')) {
+        // 翻到底但没有这个 vid（真超期的样子）
+        return ok({ code: 0, data: { children: [{ id: 'nid-1', key: 'v0other000000' }] } });
+      }
+      throw new Error('unexpected');
+    }) as unknown as typeof fetch;
+
+    const resolver = createVidResolver({
+      fetchFn,
+      ttlMs: 10 * 60_000,
+      indexTtlMs: 1_000,
+      expiredConfirmMs: 20_000,
+      now: () => clock,
+    });
+    const old = clock - 2 * 60 * 60_000;
+
+    // ⚠️ 旧口径是 pendingConfirm + 等满 20s 才定案（老视频实机要挂 20s）；§54 起当场定案
+    expect(await resolver.resolveDetailed('v0missing', { resourceAt: old })).toEqual({
+      url: null,
+      expired: true,
+      pendingConfirm: false,
+    });
+    // 只翻了一次树（homepage + 单页 node_info），**没有**轮次重扫
+    expect(calls.length).toBe(2);
+
+    // 负缓存：TTL 内再问一次不再发请求
+    const after = calls.length;
+    await resolver.resolveDetailed('v0missing', { resourceAt: old });
+    expect(calls.length).toBe(after);
+  });
+
+  it('§54 只有在**年龄已知**时才短路：不传 resourceAt（生成时间未知）仍走 20s 确认窗口', async () => {
     let clock = 1_790_700_000_000;
     const calls: string[] = [];
     const fetchFn = (async (input: RequestInfo | URL) => {
@@ -531,25 +569,16 @@ describe('createVidResolver', () => {
       expiredConfirmMs: 20_000,
       now: () => clock,
     });
-    const old = clock - 2 * 60 * 60_000;
 
-    expect(await resolver.resolveDetailed('v0missing', { resourceAt: old })).toEqual({
-      url: null,
-      expired: false,
-      pendingConfirm: true,
-    });
+    // 首次未见 → 只记录（年龄未知，不得下确定性结论）
+    expect(await resolver.resolveDetailed('v0missing')).toEqual({ url: null, expired: false, pendingConfirm: true });
 
-    clock += 30_000;
-    expect(await resolver.resolveDetailed('v0missing', { resourceAt: old, confirmation: true })).toEqual({
+    clock += 20_000;
+    expect(await resolver.resolveDetailed('v0missing', { confirmation: true })).toEqual({
       url: null,
       expired: true,
       pendingConfirm: false,
     });
-
-    // 负缓存：TTL 内再问一次不再发请求
-    const after = calls.length;
-    await resolver.resolveDetailed('v0missing', { resourceAt: old });
-    expect(calls.length).toBe(after);
   });
 
   it('§33：新作品等待期内只做廉价 head 校验（1 个请求），不会每轮全量翻树', async () => {

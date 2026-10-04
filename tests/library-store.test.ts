@@ -499,6 +499,19 @@ describe('hasCopyableDirectLink：有没有可直接复制的无水印直链（2
     expect(hasCopyableDirectLink(built({ convKind: 'thread', state: 'raw' }))).toBe(true);
   });
 
+  it('★对话页视频 + 原片已超期 → 没有直链（2026-10-04 §53：primary 是带水印播放档）', () => {
+    expect(hasCopyableDirectLink(built({ state: 'fail', meta: { ext: 'mp4', expired: true } }))).toBe(false);
+  });
+
+  it('★对话页视频「未超期」不适用这条路（解析中照旧可复制，沿用 §52 原口径）', () => {
+    expect(hasCopyableDirectLink(built({ state: 'pending' }))).toBe(true);
+    expect(hasCopyableDirectLink(built({ state: 'fail' }))).toBe(true);
+  });
+
+  it('★对话页超期视频若已解析回原片（state=raw）→ 有直链（正证据优先）', () => {
+    expect(hasCopyableDirectLink(built({ state: 'raw', meta: { ext: 'mp4', expired: true } }))).toBe(true);
+  });
+
   it('分享页的图片不受影响（「档位」只对视频有意义）', () => {
     expect(hasCopyableDirectLink(built({ convKind: 'thread', kind: 'image', state: 'pending' }))).toBe(true);
   });

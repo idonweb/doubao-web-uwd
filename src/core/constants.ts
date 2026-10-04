@@ -5,7 +5,7 @@ import type { Config } from './types';
 export const EXT_NAME = '豆包无水印下载器';
 export const EXT_SHORT_NAME = 'UWD';
 /** 扩展显示版本（与 package.json 保持同步；manifest 版本在构建期由 package.json 注入） */
-export const EXT_VERSION = '1.3.0';
+export const EXT_VERSION = '1.3.1';
 
 /**
  * GitHub 仓库地址（2026-09-27 首发时回填）。
@@ -150,8 +150,10 @@ export const LIMITS = {
    * ⚠️ 本阈值**只对「已经不新」的资源有效** —— 20~50s 才提交的样本（§17 的 50s、§26.5 的 34s）
    * 会**先被误判成「原片已超期」**，且负缓存与正缓存同 TTL（`VID_RESOLVE_TTL_MS` = 10min），
    * 期间 chain 重放不会自动重查树，要等 F5 / 切会话才翻案。
-   * 2026-09-29 §33 起由 **`VID_FRESH_RESOURCE_MS` 年龄闸门**兜住这一类（新作品不下超期结论），
-   * 所以本阈值仍可保持 20s —— 它现在描述的正是「**老资源**缺树的定案速度」。
+   * 2026-09-29 §33 起由 **`VID_FRESH_RESOURCE_MS` 年龄闸门**兜住这一类（新作品不下超期结论）。
+   * ⚠️ 2026-10-04 第三十六轮 §54 再收一步：**年龄已知且早已越过入库窗口**的资源
+   * （对话页几个月前的老视频）**首次未见即定案**，根本不走本阈值 —— 这个 20s 等待
+   * 只对「还新 / 年龄未知」的资源生效（老视频从此 ~2-3s 出「无水印（超期补救）」）。
    * ⚠️ 这段等待期界面**只显示保底的「解析中」**：曾试过的「新作品入库中」标签因触发条件是与
    * 站点提交速度的竞态（无法按需验证）已被整体删除（§30）。
    */
@@ -377,10 +379,26 @@ export const IMG_PATCH_FAIL_LABEL = '仅带水印档';
  * 分享页视频被判「原片不可得」（`meta.expired`，创作树按登录账号隔离、别人的作品永远不在）
  * **不等于**拿不到无水印 —— §47/§48 之后分享直链两档可下（轻量 / 原画质）。
  * 旧口径「原片不可得」在这个场景自相矛盾（卡片标着取不到、下载却拿到无水印文件），
- * 故按补角条目的先例（落地即标能力、失败才降级），分享页视频 expired 后直接标本标签。
+ * 故按补角条目的先例（落地即标能力、失败才降级），分享页视频直接标本标签。
+ * ⚠️ **2026-10-04 §55 起「标签判据 = 行为判据」**：分享页视频**一经识别即**标本标签，
+ * 不再等 `meta.expired`（旧口径要等 vid 三步链路翻完树 + 20s 确认窗口，实机体感是
+ * 「下载已经生效、标签还停在『解析中』」）。悬停说明仍等 `meta.expired`（见 `stateTagTitle`）。
  * ⚠️ **只用于 `convKind='thread'` 且 `kind='video'`**；对话页「原片已超期」与分享页图片不动。
  */
 export const SHARE_VIDEO_LABEL = '无水印（分享页）';
+
+/**
+ * **对话页「超期视频」**条目的文案（2026-10-04 第三十五轮）。
+ *
+ * 对话页（创作者本人）里生成超过约三个月的视频，创作树原片已被清除（`meta.expired`）——
+ * 但这**不等于**拿不到无水印：实测（同一 vid 152 天前，`docs/03` §53）站点的播放源
+ * 仍能换出**无水印的原画质档**（`fallback_api` → `codec_type=5 + force_fids=original`）。
+ * 语义与分享页视频同源（落地即标能力、失败才降级），但措辞必须说清**这是原片超期后的补救**，
+ * 不是站点给的原片。
+ *
+ * ⚠️ **只用于 `convKind='chat'` 且 `kind='video'` 且 `meta.expired`**；分享页用 `SHARE_VIDEO_LABEL`。
+ */
+export const CHAT_EXPIRED_LABEL = '无水印（超期补救）';
 
 /** 取流方案：A = chrome.downloads + DNR 注入 Referer；B = content 内 fetch + blob（回退） */
 export const DOWNLOAD_STRATEGY: 'auto' | 'downloads' | 'blob' = 'auto';

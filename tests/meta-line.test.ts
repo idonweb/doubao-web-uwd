@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { itemMetaLine, stateTagLabel, stateTagOf, stateTagTitle } from '../src/ui/shared/dom';
+import { STATE_TAG, itemMetaLine, stateTagLabel, stateTagOf, stateTagTitle } from '../src/ui/shared/dom';
 import type { MediaItem, MediaVariant } from '../src/core/types';
 
 const CANDIDATE: MediaVariant = {
@@ -122,20 +122,30 @@ describe('itemMetaLine：预览体积', () => {
 });
 
 /**
- * 状态标签（`stateTagLabel` / `stateTagTitle`）—— 分享页视频例外（2026-10-03 第三十轮 §48.7）。
+ * 状态标签（`stateTagLabel` / `stateTagOf` / `stateTagTitle`）—— 「要靠播放源换无水印」的视频例外。
  *
- * 口径：分享页视频被判「原片不可得」（`meta.expired`）**不等于**拿不到无水印 ——
- * §47/§48 之后分享直链两档可下，旧文案「原片不可得」与「下载却拿到无水印文件」自相矛盾
- * （实机截图 2026-10-3 19-2-4.png）。故：
- *   ① thread + video + expired → 「无水印（分享页）」（按补角先例：落地即标能力、失败才降级）；
- *   ② bg 回写 `meta.shareDlFail`（这次直链没解出）→ 如实降级「仅带水印档」；
- *   ③ 对话页「原片已超期」与分享页**图片**条目不受影响（原口径仍准确）；
- *   ④ 正证据优先不变：拿到原片（state=raw）一律压过 expired。
+ * 口径（2026-10-03 §48.7 分享页；2026-10-04 §53 扩到**对话页超期视频**）：
+ *   ① **分享页视频** / **对话页超期视频**被判「原片取不到」（`meta.expired`）**不等于**拿不到无水印 ——
+ *      站点播放源仍能换出无水印档，旧文案「原片不可得 / 原片已超期」与「下载却拿到无水印」自相矛盾。
+ *      按补角先例「落地即标能力、失败才降级」：默认绿（t-raw + check），文案按来源分
+ *      （分享页 = 「无水印（分享页）」；对话页 = 「无水印（超期补救）」）；
+ *   ② bg 回写 `meta.shareDlFail`（这次没解出）→ 如实降级「仅带水印档」+ fail 红；
+ *   ③ **图片**条目（含分享页图片）不受影响（原口径仍准确）；
+ *   ④ 正证据优先不变：拿到原片（state=raw）一律压过 expired；
+ *   ⑤ **2026-10-04 §55**：分享页视频的**标签判据 = 行为判据**（`needsShareWatermark`）——
+ *      未确认 expired 也当场标「无水印（分享页）」（旧口径要等三步链路翻树 + 20s 确认窗口，
+ *      实机体感「下载已生效、标签还在解析中」）；**悬停说明**仍等 `meta.expired`（不提前下断言）。
  */
-describe('stateTagLabel / stateTagTitle：分享页视频例外（§48.7）', () => {
+describe('stateTagLabel / stateTagTitle：播放源换无水印的视频例外（§48.7 / §53 / §55）', () => {
   const expiredShareVideo = {
     state: 'fail' as const,
     meta: { ext: 'mp4', expired: true },
+  };
+  const expiredChatVideo = {
+    convKind: 'chat' as const,
+    convId: 'c1',
+    id: 'c1::vid:x',
+    ...expiredShareVideo,
   };
 
   it('★分享页视频 + 原片不可得 →「无水印（分享页）」（不再显示旧文案「原片不可得」）', () => {
@@ -152,6 +162,19 @@ describe('stateTagLabel / stateTagTitle：分享页视频例外（§48.7）', ()
     expect(title).not.toContain('取不到无水印原片');
   });
 
+  it('★对话页视频 + 原片已超期 →「无水印（超期补救）」（2026-10-04 §53，原口径「原片已超期」作废）', () => {
+    const entry = item(expiredChatVideo);
+    expect(stateTagLabel(entry)).toBe('无水印（超期补救）');
+    const tag = stateTagOf(entry);
+    expect(tag.cls).toBe('t-raw');
+    expect(tag.icon).toBe('check');
+    // 说明里必须讲清「原片已超期 + 站点播放源换无水印原画质档」，且**不得**说成「分享页」
+    const title = stateTagTitle(entry);
+    expect(title).toContain('已超期');
+    expect(title).toContain('原画质');
+    expect(title).not.toContain('分享');
+  });
+
   it('★bg 回写 shareDlFail（这次直链没解出）→ 如实降级「仅带水印档」+ fail 红，说明里给恢复路径', () => {
     const entry = item({ ...expiredShareVideo, meta: { ext: 'mp4', expired: true, shareDlFail: true } });
     expect(stateTagLabel(entry)).toBe('仅带水印档');
@@ -163,15 +186,52 @@ describe('stateTagLabel / stateTagTitle：分享页视频例外（§48.7）', ()
     expect(title).toContain('自动恢复');
   });
 
-  it('对话页视频 + 原片不可得 → 仍是「原片已超期」（原口径不动）', () => {
-    const entry = item({ convKind: 'chat', convId: 'c1', id: 'c1::vid:x', ...expiredShareVideo });
-    expect(stateTagLabel(entry)).toBe('原片已超期');
-    expect(stateTagTitle(entry)).toContain('只对作品所属账号开放');
+  it('★对话页超期视频 + shareDlFail → 同样如实降级「仅带水印档」', () => {
+    const entry = item({ ...expiredChatVideo, meta: { ext: 'mp4', expired: true, shareDlFail: true } });
+    expect(stateTagLabel(entry)).toBe('仅带水印档');
+    expect(stateTagOf(entry).cls).toBe('t-fail');
+    expect(stateTagTitle(entry)).toContain('带水印档');
   });
 
-  it('★判据按条目本身（kind） gate：分享页图片条目（若出现 expired）仍走「原片不可得」', () => {
-    const entry = item({ ...expiredShareVideo, kind: 'image', fingerprint: 'img:x', id: 'share_5713::img:x' });
-    expect(stateTagLabel(entry)).toBe('原片不可得');
+  it('§55 分享页视频**未确认原片不可得**（pending、无 expired）→ 当场「无水印（分享页）」；悬停仍等确认', () => {
+    const entry = item({ state: 'pending', meta: { ext: 'mp4' } }); // item() 默认 convKind='thread'
+    expect(stateTagLabel(entry)).toBe('无水印（分享页）');
+    const tag = stateTagOf(entry);
+    expect(tag.cls).toBe('t-raw');
+    expect(tag.icon).toBe('check');
+    // ⚠️ 标签乐观提前翻绿，但「创作树原片不可得」这句结论要确认后才说 → 此刻没有悬停说明
+    expect(stateTagTitle(entry)).toBe('');
+    // 确认（meta.expired）后 → 悬停说明出现
+    expect(stateTagTitle(item(expiredShareVideo))).toContain('分享直链');
+  });
+
+  it('§55 分享页视频 shareDlFail 但尚未确认 expired → 仍立即降级「仅带水印档」+ 失败说明', () => {
+    const entry = item({ state: 'pending', meta: { ext: 'mp4', shareDlFail: true } });
+    expect(stateTagLabel(entry)).toBe('仅带水印档');
+    expect(stateTagOf(entry).cls).toBe('t-fail');
+    expect(stateTagTitle(entry)).toContain('带水印播放档');
+  });
+
+  it('§55 对话页视频未超期（pending、无 expired）仍「解析中」，不提前标「超期补救」', () => {
+    const entry = item({ convKind: 'chat', convId: 'c1', id: 'c1::vid:x', state: 'pending', meta: { ext: 'mp4' } });
+    expect(stateTagLabel(entry)).toBe('解析中');
+    expect(stateTagTitle(entry)).toBe('');
+    const tag = stateTagOf(entry);
+    expect(tag.cls).toBe(STATE_TAG.pending.cls);
+  });
+
+  it('★判据按条目本身（kind）gate：图片条目（对话页 / 分享页）即使 expired 仍走旧口径', () => {
+    const chatImage = item({
+      ...expiredChatVideo,
+      kind: 'image',
+      fingerprint: 'img:x',
+      id: 'c1::img:x',
+    });
+    expect(stateTagLabel(chatImage)).toBe('原片已超期');
+    expect(stateTagTitle(chatImage)).toContain('只对作品所属账号开放');
+
+    const threadImage = item({ ...expiredShareVideo, kind: 'image', fingerprint: 'img:x', id: 'share_5713::img:x' });
+    expect(stateTagLabel(threadImage)).toBe('原片不可得');
   });
 
   it('★正证据优先不变：拿到原片（state=raw）压过 expired →「无水印原片」', () => {
@@ -183,5 +243,17 @@ describe('stateTagLabel / stateTagTitle：分享页视频例外（§48.7）', ()
     });
     expect(stateTagLabel(entry)).toBe('无水印原片');
     expect(stateTagTitle(entry)).toBe('');
+
+    // 对话页同一条（已拿到原片的老视频不该被标成「超期补救」）
+    const chatRaw = item({
+      convKind: 'chat',
+      convId: 'c1',
+      id: 'c1::vid:x',
+      state: 'raw',
+      variants: [RAW],
+      primary: RAW.url,
+      meta: { ext: 'mp4', expired: true },
+    });
+    expect(stateTagLabel(chatRaw)).toBe('无水印原片');
   });
 });

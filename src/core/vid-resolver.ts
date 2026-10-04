@@ -287,6 +287,8 @@ export interface VidResolverOptions {
   /**
    * 「原片已超期」的二次确认窗口（毫秒），默认 `LIMITS.VID_EXPIRED_CONFIRM_MS`。
    * 首次「树里未见」只记录；窗口到点后重新全量扫描仍未见才判定超期。
+   * ⚠️ 仅对「还新 / 生成时间未知」的资源生效：资源生成时间已知且已越过
+   * `freshResourceMs` 时**首次未见即定案**（2026-10-04 §54），不经过本窗口。
    */
   expiredConfirmMs?: number;
   /**
@@ -644,10 +646,13 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
    * 21:38:51 就「翻到底未见」满两次，而到 21:40:07 树条目数仍纹丝不动（还是 152 条）。
    * 所以「一次未见」不足以判定超期，「等够时间再未见」也不够 —— 延迟本身没有上界，
    * 唯一可靠的区分信号是**这部作品还新不新**：
-   *   · 窗口（`expiredConfirmMs`）内的首次未见 → 只记录，返回 `pendingConfirm`（界面保持「解析中」）；
-   *   · 窗口到点后仍未见，但**资源本身还在「新作品入库窗口」内**（`VID_FRESH_RESOURCE_MS`，
-   *     依据消息 `create_time`）→ 仍不下结论：刚生成的作品缺树 = 站点入库延迟，返回 `pendingConfirm`；
-   *   · 窗口到点后仍未见**且资源已经不新** → 才落负缓存 +「原片已超期」。
+   *   · **资源早已不新**（生成时间已知、且已越过 `VID_FRESH_RESOURCE_MS` 入库窗口）→
+   *     它**不可能**是「刚生成还没入库」那一类，树里翻到底没有它就是**真超期** ⇒ **首次未见即定案**，
+   *     不等确认窗口、不排轮次重扫（2026-10-04 第三十六轮 §54，见下方首个分支）；
+   *   · 其余情形（作品还新 / 生成时间未知）沿用原节奏：
+   *     窗口（`expiredConfirmMs`）内的首次未见 → 只记录，返回 `pendingConfirm`（界面保持「解析中」）；
+   *     窗口到点后仍未见，但**资源本身还在入库窗口内** → 仍不下结论（站点登记延迟），返回 `pendingConfirm`；
+   *     窗口到点后仍未见**且资源已经不新** → 才落负缓存 +「原片已超期」。
    */
   function concludeMiss(
     vid: string,
@@ -658,10 +663,29 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
   ): NodeLookup {
     const waitSec = Math.round(expiredConfirmMs / 1000);
     const head = `没有 key=${vid} 的条目（${describeVidPayload(info.lastPage, 'children')}；全树 ${info.total} 条/${info.pages} 页已到底）`;
+    const ageMs = resourceAt === undefined ? undefined : now() - resourceAt;
+    /*
+     * 年龄闸门的**反向**用法（2026-10-04 第三十六轮 §54）：资源生成时间已知、且**早已越过**
+     * 入库窗口 ⇒ 树里翻到底没有它就是真超期，**首次未见即定案**。
+     *
+     * 为什么值得短路：确认窗口（20s）+ 逐轮重扫是为「刚生成、站点还没登记进树」的新作品
+     * 设计的（§33 实测延迟可达 >100s）；而对话页里几个月前的老视频**天然不适用**，
+     * 却照样要挂满 20s（2 次全量翻树 + 等待）才显示「无水印（超期补救）」—— 纯浪费。
+     * ⚠️ 只在**年龄已知**时短路：`resourceAt` 缺失（消息没给 `create_time`）时保持原节奏，
+     *    不引入新风险；翻树本身已在调用方判定为「已到底」（`complete`）才会走到这里。
+     */
+    if (ageMs !== undefined && freshResourceMs > 0 && ageMs >= freshResourceMs) {
+      misses.delete(vid);
+      negatives.set(vid, now());
+      emitDefinitiveMiss(emit, vid, startedAt, info, ageMs);
+      return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: true, pendingConfirm: false };
+    }
     const firstAt = misses.get(vid);
     if (firstAt === undefined) {
       misses.set(vid, now());
-      emit('node_info', false, startedAt, { detail: `${head} —— 首次未见（新作品等待站点入库），将轮次式重扫；${waitSec}s 仍未见才判定超期` });
+      emit('node_info', false, startedAt, {
+        detail: `${head} —— 首次未见（作品还新 / 生成时间未知，等待站点入库），将轮次式重扫；${waitSec}s 仍未见才判定超期`,
+      });
       return { nodeId: null, createTime: null, size: null, cover: null, width: null, height: null, expired: false, pendingConfirm: true };
     }
     const elapsed = now() - firstAt;
@@ -676,8 +700,8 @@ export function createVidResolver(options: VidResolverOptions = {}): VidResolver
      * `VID_FRESH_RESOURCE_MS` 内）—— 此刻缺树只说明站点还没把它登记进「我的创作」，
      * 不是「超出保存期」。此时既不下超期结论、也不落负缓存，继续保持「解析中」等待，
      * 由调用方的轮次重扫 / chain 重放自然接续（树一长出来立刻转 raw）。
+     * （「早已不新」的那一半已在函数开头短路定案，这里只剩「还新」与「年龄未知」两种。）
      */
-    const ageMs = resourceAt === undefined ? undefined : now() - resourceAt;
     if (ageMs !== undefined && freshResourceMs > 0 && ageMs < freshResourceMs) {
       emit('node_info', false, startedAt, {
         detail:

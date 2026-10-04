@@ -26,6 +26,7 @@ import {
   itemId,
   markExpired,
   markFailed,
+  needsShareWatermark,
   patchItem,
   rekeyConv,
   retainConv,
@@ -850,15 +851,19 @@ async function setShareFail(itemId: string, fail: boolean): Promise<void> {
  */
 async function performDownload(target: DownloadTarget, filename: string, tabId: number | null): Promise<void> {
   /*
-   * **分享页无水印**（2026-10-03 第二十八轮 §48）：`/thread/` 与 `/video-sharing` 的视频条目
-   * 站点只给带水印播放档，无水印档要靠页面把 vid 换成无水印直链（§47 实测走通）。
+   * **现场换无水印**（2026-10-03 §48 分享页；2026-10-04 §53 扩到**对话页超期视频**）：
+   * 这类视频站点只给带水印播放档，无水印要靠页面把 vid 换成无水印直链（§47 实测走通）。
+   *   · 分享页 `/thread/`（页面 SSR 里就有 `fallback_api`，免登录）与 `/video-sharing`
+   *     （要调 `get_video_model`，需任意账号登录）；
+   *   · 对话页超期视频（创作树原片已清，但播放源仍能换出无水印**原画质**档）。
+   * 由 `target.shareVideo` 标记（判定 = `library-store::needsShareWatermark()`）。
    *
    * ⚠️ 直链**带时效** ⇒ 只能**下载那一刻现解现用**；解析失败 / 下载失败都**如实回退**
    *    去下站点给的那个档（带水印）—— **绝不假装无水印**（与补角链路同一哲学）。
    */
   if (target.shareVideo) {
     if (tabId === null || !target.vid) {
-      diag('bg.download', `分享页无水印链路不可用（${tabId === null ? '无豆包标签页' : '条目没有 vid'}）→ 下站点给的档 ${filename}`, { level: 'warn' });
+      diag('bg.download', `播放源换无水印链路不可用（${tabId === null ? '无豆包标签页' : '条目没有 vid'}）→ 下站点给的档 ${filename}`, { level: 'warn' });
       await setShareFail(target.itemId, true);
     } else {
       const quality = target.quality ?? 'light';
@@ -870,10 +875,10 @@ async function performDownload(target: DownloadTarget, filename: string, tabId: 
       );
       const url = resolved?.ok ? resolved.url : undefined;
       if (!url) {
-        diag('bg.download', `分享页无水印解析未成功（${resolved?.error ?? '页面脚本未就绪'}）→ 下站点给的档 ${filename}`, { level: 'warn' });
+        diag('bg.download', `播放源换无水印解析未成功（${resolved?.error ?? '页面脚本未就绪'}）→ 下站点给的档 ${filename}`, { level: 'warn' });
         await setShareFail(target.itemId, true);
       } else {
-        diag('bg.download', `分享页无水印直链已解出（${quality}）→ 方案 A ${filename}`);
+        diag('bg.download', `播放源无水印直链已解出（${quality}）→ 方案 A ${filename}`);
         try {
           await downloadWithDownloadsApi(url, filename);
           diag('bg.download', `方案 A 成功 ${filename}`);
@@ -1084,8 +1089,10 @@ async function buildTargets(request: DownloadRequest, tabId: number | null): Pro
     if (item.meta.patch) target.patch = item.meta.patch;
     // 视频指纹形如 `vid:<x>` —— 签名地址过期时靠它让页面重新解析
     if (item.fingerprint.startsWith('vid:')) target.vid = item.fingerprint.slice(4);
-    // 分享页无水印（2026-10-03 §48）：UI 按当前页面类型置位，bg 再按条目类型筛（图片不走这条）
-    if (request.shareVideo && item.kind === 'video' && target.vid) {
+    // 现场换无水印（2026-10-03 §48 分享页；2026-10-04 §53 扩到对话页超期视频）：
+    // UI 只按「当前是不是会话页」置位，**这里逐条按 `needsShareWatermark()` 筛** ——
+    // 图片、已拿到原片（state=raw）、非超期的视频一律不走这条路（否则会把真原片降级成预览档）。
+    if (request.shareVideo && needsShareWatermark(item) && target.vid) {
       target.shareVideo = true;
       target.quality = request.quality === 'heavy' ? 'heavy' : 'light';
     }

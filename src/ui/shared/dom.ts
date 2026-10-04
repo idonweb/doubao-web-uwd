@@ -1,8 +1,8 @@
 /** UI 通用工具：转义、格式化、主题、Toast、复制 */
 
 import type { Config, MediaItem, MediaState } from '../../core/types';
-import { IMG_PATCH_FAIL_LABEL, IMG_PATCH_LABEL, SHARE_VIDEO_LABEL } from '../../core/constants';
-import { sizeForOf } from '../../core/library-store';
+import { CHAT_EXPIRED_LABEL, IMG_PATCH_FAIL_LABEL, IMG_PATCH_LABEL, SHARE_VIDEO_LABEL } from '../../core/constants';
+import { needsShareWatermark, sizeForOf } from '../../core/library-store';
 import type { IconName } from './icons';
 
 /** HTML 转义 —— 上游把未转义的 URL 直接拼进 href，属于注入风险，这里统一收口 */
@@ -114,25 +114,41 @@ export const STATE_TAG: Record<MediaState, { cls: string; label: string; icon: I
 /**
  * 状态标签**三件套**（cls / label / icon）的唯一出口（2026-10-03 §48.7）。
  *
- * 文案与配色必须**同源**：分享页视频 expired 后语义是「无水印可用」，
+ * 文案与配色必须**同源**：分享页视频语义是「无水印可用」，
  * 配色就跟着翻成成功绿（`t-raw` + check 图标），不再继承 fail 的红 + alert ——
  * 实机反馈（19-48-55.png）：红色让用户误以为解析失败。
  * `shareDlFail`（这次直链没解出）是真失败，维持红 + alert。
  * 卡片渲染（`popup.ts::cardHtml`）一律经此取三件套，不得再直读 `STATE_TAG[item.state]`。
+ *
+ * ⚠️ **标签判据 = 行为判据**（2026-10-04 §55，用户拍板）：`needsShareWatermark()` 成立即标，
+ * **不再额外要求 `meta.expired`**。成因（实机体感缺口的正解）：
+ *   · 分享页的**下载能力当场就成立**（`thread` 无条件），而 `meta.expired` 要等 vid 三步链路
+ *     翻完整棵树 + 二次确认窗口才落（`/video-sharing` 无 `create_time` ⇒ 必然等满
+ *     `VID_EXPIRED_CONFIRM_MS` = 20s；`/thread/` 若分享的是**新生成**的视频，还会被
+ *     「新作品入库窗口」拖到 30min）⇒ 出现「点下载已经生效、标签还停在『解析中』」的落差。
+ *   · §53 当初多要求 `meta.expired`，是怕「其实是本账号作品、不该提前说成分享页」；
+ *     但 2026-10-04 实测**三步真原片 ≡ fplay 原画质档（同一文件）**，这条路给的东西一样，顾虑不成立。
+ *   · 若随后确实拿到原片（`state='raw'`）→ `needsShareWatermark()` 自然为假 → 自动升「无水印原片720P」。
+ * ⚠️ **对话页超期视频不受影响**：它的 `needsShareWatermark()` 本身就含 `meta.expired`。
+ * ⚠️ 图片条目（含分享页图片）仍走 fail 红原口径「原片不可得 / 原片已超期」。
+ * ⚠️ **悬停说明（`stateTagTitle`）不跟着放行**：成功口径仍等 `meta.expired`（见那里的说明）。
  */
 export function stateTagOf(item: MediaItem): { cls: string; label: string; icon: IconName } {
+  /*
+   * 要靠「站点播放源换无水印」的视频（`needsShareWatermark`：分享页视频 + 对话页超期视频）。
+   * 这里 expired **不再是「失败」语义** —— 无水印仍可下（分享页 `/thread/` 免登录、
+   * `/video-sharing` 需任意账号登录；对话页超期走同一套 fplay 原画质档，2026-10-04 §53）。
+   * 按补角先例「落地即标能力、失败才降级」：默认绿（t-raw + check）；
+   * bg 回写 `shareDlFail`（这次没解出）才降红「仅带水印档」。
+   * 文案按来源分：分享页 = 「无水印（分享页）」；对话页超期 = 「无水印（超期补救）」。
+   */
+  if (needsShareWatermark(item)) {
+    if (item.meta.shareDlFail) return { ...STATE_TAG.fail, label: IMG_PATCH_FAIL_LABEL };
+    return item.convKind === 'thread'
+      ? { ...STATE_TAG.raw, label: SHARE_VIDEO_LABEL }
+      : { ...STATE_TAG.raw, label: CHAT_EXPIRED_LABEL };
+  }
   if (item.meta.expired && item.state !== 'raw') {
-    /*
-     * 分享页视频（§48.7）：expired 在这里**不再是「失败」语义** —— 分享直链两档无水印可下
-     * （`/thread/` 免登录；`/video-sharing` 需任意账号登录），故按补角先例「落地即标能力、
-     * 失败才降级」：默认绿（t-raw + check）标「无水印（分享页）」；bg 回写 shareDlFail
-     * （这次直链没解出）才降红「仅带水印档」。对话页与分享页图片仍走 fail 红原口径。
-     */
-    if (item.convKind === 'thread' && item.kind === 'video') {
-      return item.meta.shareDlFail
-        ? { ...STATE_TAG.fail, label: IMG_PATCH_FAIL_LABEL }
-        : { ...STATE_TAG.raw, label: SHARE_VIDEO_LABEL };
-    }
     return { ...STATE_TAG.fail, label: RAW_UNAVAILABLE_LABEL[item.convKind] };
   }
   if (item.state === 'raw' && item.meta.patch) {
@@ -204,14 +220,40 @@ const PATCH_FAIL_TITLE =
   '补角不可用：这两张图不是同一张底图（同源校验未通过），所以插件**不做**补角 —— ' +
   '现在下到的是带水印的预览档，不会冒充无水印。可 F5 重新解析后再试。';
 
-/** 状态标签的悬停说明：只有「取不到原片」「分享页视频」「补角」这三种有内容，其余返回空串 */
+/**
+ * 「超期补救」的悬停说明（2026-10-04 第三十五轮）—— 对话页创作者本人的老视频。
+ * 讲清三件事：为什么原片没了（创作树只留约三个月）、无水印从哪来（站点播放源换原画质档）、
+ * 直链带时效（现解现用、不入库）。与分享页说明同一哲学，但**不说「分享页」**。
+ */
+const CHAT_EXPIRED_TITLE =
+  '原片已超期（创作树只保留约三个月），但站点播放源仍能换出**无水印原画质档** —— ' +
+  '「下载」会在下载那一刻现场解析（直链带时效，不入库）；失败时如实回退站点给的带水印档。';
+
+/** 「超期补救」这次没解出（`meta.shareDlFail`）的悬停说明：如实说下到的是什么、怎么恢复 */
+const CHAT_EXPIRED_FAIL_TITLE =
+  '这次没换到无水印档（未登录 / 播放源已失效 / 网络问题），下到的是站点给的带水印档 —— 不假装无水印。' +
+  '可再点一次「下载」重试，成功后本标签自动恢复。';
+
+/**
+ * 状态标签的悬停说明：只有「取不到原片」「播放源换无水印」「补角」这几种有内容，其余返回空串。
+ *
+ * ⚠️ **与标签判据不同源**（2026-10-04 §55，用户拍板）：标签可以乐观提前翻绿
+ * （`stateTagOf` 只看 `needsShareWatermark()`），但**成功口径的说明仍等 `meta.expired`** ——
+ * 「创作树原片不可得」这句结论要确认后才说，不提前下断言。
+ * 反例（不受此限制）：`shareDlFail` 是 bg 当场回写的**真结论**（这次确实没解出）⇒ 立即给失败说明，
+ * 否则卡片标着红「仅带水印档」却没有任何解释。
+ */
 export function stateTagTitle(item: MediaItem): string {
-  if (item.meta.expired && item.state !== 'raw') {
-    if (item.convKind === 'thread' && item.kind === 'video') {
-      return item.meta.shareDlFail ? SHARE_DL_FAIL_TITLE : SHARE_VIDEO_TITLE;
+  if (needsShareWatermark(item)) {
+    if (item.meta.shareDlFail) {
+      return item.convKind === 'thread' ? SHARE_DL_FAIL_TITLE : CHAT_EXPIRED_FAIL_TITLE;
     }
-    return RAW_UNAVAILABLE_TITLE;
+    if (item.meta.expired) {
+      return item.convKind === 'thread' ? SHARE_VIDEO_TITLE : CHAT_EXPIRED_TITLE;
+    }
+    return '';
   }
+  if (item.meta.expired && item.state !== 'raw') return RAW_UNAVAILABLE_TITLE;
   if (item.state === 'raw' && item.meta.patch) return item.meta.patchFail ? PATCH_FAIL_TITLE : PATCH_TITLE;
   return '';
 }
