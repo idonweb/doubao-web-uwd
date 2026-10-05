@@ -9,6 +9,7 @@
 import {
   CORS_INJECT_HOST_FILTERS,
   COVER_INJECT_HOST_FILTERS,
+  DNR_EXCLUDED_INITIATOR_DOMAINS,
   DOWNLOAD_REFERER,
   HOST_DOLA,
   HOST_IMAGE_CDN_SUFFIXES,
@@ -267,6 +268,12 @@ export interface DnrRule {
  * 现在只剩两类「注入类」规则（都不改 URL）：
  *   · 视频 CDN 注入 CORS 响应头（取流方案 B 的 fetch+blob 需要）
  *   · 视频 CDN / 封面域注入 Referer 请求头（下载防盗链 + 弹窗里的封面图）
+ *
+ * ⚠️ 2026-10-05（抖音回归，方案 A）：所有规则统一带
+ * `excludedInitiatorDomains`（见 `site-contract::DNR_EXCLUDED_INITIATOR_DOMAINS`）——
+ * DNR 是网络层全局过滤器，抖音的播放域也是 `*.douyinvod.com`（字节系共享 CDN），
+ * 不加发起页豁免会把抖音的拉流请求打死（防盗链 403 / CORS 凭据拒绝）。
+ * 扩展自身与豆包页面的 initiator 都不匹配排除表，行为不变。
  */
 export function buildDnrRules(): DnrRule[] {
   const rules: DnrRule[] = [];
@@ -288,6 +295,7 @@ export function buildDnrRules(): DnrRule[] {
       condition: {
         urlFilter: filter,
         resourceTypes: ['xmlhttprequest', 'media', 'other'],
+        excludedInitiatorDomains: [...DNR_EXCLUDED_INITIATOR_DOMAINS],
       },
     });
   }
@@ -307,6 +315,7 @@ export function buildDnrRules(): DnrRule[] {
       condition: {
         urlFilter: filter,
         resourceTypes: ['xmlhttprequest', 'media', 'other', 'image'],
+        excludedInitiatorDomains: [...DNR_EXCLUDED_INITIATOR_DOMAINS],
       },
     });
   }
@@ -334,6 +343,7 @@ export function buildDnrRules(): DnrRule[] {
       condition: {
         urlFilter: filter,
         resourceTypes: ['image', 'xmlhttprequest'],
+        excludedInitiatorDomains: [...DNR_EXCLUDED_INITIATOR_DOMAINS],
       },
     });
   }

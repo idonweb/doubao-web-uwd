@@ -913,6 +913,25 @@ export const COVER_INJECT_HOST_FILTERS = [
 ] as const;
 
 /**
+ * DNR 注入规则的「发起页豁免域」（2026-10-05 抖音回归，方案 A）。
+ *
+ * 9 条注入规则的 condition 只有 urlFilter + resourceTypes，**没有 initiator 限制**——
+ * DNR 是网络层全局过滤器，与「哪个页面发起请求」无关。而抖音网页版的视频播放域
+ * 恰好也是 `*.douyinvod.com`（与豆包同属字节系 VOD CDN，实测 `v3-web` / `v26-web`
+ * 子域），图片域 `*.douyinpic.com` 亦命中封面注入——把 `Referer/Origin` 改成
+ * `doubao.com` 会触发抖音 CDN 防盗链 403，把 `ACAO` 覆盖成 `*` + `ACAC: true`
+ * 会打死带凭据的 MSE 拉流 ⇒ 页面报「不支持的视频格式，或设备无网络」。
+ *
+ * `excludedInitiatorDomains`（Chrome 101+，本扩展 `minimum_chrome_version = 114`）
+ * 按**发起请求的页面站点**排除：initiator 属于 `douyin.com` 及其子域的请求一律不再注入。
+ * ⚠️ 扩展自身（弹窗 `<img>` 封面、bg 体积实测、`chrome.downloads`）的 initiator 是
+ * `chrome-extension://…`，**不是 http(s) 站点，不匹配排除表** ⇒ 照旧注入，豆包功能不受影响。
+ * 豆包页面（initiator = `doubao.com`）同样不在排除表 ⇒ 解析 / 下载照旧。
+ * 若日后其他站点出现同类实报（如今日头条），同一行追加域名即可。
+ */
+export const DNR_EXCLUDED_INITIATOR_DOMAINS = ['douyin.com'] as const;
+
+/**
  * 分享短链域名 [实测]
  * `aka.doubaocdn.com/s/<token>` 是**分享卡片短链图**，不是视频封面：
  * 首轮联调里它既让卡片缩略图加载失败，又因为被当成封面而导致**指纹漂移**

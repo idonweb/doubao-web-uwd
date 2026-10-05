@@ -5,7 +5,7 @@ import type { Config } from './types';
 export const EXT_NAME = '豆包无水印下载器';
 export const EXT_SHORT_NAME = 'UWD';
 /** 扩展显示版本（与 package.json 保持同步；manifest 版本在构建期由 package.json 注入） */
-export const EXT_VERSION = '1.3.1';
+export const EXT_VERSION = '1.3.2';
 
 /**
  * GitHub 仓库地址（2026-09-27 首发时回填）。

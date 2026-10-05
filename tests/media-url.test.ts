@@ -228,4 +228,20 @@ describe('DNR 规则生成（构建期）', () => {
     expect(types).toContain('image');
     expect(types).toContain('xmlhttprequest');
   });
+
+  it('每条规则都豁免抖音发起页（2026-10-05 抖音回归，方案 A）', () => {
+    /*
+     * DNR 是网络层全局过滤器：抖音网页版的视频播放域也是 `*.douyinvod.com`（字节系共享 CDN），
+     * 不加发起页豁免会把抖音的拉流请求打死（防盗链 403 / CORS 凭据拒绝），
+     * 页面报「不支持的视频格式，或设备无网络」。这份锁保证 9 条规则**每一条**都带
+     * `excludedInitiatorDomains` 且含 `douyin.com`——新加规则时同样不许遗漏。
+     * 扩展自身（initiator = `chrome-extension://…`）与豆包页面（`doubao.com`）
+     * 都不匹配排除表，行为不变。
+     */
+    expect(rules.length).toBeGreaterThan(0);
+    for (const rule of rules) {
+      const excluded = (rule.condition?.excludedInitiatorDomains ?? []) as unknown as string[];
+      expect(excluded).toContain('douyin.com');
+    }
+  });
 });
