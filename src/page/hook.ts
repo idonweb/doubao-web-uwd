@@ -40,7 +40,7 @@ import {
   videoShareConvId,
 } from '../core/site-contract';
 import { createVidResolver, formatVidStep, type VidResolveOutcome, type VidStepEvent } from '../core/vid-resolver';
-import { cleanDocTitle, isStaleTitle, normalizeTitleSnapshot, pickFreshTitle } from '../core/title';
+import { canAdoptTitle, cleanDocTitle, isStaleTitle, normalizeTitleSnapshot, pickFreshTitle } from '../core/title';
 import type { Config, MediaDraft, PageInfo, PageKind, RawMedia } from '../core/types';
 
 declare global {
@@ -66,6 +66,16 @@ declare global {
    */
   let staleTitles: string[] = [];
   let titleTimers: number[] = [];
+  /**
+   * `<title>` 变更后的**防抖句柄**（§57）。
+   *
+   * 站点改名时可能连写几次标题（`新对话` → `生成中…` → 真名），逐次采纳就会把中间态
+   * 写进库里。事件照旧是事件（MutationObserver），只是延后 200ms 再读 —— 与守则 4
+   * 的「不用定时轮询」不冲突：这条定时器由变更事件触发、只跑一次。
+   */
+  let titleSyncTimer = 0;
+  /** 改名同步的防抖窗（ms）：够长以跨过站点的连续改写，够短以不让人察觉 */
+  const TITLE_SYNC_DEBOUNCE_MS = 200;
 
   /** vid → 最近一次解析的步骤事实（按 vid 收，避免并发解析互相覆盖） */
   const vidSteps = new Map<string, VidStepEvent[]>();
@@ -251,6 +261,22 @@ declare global {
   }
 
   /**
+   * 采纳一个会话名 —— **首解析与「同会话内改名」共用这条尾部**（§57）。
+   *
+   * 尾部三件事缺一不可：置 `convTitle`、广播 `conv:scope`（background 据此把该会话
+   * 已有条目的会话名一并刷新）、留诊断。`page/title` 事件是排查「标题对不上」的唯一证据，
+   * 改名场景会连续出现两条（旧 → 新）。
+   */
+  function adoptTitle(title: string, reason: string): void {
+    convTitle = title;
+    titleResolved = true;
+    cancelTitleTimers();
+    diag('page.title', `convId=${convId || '-'} title=${title}（${reason}）`);
+    // 标题变了就广播一次 → background 会把该会话下已有条目的标题一并刷新
+    emitScope();
+  }
+
+  /**
    * 解析会话标题：候选必须**不在路由切换前的快照里**才被采用。
    * 拿不到就返回空串（**绝不返回兜底值**，兜底由界面侧 `displayConvTitle()` 负责）。
    */
@@ -258,17 +284,38 @@ declare global {
     if (titleResolved || pageKind === 'none') return;
     const title = pickFreshTitle(titleCandidates(), staleTitles);
     if (!title) return;
-    convTitle = title;
-    titleResolved = true;
-    cancelTitleTimers();
-    diag('page.title', `convId=${convId || '-'} title=${title}（已拒收过渡期候选 ${staleTitles.length} 个）`);
-    // 标题确定后广播一次 → background 会把该会话下已有条目的标题一并刷新
-    emitScope();
+    adoptTitle(title, `首次解析，已拒收过渡期候选 ${staleTitles.length} 个`);
   }
 
+  /**
+   * **同一会话内的改名**（2026-11-06 第三十九轮 §57）。
+   *
+   * 实机问题：新开对话的默认名是「新对话」，首次解析把它当真名锁死；此后用户手动改名、
+   * 或站点在首轮对话后自动改名，资源库与下载文件名都停在「新对话」。
+   *
+   * 判据与首解析**共用同一把快照闸门**（`canAdoptTitle` 内部仍调 `isStaleTitle`）：
+   * 只有「不在切换快照里、且与现状不同」的值才可能是本会话的新名字。
+   * 未解析时退回 `refreshTitle()` —— 首解析的语义（可重试、可等待）比这里更强。
+   */
+  function upgradeTitle(): void {
+    if (pageKind === 'none') return;
+    if (!titleResolved) {
+      refreshTitle();
+      return;
+    }
+    const next = pickFreshTitle(titleCandidates(), staleTitles);
+    if (!canAdoptTitle(convTitle, next, staleTitles)) return;
+    adoptTitle(next, `改名自「${convTitle || '-'}」`);
+  }
+
+  /** 标题相关的定时器全部作废（重试 + 改名同步） */
   function cancelTitleTimers(): void {
     titleTimers.forEach((timer) => clearTimeout(timer));
     titleTimers = [];
+    if (titleSyncTimer) {
+      clearTimeout(titleSyncTimer);
+      titleSyncTimer = 0;
+    }
   }
 
   /**
@@ -294,16 +341,30 @@ declare global {
   /**
    * 监听 `<title>` 文本变化：站点一改标题就**立刻**重新判定，不必等固定重试。
    * 事件驱动，无轮询（守则 4）。
+   *
+   * ⚠️ 2026-11-06 §57：**已解析之后也要继续听** —— 会话改名走的正是这条路。
+   * 旧实现只在 `!titleResolved` 时刷新，等于「首解析之后站点改标题我一概不认」。
+   * 现在统一走 `queueTitleSync()`：防抖 200ms → `upgradeTitle()`（未解析时它会转首解析）。
    */
   function watchTitleElement(): void {
-    const observer = new MutationObserver(() => {
-      if (!titleResolved) refreshTitle();
-    });
+    const observer = new MutationObserver(queueTitleSync);
     observer.observe(document.head ?? document.documentElement, {
       childList: true,
       subtree: true,
       characterData: true,
     });
+  }
+
+  /**
+   * `<title>` 变更的防抖入口（§57）：一次改名可能连写几次标题，
+   * 延后 200ms 再读 —— 读到的是稳定值，中间态不会被写进库里。
+   */
+  function queueTitleSync(): void {
+    if (titleSyncTimer) clearTimeout(titleSyncTimer);
+    titleSyncTimer = window.setTimeout(() => {
+      titleSyncTimer = 0;
+      upgradeTitle();
+    }, TITLE_SYNC_DEBOUNCE_MS);
   }
 
   function draftContext(): DraftContext {
@@ -1306,7 +1367,9 @@ declare global {
       modelHint = null;
     }
 
-    if (pageKind !== 'none') refreshTitle();
+    // 未解析 → 首解析（内部含：可重试的部分由 scheduleTitleResolve 负责）；
+    // 已解析 → 只在站点确实改了名时才更新（§57）
+    if (pageKind !== 'none') upgradeTitle();
 
     if (changed) {
       diag(
@@ -1347,7 +1410,12 @@ declare global {
     if (env.src !== 'content') return;
 
     if (env.type === MSG.PageQuery) {
-      refreshTitle();
+      /*
+       * **查询即校正**（§57）：background 每次问页面（弹窗打开、保存前现读）都顺手做一次
+       * 改名判定 —— `upgradeTitle()` 未解析时等同首解析，已解析时只在确有新名字才改。
+       * 这样「回答的内容」永远是此刻页面上的真名，而不是后台缓存的那份。
+       */
+      upgradeTitle();
       const payload = env.payload as { reqId?: string } | undefined;
       const info = { ...buildPageInfo(), reqId: payload?.reqId };
       diag('page.query', `kind=${info.kind} convId=${info.convId || '-'} title=${info.title || '-'}`);

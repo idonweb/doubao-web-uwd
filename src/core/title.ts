@@ -20,6 +20,11 @@
  *
  * 与 J3「宁缺勿假」同一条原则：宁可显示兜底文案（`豆包对话 <id8>`），
  * 也绝不显示一个错误的会话名。
+ *
+ * ## 第三十九轮补充（2026-11-06 §57）：闸门 ≠ 一次锁死
+ * 「不采用过渡期候选」不等于「首个候选就终身有效」—— 新建会话的默认名「新对话」是
+ * **真的当前名字**，但它会被站点或用户改掉。因此已解析的标题仍允许被「同一会话内的
+ * 新值」替换，判据见文末 `canAdoptTitle()`（替换同样要过闸门）。
  */
 
 /** 纯品牌名 */
@@ -74,4 +79,25 @@ export function pickFreshTitle(candidates: readonly string[], stale: readonly st
     if (value && !isStaleTitle(value, stale)) return value;
   }
   return '';
+}
+
+/**
+ * **已解析的标题**是否允许被同一条目里的新值替换（2026-11-06 第三十九轮 §57）。
+ *
+ * ## 为什么需要「可替换」
+ * 站点给新建会话的默认名是「新对话」—— 首解析那一刻它**确实**是该会话的当前名字
+ * （不是上一个会话的残留），于是一次性闸门把它锁死。此后用户手动改名、或站点在首轮
+ * 对话后自动改名，全被忽略：资源库与下载文件名一直停在「新对话」。
+ *
+ * ## 为什么不能拆掉闸门
+ * 「后来读到的新值」也可能属于**上一个会话**（SPA 切换瞬间的滞后渲染）。所以升级
+ * **必须仍过 `isStaleTitle`** —— 只有「不在路由切换快照里」的值才可能是本会话的新名字。
+ *
+ * 同名 / 空值一律不动：空值是过渡态，不是「改名成空」。
+ */
+export function canAdoptTitle(current: string, candidate: string, stale: readonly string[]): boolean {
+  const value = (candidate ?? '').trim();
+  if (!value) return false;
+  if (value === (current ?? '').trim()) return false;
+  return !isStaleTitle(value, stale);
 }

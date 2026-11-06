@@ -23,6 +23,7 @@ import {
   type Library,
   filterDraftsByConv,
   isLeaveScope,
+  isWeakTitle,
   itemId,
   markExpired,
   markFailed,
@@ -1098,7 +1099,43 @@ async function buildTargets(request: DownloadRequest, tabId: number | null): Pro
     }
     targets.push(target);
   }
+  await refreshTargetTitles(targets, tabId);
   return targets;
+}
+
+/**
+ * **保存时现读会话名**（2026-11-06 第三十九轮 §57）。
+ *
+ * 文件名里的标题位一直取自条目入库时的 `convTitle` 快照。站点在新建会话后会把默认名
+ * 「新对话」改成真名（自动生成或用户手动改），而那一批条目的快照已经写死 ——
+ * 于是保存出来的文件还叫「新对话」。
+ *
+ * 这里在**入队之前**向发起下载的标签页问一次页面（`tab:query` 的回答是页面此刻的真名，
+ * 见 `page/hook.ts` 的「查询即校正」），命中同一会话就覆盖本批目标的标题位，
+ * 并把新名字回写该槽（`retitleConv`）—— 卡片显示与文件名从此一致。
+ *
+ * 三重闸门，任何一条不满足就**保持原值**（宁缺勿假）：
+ *   ① 拿不到标签页 / 页面没应答（内容脚本未注入）→ 不动；
+ *   ② 页面当前会话与条目会话不一致 → 不动（否则会把 A 会话的名字安到 B 会话上）；
+ *   ③ 读到的值是弱标题（兜底文案 / 站点通用名）→ 不动。
+ */
+async function refreshTargetTitles(targets: DownloadTarget[], tabId: number | null): Promise<void> {
+  if (tabId === null || !targets.length) return;
+  const convId = targets[0].convId;
+  if (!convId || targets.some((target) => target.convId !== convId)) return;
+
+  const info = await trySendToTab<PageInfo>(tabId, MSG.TabQuery);
+  const live = info && info.kind !== 'none' && info.convId === convId ? (info.title ?? '').trim() : '';
+  if (!live || isWeakTitle(live)) return;
+  if (targets.every((target) => target.convTitle === live)) return;
+
+  for (const target of targets) target.convTitle = live;
+
+  const slotTab = targets[0].slotTabId ?? tabId;
+  const slot = slotOf(await getSlots(), slotTab);
+  const next = retitleConv(slot, convId, live);
+  if (next !== slot) await writeSlot(slotTab, next);
+  diag('bg.download', `会话名现读：convId=${convId} title=${live}（已覆盖入库快照）`);
 }
 
 /**

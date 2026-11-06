@@ -96,6 +96,20 @@ describe('文件名规则（第十二轮改版：doubao_<真实生成时间> <�
     );
   });
 
+  it('站点默认名「新对话」照原样使用，不回退会话 ID（第三十九轮 §57 拍板）', () => {
+    // 真名还没生成的极端窗口：此刻站点上的名字就是「新对话」，如实写进文件名
+    // —— 它至少语义正确，比一串无意义的会话 ID 可读
+    expect(
+      baseFilename({
+        convId: '38443981',
+        ext: 'mp4',
+        createdAtMs: 1_790_520_877_000,
+        convTitle: '新对话',
+        now: new Date(2026, 8, 28, 15, 0, 0),
+      }),
+    ).toBe('doubao_2026-9-27 22-54-37 新对话.mp4');
+  });
+
   it('createdAt 缺失 → 时间位回退下载时刻（用户拍板）；此时标题仍可用', () => {
     expect(
       baseFilename({ convId: 'c1', ext: 'mp4', convTitle: '真实标题', now: new Date(2026, 8, 28, 15, 20, 11) }),

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  canAdoptTitle,
   cleanDocTitle,
   isGenericDocTitle,
   isStaleTitle,
@@ -101,5 +102,36 @@ describe('回归：实机「切对话后显示上一个对话标题」场景', (
     expect(readNow()).not.toBe('0925_AI视频提示词运镜分析与修改');
     const after = pickFreshTitle([cleanDocTitle('0925_AI视频提示词运镜分析与修改 - 豆包')], snapshot);
     expect(after).toBe('0925_AI视频提示词运镜分析与修改');
+  });
+});
+
+describe('canAdoptTitle：同一会话内改名可升级（第三十九轮 §57）', () => {
+  const STALE = ['0924_古装战争史诗视频生成'];
+
+  it('站点默认名「新对话」→ 真名：可采纳', () => {
+    // 实机场景：新开对话不切换，站点/用户随后改名，文件名不该停在「新对话」
+    expect(canAdoptTitle('新对话', '视频生成测试', STALE)).toBe(true);
+    expect(canAdoptTitle('新对话', '0925_AI视频提示词运镜分析与修改', STALE)).toBe(true);
+  });
+
+  it('候选属于上一个会话（在路由切换快照里）→ 拒绝：闸门不因「可升级」而失效', () => {
+    expect(canAdoptTitle('新对话', '0924_古装战争史诗视频生成', STALE)).toBe(false);
+  });
+
+  it('空值 / 同名 → 不动（空值是过渡态，不是「改名成空」）', () => {
+    expect(canAdoptTitle('新对话', '', STALE)).toBe(false);
+    expect(canAdoptTitle('新对话', '   ', STALE)).toBe(false);
+    expect(canAdoptTitle('新对话', ' 新对话 ', STALE)).toBe(false);
+  });
+
+  it('回归：新对话 → 中间态 → 真名，逐次判定只有「真名」那一步成立', () => {
+    const stale = normalizeTitleSnapshot(['0924_古装战争史诗视频生成']);
+    let current = '新对话';
+    for (const next of ['新对话', '豆包 - 字节跳动旗下 AI 智能助手', '', '视频生成测试']) {
+      // 页面侧候选一律先过 cleanDocTitle（通用名/纯品牌在这里就被清空）
+      const candidate = pickFreshTitle([cleanDocTitle(next)], stale);
+      if (canAdoptTitle(current, candidate, stale)) current = candidate;
+    }
+    expect(current).toBe('视频生成测试');
   });
 });
